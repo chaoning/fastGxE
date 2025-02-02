@@ -1,7 +1,7 @@
 ---
 layout: page
 title: Data Input
-description: Input file format
+description: ~
 ---
 ### PLINK Binary File
 
