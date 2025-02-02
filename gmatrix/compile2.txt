@@ -1,0 +1,39 @@
+
+MKLROOT=/net/mulan/home/chaon/intel/oneapi/mkl/2024.1/
+GSL=/net/mulan/home/chaon/software/gsl-2.7.1/
+EIGEN=/net/mulan/home/chaon/software/eigen-3.4.0/
+EIGEN_UN=${EIGEN}/unsupported/
+BOOST=/net/mulan/home/chaon/software/boost_1_81_0/
+LBFGSpp=/net/mulan/home/chaon/WORK/GMAT/external/LBFGSpp/include/
+UTIL=/net/zootopia/disk1/chaon/WORK/GMAT/utils/
+SPD=/net/zootopia/disk1/chaon/WORK/GMAT/external/
+CLI=/net/zootopia/disk1/chaon/WORK/GMAT/external/
+
+g++ \
+ ../utils/string_utils.cpp \
+ ../utils/partitionLowerTriangle.cpp \
+ ../utils/iterator_utils.cpp \
+ ../utils/EigenMatrix_utils.cpp \
+ ../geno/geno.cpp \
+ ../gmatrix/gmatrix.cpp \
+ ../gmatrix/processGRM.cpp \
+ main.cpp \
+ -Wl,--start-group \
+ ${MKLROOT}/lib/intel64/libmkl_intel_lp64.a \
+ ${MKLROOT}/lib/intel64/libmkl_intel_thread.a \
+ ${MKLROOT}/lib/intel64/libmkl_core.a \
+ ${GSL}/lib/libgsl.a \
+ ${GSL}/lib/libgslcblas.a \
+ -Wl,--end-group \
+ -liomp5 -lpthread -lm -ldl -fopenmp \
+ -I${EIGEN}  \
+-I${EIGEN_UN}  \
+ -DMKL_LP64  -I"${MKLROOT}/include/" \
+ -I${GSL}/include/ \
+ -I${BOOST}/ \
+ -I${UTIL}/ \
+ -I${LBFGSpp} \
+ -I${SPD} \
+ -O3 \
+ -o gmatrix
+

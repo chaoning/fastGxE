@@ -1,0 +1,11 @@
+prefix=/nfs3/ningc/software/gsl-2.7
+exec_prefix=/nfs3/ningc/software/gsl-2.7
+libdir=/nfs3/ningc/software/gsl-2.7/lib
+includedir=/nfs3/ningc/software/gsl-2.7/include
+GSL_CBLAS_LIB=-lgslcblas
+
+Name: GSL
+Description: GNU Scientific Library
+Version: 2.7
+Libs: -L/nfs3/ningc/software/gsl-2.7/lib -lgsl ${GSL_CBLAS_LIB} -lm -lm 
+Cflags: -I/nfs3/ningc/software/gsl-2.7/include
