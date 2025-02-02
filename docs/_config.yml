@@ -15,7 +15,11 @@ license:
   software: MIT
   software_url: https://mit-license.org/
 
-
+collections:
+  documentation:
+    output: true
+    permalink: /documentation/:name/
+  
 # Navigation menu
 nav:
   - title: "About"
