@@ -23,15 +23,15 @@ collections:
 # Navigation menu
 nav:
   - title: "About"
-    url: /documentation/01_About
+    url: /documentation/
   - title: "Installation"
-    url: /documentation/02_installation
+    url: /documentation/
   - title: "Data Input"
-    url: /documentation/03_data
+    url: /documentation/
   - title: "Tutorial"
-    url: /documentation/04_Tutorial
+    url: /documentation/
   - title: "Experiments"
-    url: /documentation/05_Experiments
+    url: /documentation/
 
 
 # Navigation links
