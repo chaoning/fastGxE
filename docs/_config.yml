@@ -19,15 +19,15 @@ license:
 # Navigation menu
 nav:
   - title: "About"
-    url: /01_About/
+    url: /documentation/01_About
   - title: "Installation"
-    url: /02_installation/
+    url: /documentation/02_installation
   - title: "Data Input"
-    url: /03_data/
+    url: /documentation/03_data
   - title: "Tutorial"
-    url: /04_Tutorial/
+    url: /documentation/04_Tutorial
   - title: "Experiments"
-    url: /05_Experiments/
+    url: /documentation/05_Experiments
 
 
 # Navigation links
