@@ -15,6 +15,20 @@ license:
   software: MIT
   software_url: https://mit-license.org/
 
+
+# Navigation menu
+nav:
+  - title: "About"
+    url: /about/
+  - title: "Installation"
+    url: /installation/
+  - title: "Data Input"
+    url: /data-input/
+  - title: "Tutorial"
+    url: /tutorial/
+  - title: "Experiments"
+    url: /experiments/
+
 # Navigation links
 links:
   header:
