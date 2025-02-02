@@ -7,7 +7,7 @@ description: "A scalable and fast multivariate GxE analysis tool."
 
 project:
   version: 1.0.0
-  download_url: https://github.com/chaoning/fastGxE
+  download_url: https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe
   download_text: "Download fastGxE"
 
 # License information
