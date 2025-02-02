@@ -6,9 +6,9 @@ description:
 
 
 
-# 1. Data input
+## 1. Data input
 
-## PLINK Binary File
+### PLINK Binary File
 
 PLINK binary files consist of three components:
 
@@ -20,7 +20,7 @@ In fastGxE, missing genotype values for the focus SNP are imputed using the mean
 
 
 
-## Data File Format
+### Data File Format
 
 The data file should contain individual IDs, confounding covariates, interacting environmental covariates, and phenotypic values. It must follow the structure below:
 
@@ -51,9 +51,9 @@ An example data file
 
 Any symbol listed above will be treated as a missing value. Symbols are separated by spaces, and users can add custom missing values to the list. If a variable is included in the model and contains a missing value in this field, the entire row will be discarded.
 
-# 2. Calculate the Genomic Relationship Matrix (GRM)
+## 2. Calculate the Genomic Relationship Matrix (GRM)
 
-## Single-Step Calculation  
+### Single-Step Calculation  
 
 For standard datasets, compute the GRM in a single step:  
 
@@ -61,7 +61,7 @@ For standard datasets, compute the GRM in a single step:
 fastgxe --make-grm --bfile test --code-type 2 --out test
 ```
 
-## Parallel Computation for Large Datasets (e.g., Biobank Data)  
+### Parallel Computation for Large Datasets (e.g., Biobank Data)  
 
 For large-scale datasets, partition the GRM into 100 parts, compute them in parallel, and then merge the results:  
 
@@ -78,7 +78,7 @@ Once all parts are computed, merge them into a single GRM file:
 fastgxe --process-grm --merge --grm test.agrm --npart 100
 ```
 
-## Sample Clustering Based on Relatedness  
+### Sample Clustering Based on Relatedness  
 
 To group samples such that any pair with an estimated relatedness greater than 0.05 belongs to the same subgroup:  
 
@@ -88,7 +88,7 @@ fastgxe --process-grm --group --grm test.agrm --cut-value 0.05 --out test.agrm
 
 ---
 
-# 3. Genome-Wide GxE Analysis
+## 3. Genome-Wide GxE Analysis
 
 Using the previously generated sparse GRM, along with a PLINK binary file and a data file, perform a GxE analysis as follows:  
 
@@ -101,7 +101,7 @@ fastgxe --test-gxe --grm test --bfile bed_file --data data_file --trait trait \
 - Columns from `Age` to `Confide` are considered interacting environmental factors.  
 - Columns `PCA1` to `PCA5` and `Sex` are treated as confounding covariates.  
 
-## Parallel Computation for Large Datasets  
+### Parallel Computation for Large Datasets  
 
 For large datasets, partition the SNPs into 10 parts and compute them in parallel. The results can then be merged using a custom Python or R script.  
 
@@ -122,7 +122,7 @@ Once all tasks are completed, the results can be merged using a custom Python or
 
 ---
 
-# 4. GxE Heritability Estimation Using the Method of Moments  
+## 4. GxE Heritability Estimation Using the Method of Moments  
 
 To obtain an unbiased estimate of GxE heritability, use the method of moments:  
 
@@ -139,7 +139,7 @@ This approach ensures an unbiased estimation of GxE heritability using the metho
 
 ---
 
-# 5. Identifying Environmental Factors Driving GxE  
+## 5. Identifying Environmental Factors Driving GxE  
 
 Once GxE genomic loci are identified, the environmental factors driving the GxE effect of the lead SNP can be determined using **mmSuSiE**.  
 
