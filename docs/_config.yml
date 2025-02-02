@@ -1,15 +1,21 @@
+# Theme settings
 remote_theme: allejo/jekyll-docs-theme
+
+# Project information
 name: fastGxE
+description: "A scalable and fast multivariate GxE analysis tool."
 
 project:
   version: 1.0.0
   download_url: https://github.com/chaoning/fastGxE
-  download_text: Download
+  download_text: "Download fastGxE"
 
+# License information
 license:
   software: MIT
   software_url: https://mit-license.org/
- 
+
+# Navigation links
 links:
   header:
     - title: GitHub
@@ -17,7 +23,7 @@ links:
       brand: true
       url: https://github.com/chaoning/fastGxE
   homepage:
-    - title: View on GitHub
+    - title: "View on GitHub"
       icon: github
       brand: true
       url: https://github.com/chaoning/fastGxE
@@ -26,52 +32,56 @@ links:
       icon: github
       brand: true
       url: https://github.com/chaoning/fastGxE
-    - title: Issues
+    - title: Report Issues
       icon: bug
       url: https://github.com/chaoning/fastGxE/issues
 
+# UI theme settings
 ui:
-  mode: 'auto' # 'auto', 'dark', 'light'
+  mode: 'auto'  # Options: 'auto', 'dark', 'light'
   brand:
     dark: "#00ceff"
-    light: "#a20000"
+    light: "#d32f2f"  # Adjusted to a softer red
   border_color:
     dark: "#5f5f5f"
     light: "#dee2e6"
   header:
     trianglify: true
     dark:
-      color1: "#062a48"
-      color2: "#304e67"
+      color1: "#0a1f33"  # Adjusted for a more cohesive color scheme
+      color2: "#2c4964"
     light:
-      color1: "#080331"
-      color2: "#673051"
+      color1: "#1b0530"
+      color2: "#88435c"
   masthead:
     color:
-      dark: "#fff"
-      light: "#fff"
+      dark: "#ffffff"
+      light: "#ffffff"
     align:
-      homepage: 'center'
-      page: 'left'
+      homepage: "center"
+      page: "left"
 
+# Social media links
 social:
   github:
     user: chaoning
     repo: fastGxE
   twitter:
-    enabled: false
-    via:
-    hash:
-    account:
+    enabled: false  # Set to false to disable Twitter integration
   facebook:
-    enabled: false
-    profileUrl:
+    enabled: false  # Set to false to disable Facebook integration
 
+# Website analytics
 analytics:
-  google: UA-123456-1
+  google: "UA-123456-1"  # Replace with your actual Google Analytics tracking ID
 
-# Build settings
+# Markdown parser
 markdown: kramdown
+
+# Exclude unnecessary files to improve build performance
 exclude:
   - LICENSE.md
   - README.md
+  - .gitignore
+  - Gemfile
+  - Gemfile.lock
