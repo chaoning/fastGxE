@@ -1,140 +1,189 @@
-div.author{
-	display: inline-block;
-	vertical-align: top;
-	padding-right: 2em;
-}
+/* ============================== */
+/* ========== GLOBAL ============ */
+/* ============================== */
 
 body, td {
-   background-color: white;
+    background-color: #f9fbfc; /* Light, clean background */
+    font-family: Helvetica, Arial, sans-serif;
+    color: #333; /* Dark grey for easy reading */
 }
 
-/* element spacing */
+/* ============================== */
+/* ========== LAYOUT ============ */
+/* ============================== */
 
-p, pre { 
-  margin: 0em 0em 1em;
+/* Author block */
+div.author {
+    display: inline-block;
+    vertical-align: top;
+    padding-right: 2em;
 }
 
-/* center images and tables */
-img, table {
-  margin: 0em auto 1em;
+/* Spacing for paragraphs and preformatted text */
+p, pre {
+    margin: 0em 0em 1em;
 }
 
 p {
-  text-align: justify;
+    text-align: justify;
+    color: #444; /* Slightly softer black for readability */
 }
 
-tt, code, pre {
-   font-family: 'DejaVu Sans Mono', 'Droid Sans Mono', 'Lucida Console', Consolas, Monaco, monospace;
+/* Centering images and tables */
+img, table {
+    margin: 0 auto 1em;
 }
 
-h1, h2, h3, h4, h5, h6 { 
-  font-family: Helvetica, Arial, sans-serif;
-  margin: 1.2em 0em 0.6em 0em;
-  font-weight: bold;
+/* ============================== */
+/* ======= TYPOGRAPHY =========== */
+/* ============================== */
 
+h1, h2, h3, h4, h5, h6 {
+    font-family: Helvetica, Arial, sans-serif;
+    font-weight: bold;
+    margin: 1.2em 0 0.6em 0;
+    color: #2a7cbb; /* Deep blue for better contrast */
 }
 
+/* Title styling */
 h1.title {
-  color: #87b13f;
-  line-height: 1.1em;
-  margin-top: 0px;
-  border-bottom: 0px;
+    color: #5aaf61; /* Green for main title */
+    line-height: 1.1em;
+    margin-top: 0px;
+    border-bottom: none;
 }
 
+/* Headings */
 h1 {
-  font-size: 160%;
-  font-weight: normal;
-  line-height: 1.1em;
-  padding-bottom: 2px;
-  border-bottom: 3px solid;
+    font-size: 160%;
+    font-weight: normal;
+    line-height: 1.1em;
+    padding-bottom: 2px;
+    border-bottom: 3px solid #2a7cbb; /* Blue underline */
 }
 
 h2 {
-  font-size: 130%;
-}
-
-h1, h2, h3 {
-/*  color: #1a81c2; */
+    font-size: 130%;
+    color: #205a8e; /* Slightly darker blue */
 }
 
 h3, h4, h5, h6 {
-  font-size:115%;
-} /* not expecting to dive deeper than four levels on a single page */
+    font-size: 115%;
+    color: #1f5d7f; /* Soft blue */
+} 
 
-/* links are simply blue, hovering slightly less blue */
-/*a { color: #1a81c2; }
-a:active { outline: none; }
-a:visited { color: #1a81c2; }
-a:hover { color: #4c94c2; }
-*/
+/* ============================== */
+/* ========== CODE ============== */
+/* ============================== */
 
-pre, img {
-  max-width: 100%;
-  display: block;
+/* Code font */
+tt, code, pre {
+    font-family: 'DejaVu Sans Mono', 'Droid Sans Mono', 'Lucida Console', Consolas, Monaco, monospace;
 }
 
+/* Preformatted code blocks */
 pre {
-  border: 0px none;
-  background-color: #F8F8F8;
-  white-space: pre;
-  overflow-x: auto;
+    border: none;
+    background-color: #f0f5f9; /* Light blueish-grey */
+    white-space: pre;
+    overflow-x: auto;
+    padding: 1em;
 }
 
+/* Inline code */
+code {
+    background-color: #eaeff4; /* Soft background for inline code */
+    color: #5aaf61; /* Green for inline code */
+    font-size: 92%;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+
+/* Code blocks within <pre> */
 pre code {
-  border: 1px #aaa dashed;
-  background-color: white;
-  display: block;
-  padding: 1em;  
-  color: #111;
-  overflow-x: inherit;
+    border: 1px dashed #bbb;
+    background-color: white;
+    display: block;
+    padding: 1em;
+    color: #222;
+    overflow-x: inherit;
 }
 
-/* markdown v1 */
+/* Markdown v1 */
 pre code[class] {
-  background-color: inherit;
+    background-color: inherit;
 }
 
-/* markdown v2 */
+/* Markdown v2 */
 pre[class] code {
-  background-color: inherit;
+    background-color: inherit;
 }
 
-/* formatting of inline code */
-code { 
-  background-color: transparent;
-  color: #87b13f;
-  font-size: 92%;
-}
-
-/* formatting of tables */
+/* ============================== */
+/* ========== TABLES ============ */
+/* ============================== */
 
 table, td, th {
-  border: none;
-  padding: 0 0.5em;
+    border: 1px solid #ccc;
+    padding: 0.5em;
+    background-color: #fff;
 }
 
-/* alternating row colors */
+/* Alternating row colors for better readability */
 tbody tr:nth-child(odd) td {
-  background-color: #F8F8F8;
+    background-color: #f8f8f8;
 }
+
+th {
+    background-color: #2a7cbb; /* Blue header */
+    color: white;
+    font-weight: bold;
+    padding: 10px;
+}
+
+/* ============================== */
+/* ========== BLOCKQUOTES ======= */
+/* ============================== */
 
 blockquote {
-   color:#666666;
-   margin:0;
-   padding-left: 1em;
-   border-left: 0.5em #EEE solid;
+    color: #555;
+    margin: 0;
+    padding-left: 1em;
+    border-left: 0.4em solid #5aaf61; /* Green left border */
+    background-color: #f9fbfc; /* Soft light background */
+    padding: 1em;
 }
+
+/* ============================== */
+/* ========== LINKS ============ */
+/* ============================== */
+
+/* Default links */
+a {
+    color: #2a7cbb;
+    text-decoration: none;
+}
+
+a:hover {
+    color: #5aaf61; /* Green hover */
+}
+
+/* ============================== */
+/* ========== HORIZONTAL RULES == */
+/* ============================== */
 
 hr {
-   height: 0px;
-   border-bottom: none;
-   border-top-width: thin;
-   border-top-style: dotted;
-   border-top-color: #999999;
+    height: 0;
+    border-bottom: none;
+    border-top: thin dotted #999;
 }
 
+/* ============================== */
+/* ========== SECTION NUMBERING == */
+/* ============================== */
+
 span.header-section-number {
-  padding-right: 1em;
+    padding-right: 1em;
 }
 
 span.toc-section-number::after {
@@ -142,54 +191,60 @@ span.toc-section-number::after {
     white-space: pre;
 }
 
+/* ============================== */
+/* ========== PRINT STYLES ====== */
+/* ============================== */
+
 @media print {
-   * {
-      background: transparent !important;
-      color: black !important;
-      filter:none !important;
-      -ms-filter: none !important;
-   }
+    * {
+        background: transparent !important;
+        color: black !important;
+        filter: none !important;
+        -ms-filter: none !important;
+    }
 
-   body {
-      font-size:12pt;
-      max-width:100%;
-   }
+    body {
+        font-size: 12pt;
+        max-width: 100%;
+    }
 
-   a, a:visited {
-      text-decoration: underline;
-   }
+    a, a:visited {
+        text-decoration: underline;
+    }
 
-   hr {
-      visibility: hidden;
-      page-break-before: always;
-   }
+    hr {
+        visibility: hidden;
+        page-break-before: always;
+    }
 
-   pre, blockquote {
-      padding-right: 1em;
-      page-break-inside: avoid;
-   }
+    pre, blockquote {
+        padding-right: 1em;
+        page-break-inside: avoid;
+    }
 
-   tr, img {
-      page-break-inside: avoid;
-   }
+    tr, img {
+        page-break-inside: avoid;
+    }
 
-   img {
-      max-width: 100% !important;
-   }
+    img {
+        max-width: 100% !important;
+    }
 
-   @page :left {
-      margin: 15mm 20mm 15mm 10mm;
-   }
+    /* Left and right page margins */
+    @page :left {
+        margin: 15mm 20mm 15mm 10mm;
+    }
 
-   @page :right {
-      margin: 15mm 10mm 15mm 20mm;
-   }
+    @page :right {
+        margin: 15mm 10mm 15mm 20mm;
+    }
 
-   p, h2, h3 {
-      orphans: 3; widows: 3;
-   }
+    p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+    }
 
-   h2, h3 {
-      page-break-after: avoid;
-   }
+    h2, h3 {
+        page-break-after: avoid;
+    }
 }
