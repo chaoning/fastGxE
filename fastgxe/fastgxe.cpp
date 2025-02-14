@@ -4,7 +4,7 @@
  * @Author: Chao Ning
  * @Date: 2022-12-18 21:22:40
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-01 17:48:08
+ * @LastEditTime: 2025-02-13 10:30:12
  */
 
 #define EIGEN_USE_MKL_ALL  // must be before include Eigen
@@ -619,6 +619,16 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
     m_logL_null = logL;
     
     m_varcom_null = varcom;
+
+    ofstream fout;
+    fout.open(m_out_file + ".var");
+    if(!fout.is_open()){
+        spdlog::error("Fail to open the output file: {}.var", m_out_file);
+        exit(1);
+    }
+
+    fout << varcom << std::endl;
+
     return m_varcom_null;
 }
 
@@ -724,6 +734,16 @@ VectorXd fastGxE::varcom_main(VectorXd& init, int maxiter0, double cc_par0, doub
     else
         spdlog::info("Variances Not Converged");
     m_varcom_null = varcom;
+
+    ofstream fout;
+    fout.open(m_out_file + ".var");
+    if(!fout.is_open()){
+        spdlog::error("Fail to open the output file: {}.var", m_out_file);
+        exit(1);
+    }
+
+    fout << varcom << std::endl;
+    
     return m_varcom_null;
 }
 
