@@ -4,7 +4,7 @@
  * @Author: Chao Ning
  * @Date: 2022-12-18 21:22:40
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-13 10:30:12
+ * @LastEditTime: 2025-02-17 16:33:55
  */
 
 #define EIGEN_USE_MKL_ALL  // must be before include Eigen
@@ -1556,7 +1556,7 @@ void fastGxE::test_GxE(string bed_file,
             }
         }
 
-        VectorXd score_Vec = z_mat.leftCols(this->m_num_bye).array().square().matrix().rowwise().sum();
+        VectorXd score_Vec = z_mat.rightCols(this->m_num_bye).array().square().matrix().rowwise().sum();
         
         #pragma omp parallel for schedule(dynamic)
         for(long long k = 0; k < num_snp_read; k++){
