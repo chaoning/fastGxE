@@ -4,7 +4,7 @@
  * @Author: Chao Ning
  * @Date: 2022-12-18 21:22:40
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-17 16:33:55
+ * @LastEditTime: 2025-02-18 11:12:39
  */
 
 #define EIGEN_USE_MKL_ALL  // must be before include Eigen
@@ -1419,7 +1419,7 @@ void fastGxE::test_GxE(string bed_file,
     fout.close();
 
     // the correlation among the environments
-    MatrixXd corrE = this->m_bye_mat.transpose() * this->m_bye_mat / this->m_bye_mat.rows();
+    MatrixXd corrE = computeCorrelationMatrix(this->m_bye_mat);
     corrE.diagonal() += Eigen::VectorXd::Constant(corrE.rows(), 0.001);
 
     Eigen::SelfAdjointEigenSolver<MatrixXd> eigensolver(corrE);

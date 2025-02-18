@@ -5,7 +5,7 @@
  * @Author: Chao Ning
  * @Date: 2022-06-22 21:08:46
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-01-31 19:35:40
+ * @LastEditTime: 2025-02-18 11:05:41
  */
 
 
@@ -23,6 +23,23 @@
 
 using namespace Eigen;
 using namespace std;
+
+
+
+
+Eigen::MatrixXd computeCorrelationMatrix(const Eigen::MatrixXd& mat) {
+        int cols = mat.cols();
+        Eigen::VectorXd mean = mat.colwise().mean();
+        Eigen::VectorXd stdDev = ((mat.rowwise() - mean.transpose()).array().square().colwise().sum() / mat.rows()).sqrt();
+    
+        // standardized matrix
+        Eigen::MatrixXd normMat = (mat.rowwise() - mean.transpose()).array().rowwise() / stdDev.transpose().array();
+    
+        // calcualte the correlation
+        Eigen::MatrixXd correlationMatrix = (normMat.transpose() * normMat) / mat.rows();
+        
+        return correlationMatrix;
+}
 
 
 /**

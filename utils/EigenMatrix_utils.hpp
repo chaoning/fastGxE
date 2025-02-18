@@ -5,7 +5,7 @@
  * @Author: Chao Ning
  * @Date: 2022-06-22 21:08:46
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-01 14:07:01
+ * @LastEditTime: 2025-02-18 11:08:04
  */
 #pragma once
 #include <iostream>
@@ -16,6 +16,9 @@
 #include <Eigen/KroneckerProduct>
 #include "mkl.h"
 
+
+// Calcualte the correlation of columns
+Eigen::MatrixXd computeCorrelationMatrix(const Eigen::MatrixXd& mat);
 
 void remove_col(Eigen::MatrixXd& mat, std::vector<long long> col_to_remove);
 
