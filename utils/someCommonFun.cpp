@@ -4,7 +4,7 @@
  * @Author: Chao Ning
  * @Date: 2022-12-02 18:24:20
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-01 14:21:56
+ * @LastEditTime: 2025-02-20 16:48:57
  */
 
 #include <Eigen/Core>
@@ -73,6 +73,9 @@ Eigen::VectorXd combine_pvalues_cauchy(const Eigen::VectorXd& p_values, const Ei
     Eigen::VectorXd transformed_values(clipped_p_values.size());
     for (int i = 0; i < clipped_p_values.size(); ++i) {
         transformed_values[i] = std::tan((0.5 - clipped_p_values[i]) * 3.14159265358979323846);
+        if(clipped_p_values[i] < 1.0e-15){
+            transformed_values[i] = 1 / (clipped_p_values[i] * 3.14159265358979323846);
+        }
     }
 
     // Calculate the weighted sum of the transformed values
@@ -83,7 +86,11 @@ Eigen::VectorXd combine_pvalues_cauchy(const Eigen::VectorXd& p_values, const Ei
 
     // Calculate the combined p-value from the ACAT statistic
     double combined_p_value = 0.5 - (std::atan(T_ACAT / w) / 3.14159265358979323846);
-    combined_p_value = clamp(combined_p_value, min_p, max_p);
+    // combined_p_value = clamp(combined_p_value, min_p, max_p);
+
+    if(combined_p_value < 1e-50){
+        combined_p_value = w / (T_ACAT * 3.14159265358979323846);
+    }
 
     // Create a vector to store the results
     Eigen::VectorXd result(2);
