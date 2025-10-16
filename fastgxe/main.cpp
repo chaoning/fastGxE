@@ -13,22 +13,20 @@
 #include <cstdlib>
 #include <spdlog/spdlog.h>
 
-#include "../gmatrix/gmatrix.hpp"
-#include "../gmatrix/processGRM.hpp"
+#include "gmatrix.hpp"
+#include "processGRM.hpp"
 #include "fastgxe.hpp"
 #include "mom.hpp"
-#include "mmsusie.hpp"
 
 // Display the general help message
 void show_help_general() {
     std::cout << "Usage: gmatrix [options]\n"
               << "Options:\n"
-              << "  -h 1   Compute GRM\n"
-              << "  -h 2   Process GRM\n"
-              << "  -h 3   test the SNP main effects\n"
-              << "  -h 4   test GxE\n"
-              << "  -h 5   GxE heritability estimation with Method-of-moment\n"
-              << "  -h 6   mmSuSiE\n";
+              << "  -h 1   Compute the Genomic Relationship Matrix (GRM)\n"
+              << "  -h 2   Post-process an existing GRM\n"
+              << "  -h 3   Test SNP main effects\n"
+              << "  -h 4   Test GxE interactions\n"
+              << "  -h 5   Estimate GxE heritability (Method of Moments)\n\n";
               
 }
 
@@ -59,11 +57,6 @@ void mom_(int argc, char* argv[]) {
     momA.run(argc, argv);
 }
 
-void mmsusie_(int argc, char* argv[]) {
-    MMSUSIE mmsusieA;
-    mmsusieA.run(argc, argv);
-}
-
 
 
 int main(int argc, char* argv[]) {
@@ -74,7 +67,6 @@ int main(int argc, char* argv[]) {
         {"test-main", no_argument, nullptr, 'g'},     // test the SNP main effects
         {"test-gxe", no_argument, nullptr, 'x'},     // test GxE
         {"mom", no_argument, nullptr, 'o'},     // GxE heritability estimation with Method-of-moment
-        {"mmsusie", no_argument, nullptr, 's'},     // GxE heritability estimation with Method-of-moment
         {"help", optional_argument, nullptr, 'h'}, 
         {nullptr, 0, nullptr, 0}
     };
@@ -113,9 +105,6 @@ int main(int argc, char* argv[]) {
                     }else if (help_type == 5)
                     {
                         mom_(argc, argv);
-                    }else if (help_type == 6)
-                    {
-                        mmsusie_(argc, argv);
                     }else {
                         spdlog::error("Invalid argument for -h");
                         show_help_general();
@@ -137,9 +126,6 @@ int main(int argc, char* argv[]) {
                 return 0;
             case 'o':
                 mom_(argc, argv);
-                return 0;
-            case 's':
-                mmsusie_(argc, argv);
                 return 0;
             default:
                 spdlog::error("Unknown option provided.");

@@ -835,7 +835,7 @@ void GENO::read_bed_omp(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_ar
  * ! Read genotypic matrix from dgeno file
  * @param in_file dgeno file
  * @param geno_mat_part genotypic matrix
- * @param freq_arr frequence array
+ * @param freq_arr frequence array = mean/2
  * @param missing_rate_arr missing rate
  * @param start_snp start snp
  * @param num_snp_read the number of readed snp
@@ -848,7 +848,7 @@ void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_ar
     // check the boundary
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
-        exit;
+        std::exit(1);
     }
 
     
@@ -856,7 +856,7 @@ void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_ar
     fin.open(in_file);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the genotypic file: " + in_file);
-        exit;
+        std::exit(1);
     }
 
     string line;
@@ -914,7 +914,7 @@ void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_ar
     delete[] endptr;
     // reorder the snp matrix
     if(!index_vec.empty()){
-        geno_mat_part = (geno_mat_part(index_vec, Eigen::all)).eval();
+        geno_mat_part = geno_mat_part(index_vec, Eigen::all).eval();
         freq_arr = geno_mat_part.colwise().sum() / (2 * index_vec.size());
     }
     fin.close();
@@ -939,20 +939,13 @@ void GENO::read_geno(int input_geno_fmt, MatrixXd& snp_mat_part, VectorXd& maf_a
         string in_file = _geno_file + ".bed";
         GENO::read_bed_omp(in_file, snp_mat_part, maf_arr, missing_rate_arr, start_snp, num_snp_read, index_vec);
     }else if(input_geno_fmt == 1){
-        string in_file = _geno_file + ".dgeno";
+        string in_file = _geno_file + ".fmat"; // feture matrix such as SNP, gene expression, etc
         GENO::read_dgeno(in_file, snp_mat_part, maf_arr, missing_rate_arr, start_snp, num_snp_read, index_vec, missing_in_geno_vec);
-        if(snp_mat_part.minCoeff() < 0 || snp_mat_part.maxCoeff() > 2){
-            spdlog::error("Genotypic values from dgeno file should be between 0 and 2.");
-            exit;
-        }
-    }else if(input_geno_fmt == 2){
-        string in_file = _geno_file + ".cgeno";
-        GENO::read_dgeno(in_file, snp_mat_part, maf_arr, missing_rate_arr, start_snp, num_snp_read, index_vec, missing_in_geno_vec);
+    }else{
+        spdlog::error("The input genotypic format is not supported");
+        std::exit(1);
     }
 }
-
-
-
 
 
 /**
@@ -1136,7 +1129,7 @@ void GENO::read_dgeno_by_geno_index(string in_file, MatrixXd& geno_mat_by_snp_in
     delete[] endptr;
     fin.close();
     if(!index_vec.empty()){
-        geno_mat_by_snp_index = (geno_mat_by_snp_index(index_vec, Eigen::all)).eval();
+        geno_mat_by_snp_index = geno_mat_by_snp_index(index_vec, Eigen::all).eval();
         maf_arr = geno_mat_by_snp_index.colwise().sum() / (2 * index_vec.size());
     }
 }

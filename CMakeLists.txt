@@ -10,7 +10,9 @@ set(MKLROOT /net/mulan/home/chaon/intel/oneapi/mkl/2024.1/)
 set(GSLROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/gsl-2.7/)
 set(EIGENROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/eigen-3.4.0/)
 set(LBFGSppROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/LBFGSpp/include/)
+set(BOOSTROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/boost_1_89_0/)
 set(UTILROOT /net/zootopia/disk1/chaon/WORK/fastgxe/utils/)
+set(GMATRIXROOT /net/zootopia/disk1/chaon/WORK/fastgxe/gmatrix/)
 set(SPDROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/)
 set(CLIROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/)
 
@@ -20,7 +22,9 @@ include_directories(
     ${GSLROOT}/include
     ${EIGENROOT}
     ${EIGENROOT}/unsupported
+    ${BOOSTROOT}
     ${UTILROOT}
+    ${GMATRIXROOT}
     ${LBFGSppROOT}
     ${SPDROOT}
     ${CLIROOT}

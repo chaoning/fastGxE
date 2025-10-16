@@ -21,9 +21,9 @@
 #include <Eigen/Eigen>
 
 #include "processGRM.hpp"
-#include "../utils/string_utils.hpp"
-#include "../utils/iterator_utils.hpp"
-#include "../utils/EigenMatrix_utils.hpp"
+#include "string_utils.hpp"
+#include "iterator_utils.hpp"
+#include "EigenMatrix_utils.hpp"
 
 
 using std::ofstream; using std::ifstream;
@@ -307,13 +307,13 @@ void ProcessGRM::merge_grm(std::string grm_file, int sparse, int npart, string o
     ProcessGRM::merge_file(file_vec, out_file + ".id", false);
 
     // N
-    spdlog::info(" *.N.bin file");
+    spdlog::info(" *.N file");
     file_vec.clear();
     for(int i = 1; i <= npart; i++){
-        string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".N.bin";
+        string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".N";
         file_vec.push_back(tmp_file);
     }
-    ProcessGRM::merge_file({file_vec[0]}, out_file + ".N.bin", true);
+    ProcessGRM::merge_file({file_vec[0]}, out_file + ".N", false);
 
 
     // bin
@@ -589,7 +589,7 @@ void ProcessGRM::epistatic_grm(std::string grm_file, int sparse, std::string grm
         ProcessGRM::merge_file({in_file + ".id"}, out_file + "." + grm_type + ".id", false);
         vector<string> grm_id_vec = ProcessGRM::read_grm_id(out_file + "." + grm_type);
 
-        ProcessGRM::merge_file({in_file + ".N.bin", in_file + ".N.bin"}, out_file + "." + grm_type + ".N.bin", true);
+        ProcessGRM::merge_file({in_file + ".N", in_file + ".N"}, out_file + "." + grm_type + ".N", false);
 
         if(sparse == 0){
             std::map<string, long long> grm_id_map;
@@ -619,7 +619,7 @@ void ProcessGRM::epistatic_grm(std::string grm_file, int sparse, std::string grm
         vector<string> grm_id_vec = ProcessGRM::read_grm_id(out_file + "." + grm_type);
 
         // N
-        ProcessGRM::merge_file({in_file1 + ".N.bin", in_file2 + ".N.bin"}, out_file + "." + grm_type + ".N.bin", true);
+        ProcessGRM::merge_file({in_file1 + ".N", in_file2 + ".N"}, out_file + "." + grm_type + ".N", false);
 
         // bin
         if(sparse == 0){
@@ -675,7 +675,7 @@ void ProcessGRM::remove_id(std::string grm_file, int sparse, std::string id_file
     }
 
     ProcessGRM::out_grm_id(out_file, id_keep_vec);
-    ProcessGRM::merge_file({grm_file + ".N.bin"}, out_file + ".N.bin", true);
+    ProcessGRM::merge_file({grm_file + ".N"}, out_file + ".N", false);
 
     if(sparse==0){
         Eigen::MatrixXd mat;
@@ -718,7 +718,7 @@ void ProcessGRM::keep_id(std::string grm_file, int sparse, std::string id_file, 
     }
 
     ProcessGRM::out_grm_id(out_file, id_keep_vec);
-    ProcessGRM::merge_file({grm_file + ".N.bin"}, out_file + ".N.bin", true);
+    ProcessGRM::merge_file({grm_file + ".N"}, out_file + ".N", false);
 
     if(sparse==0){
         Eigen::MatrixXd mat;
@@ -1151,6 +1151,26 @@ int ProcessGRM::run(int argc, char* argv[]){
         mat = LLTA.inverse();
         vector<string> grm_id_vec = this->read_grm_id(grm_file);
         this->out_gmat(mat, grm_id_vec, out_fmt, out_file);
+    } else if(group){
+        spdlog::info("Grouping individuals by GRM relationships");
+        this->group(grm_file, sparse, cut_value, out_file);
+    } else if (remove_iid) {
+        spdlog::info("Removing specified iids from GRM");
+        if (iid_file.empty()) {
+            spdlog::error("--iid is required for removing iids");
+            exit(1);
+        }
+        this->remove_id(grm_file, sparse, iid_file, out_file);
+    } else if (keep_iid) {
+        spdlog::info("Keeping specified iids in GRM");
+        if (iid_file.empty()) {
+            spdlog::error("--iid is required for keeping iids");
+            exit(1);
+        }
+        this->keep_id(grm_file, sparse, iid_file, out_file);
+    } else if (out_close) {
+        spdlog::info("Outputting one of each pair of close individuals");
+        this->remove_close_id(grm_file, sparse, cut_value, out_file);
     } else {
         spdlog::error("No valid operation specified");
         exit(1);

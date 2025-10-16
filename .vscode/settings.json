@@ -95,6 +95,7 @@
         "valarray": "cpp",
         "variant": "cpp",
         "dense": "cpp",
-        "fft": "cpp"
+        "fft": "cpp",
+        "stdfloat": "cpp"
     }
 }

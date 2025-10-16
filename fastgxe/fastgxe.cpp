@@ -1467,7 +1467,6 @@ void fastGxE::test_GxE(string bed_file,
         }
         
         spdlog::info("Part {}/{}: Start SNP {}, read SNPs {}", ipart + 1, npart_snp, start_snp, num_snp_read);
-
         GenoA.read_bed_omp_spMVLMM(bed_file + ".bed", snp_mat_part, freq_arr, missing_rate_arr, start_snp, num_snp_read, id_index_in_bed_vec);
 
         // norm2
@@ -1560,8 +1559,10 @@ void fastGxE::test_GxE(string bed_file,
         
         #pragma omp parallel for schedule(dynamic)
         for(long long k = 0; k < num_snp_read; k++){
-            if(isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut)){
-                double p1 = saddle(score_Vec(k), corrE_eigenvalues);
+            double score_val = score_Vec(k);
+            if(isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut) && score_val >= 0.0 && std::isfinite(score_val)){
+
+                double p1 = saddle(score_val, corrE_eigenvalues);
                 p_combined_Mat(k, 1) = p1;
 
                 VectorXd p_Vec(2);
@@ -1572,7 +1573,7 @@ void fastGxE::test_GxE(string bed_file,
                 p_combined_Mat(k, 1) = p_combined_Mat(k, 2) = NAN;
             }
         }
-
+        
         vector <std::string> snp_info_vec = GenoA.snp_anno(start_snp, num_snp_read);
         fastGxE::output_GxE(fout, snp_info_vec, freq_arr, missing_rate_arr,
             beta_Mat, se_Mat, p_Mat, p_combined_Mat,

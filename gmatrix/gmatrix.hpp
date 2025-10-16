@@ -111,14 +111,14 @@ public:
 
 private:
     string m_geno_file;           ///< Path to the genotype file.
-    int m_input_geno_fmt;         ///< Format of the input genotype data.
     string m_out_file;            ///< Path to the output file.
-    long long m_num_snp;              ///< Number of SNPs.
-    long long m_num_id;               ///< Number of individuals (IDs).
     vector<string> m_id_in_geno_vec;  ///< List of IDs in the genotype file.
     vector<string> m_missing_in_geno_vec; ///< List of missing genotype indicators.
 
-    double m_num_snp_used; ///< Number of SNPs used in computation.
+    long long m_num_snp;              ///< Number of SNPs.
+    long long m_num_id;               ///< Number of individuals (IDs).
+    int m_input_geno_fmt;         ///< Format of the input genotype data.
+    long long m_num_snp_used; ///< Number of SNPs used in computation.
     double m_scale;        ///< Scaling factor for genomic relationship matrix.
     long long m_start_id;  ///< Start index for processing individuals.
     long long m_num_id_read; ///< Number of individuals read.

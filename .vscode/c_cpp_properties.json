@@ -3,18 +3,25 @@
         {
             "name": "Win32",
             "includePath": [
-                "${workspaceFolder}/**",
-                "D:/cpp/eigen-3.4.0",
-                "E:/GMAT/gmat64/utils",
-                "D:/cpp/mingw64/include",
-                "D:\\cpp/boost_1_81_0"
+                "E:\\code\\fastgxe\\external",
+                "E:\\code\\fastgxe\\external\\eigen-3.4.0",
+                "E:\\code\\fastgxe\\external\\eigen-3.4.0\\unsupported",
+                "E:\\code\\fastgxe\\external\\boost_1_89_0",
+                "E:\\code\\fastgxe\\external\\CLI",
+                "E:\\code\\fastgxe\\external\\gsl-2.7\\include",
+                "E:\\code\\fastgxe\\external\\spdlog",
+                "E:\\code\\fastgxe\\utils",
+                "E:\\code\\fastgxe\\external\\intel\\linux\\mkl\\include",
+                "D:/Apps/cpp/mingw64/include",
+                "E:\\code\\fastgxe\\gmatrix",
+                "E:\\code\\fastgxe\\external\\LBFGSpp\\include"
             ],
             "defines": [
                 "_DEBUG",
                 "UNICODE",
                 "_UNICODE"
             ],
-            "compilerPath": "D:\\cpp\\mingw64\\bin\\g++.exe",
+            "compilerPath": "D:/Apps/cpp/mingw64/bin/g++.exe",
             "cStandard": "c11",
             "cppStandard": "c++17",
             "intelliSenseMode": "windows-gcc-x64"
