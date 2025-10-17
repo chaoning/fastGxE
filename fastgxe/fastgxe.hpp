@@ -15,6 +15,8 @@
 #include <Eigen/Core>
 #include <Eigen/Dense>
 #include <Eigen/Eigen>
+#include <Eigen/Sparse>
+
 
 using std::string;
 using std::vector;
@@ -79,7 +81,7 @@ public:
                 long long start_snp, long long num_snp_read, double p_cut);
 
     // GxE
-    VectorXd varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
+    VectorXd varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
 
     void test_GxE_multi(string bed_file, long long start_pos, long long end_pos, int npart_snp,
                 int speed, long long num_random_snp,

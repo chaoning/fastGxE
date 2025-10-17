@@ -30,6 +30,7 @@ Ensure the following dependencies are installed on your system:
 - **OpenMP**
 - **CLI**
 - **spdlog**
+- **boost** (1.89.0)
 
 ### Installation Steps
 

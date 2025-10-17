@@ -318,6 +318,35 @@ VectorXd calculate_variance_components(const MatrixXd &GB, const MatrixXd &VB, c
     return varcom;
 }
 
+
+VectorXd calculate_variance_components_withNxE(const MatrixXd &GB, const MatrixXd &VB, const VectorXd &nxe_vec, const MatrixXd &B, const MatrixXd &y) {
+    long long num_randomB = B.cols() - 1;
+    long long num_used_id = GB.rows();
+
+    MatrixXd leftMat(4, 4);
+    VectorXd rightVec(4);
+    MatrixXd nxeB = B.array().colwise() * nxe_vec.array();
+
+    leftMat(0, 0) = (GB.rightCols(num_randomB).cwiseProduct(GB.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(1, 1) = (VB.rightCols(num_randomB).cwiseProduct(VB.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(2, 2) = (nxe_vec.cwiseProduct(nxe_vec)).sum();
+    leftMat(3, 3) = num_used_id;
+    leftMat(0, 1) = leftMat(1, 0) = (GB.rightCols(num_randomB).cwiseProduct(VB.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(0, 2) = leftMat(2, 0) = (GB.rightCols(num_randomB).cwiseProduct(nxeB.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(0, 3) = leftMat(3, 0) = (GB.rightCols(num_randomB).cwiseProduct(B.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(1, 2) = leftMat(2, 1) = (VB.rightCols(num_randomB).cwiseProduct(nxeB.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(1, 3) = leftMat(3, 1) = (VB.rightCols(num_randomB).cwiseProduct(B.rightCols(num_randomB))).sum() / num_randomB;
+    leftMat(2, 3) = leftMat(3, 2) = nxe_vec.sum();
+
+    rightVec(0) = (GB.col(0).transpose() * y).sum();
+    rightVec(1) = (VB.col(0).transpose() * y).sum();
+    rightVec(2) = (nxeB.col(0).transpose() * y).sum();
+    rightVec(3) = (y.transpose() * y).sum();
+
+    VectorXd varcom = leftMat.inverse() * rightVec;
+    return varcom;
+}
+
 VectorXd calculate_multi_variance_components(const vector<MatrixXd> &VB_vec, const MatrixXd &B, const MatrixXd &y) {
     long long num_randomB = B.cols() - 1;
     long long num_used_id = VB_vec[0].rows();
@@ -346,7 +375,7 @@ VectorXd calculate_multi_variance_components(const vector<MatrixXd> &VB_vec, con
 }
 
 
-void MoM::MoMV(const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
+void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
           const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
           const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
           long long num_randomB) {
@@ -387,10 +416,16 @@ void MoM::MoMV(const string &out_file, const string &data_file, const vector<lon
 
     MatrixXd GB = MatrixXd::Zero(num_used_id, num_randomB + 1);
     MatrixXd VB = MatrixXd::Zero(num_used_id, num_randomB + 1);
+    VectorXd nxe_vec = bye_mat.rowwise().squaredNorm() / bye_mat.cols(); // nxe for each individual
 
     process_snps(num_snp_read, num_iid_bed, num_used_id, num_randomB, bytes_vec, index_vec, GB, VB, B, bye_mat);
 
-    VectorXd varcom = calculate_variance_components(GB, VB, B, y);
+    VectorXd varcom;
+    if(no_noisebye){
+        varcom = calculate_variance_components(GB, VB, B, y);
+    }else{
+        varcom = calculate_variance_components_withNxE(GB, VB, nxe_vec, B, y);
+    }
 
     delete[] bytes_vec;
 
@@ -489,7 +524,14 @@ int MoM::run(int argc, char* argv[]) {
 
     // Define command-line options
     bool mom=false;
+    bool no_noisebye = false;
     app.add_flag("--mom", mom, "GxE Heritability Estimation Using MoM");
+
+    app.add_flag("--no-noisebye", [&no_noisebye](int count) {
+        if (count > 0) no_noisebye = true;  // Flip no_noisebye to true when flag is used
+    }, "Disable noise-by-environment interaction terms.\n"
+       "  - Noise-by-environment interactions are ENABLED by default.\n"
+       "  - Use --no-noisebye to turn it OFF.");
 
     app.add_option("--threads", threads, "Number of threads (default: 10)")->default_val(10);
     app.add_option("--out", out_file, "Output file")->required();
@@ -639,8 +681,8 @@ int MoM::run(int argc, char* argv[]) {
     }
 
     // Run the appropriate MoM analysis method
-    
-    this->MoMV(out_file, data_file, covariate_index_vec, class_index_vec, bye_index_vec, trait_index_vec, missing_in_data_vec, bed_file, start_pos, num_snp_read, num_randomB);
+
+    this->MoMV(no_noisebye, out_file, data_file, covariate_index_vec, class_index_vec, bye_index_vec, trait_index_vec, missing_in_data_vec, bed_file, start_pos, num_snp_read, num_randomB);
 
     return 0;
 }

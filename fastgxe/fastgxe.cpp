@@ -45,7 +45,6 @@ using std::endl;
 using Eigen::HouseholderQR;
 using Eigen::ColPivHouseholderQR;
 
-
 fastGxE::fastGxE(){
 
 }
@@ -373,11 +372,13 @@ void fastGxE::pre_data_GxE(bool standardize_env, bool phen_correct){
  * @param {double} cc_gra0
  * @param {double} cc_logL0
  */
-VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0){
+VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0){
     spdlog::info("Estimate variances...");
 
     // * set the initial variances
-    long long num_cov = 3;
+    long long num_cov = 4;
+    if(no_noisebye) num_cov = 3;
+
     VectorXd varcom;
     if((init_varcom.size() == num_cov) && (init_varcom.minCoeff() > 0)){
         varcom = init_varcom;
@@ -429,6 +430,16 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
 
     double logL = -1e100, logL_curr = -1e100;
     bool isCC = true;
+    long long num_envi_int = this->m_bye_mat.cols();
+    VectorXd nxe_vec = this->m_bye_mat.rowwise().squaredNorm() / num_envi_int; // nxe for each individual
+    SparseMatrix<double> nxe_diag(nxe_vec.size(), nxe_vec.size());
+    nxe_diag.reserve(Eigen::VectorXi::Constant(nxe_vec.size(), 1));
+    for (long long i = 0; i < nxe_vec.size(); ++i)
+        nxe_diag.insert(i, i) = nxe_vec[i];
+
+    nxe_diag.makeCompressed();
+    VectorXd ai_mat_inv_diag;
+
     for(int iter_count = 0; iter_count < maxiter0; iter_count++){
         spdlog::info("Iteration {}", iter_count + 1);
 
@@ -440,10 +451,14 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
             MatrixXd tmp_gxe_mat = gxe_rm_group_vec[i];
             long long start_index = m_grm_index_vec[i];
             long long num_element = tmp_grm_mat.rows();
+            VectorXd tmp_nxe_vec = nxe_vec.segment(start_index, num_element);
             if(i == 0){
                 if(tmp_grm_mat.size() != 0){
                     Eigen::ArrayXXd tmp_mat = tmp_grm_mat.array() * varcom(0) + 
-                                tmp_gxe_mat.array() * varcom(1) + varcom(2);
+                                tmp_gxe_mat.array() * varcom(1) + varcom(num_cov - 1);
+                    if(!no_noisebye){
+                        tmp_mat += tmp_nxe_vec.array() * varcom(2);
+                    }
                     vmat_logdet += tmp_mat.log().sum();
                     tmp_mat = 1 / tmp_mat.array();
                     for(long long m = 0; m < num_element; m++){
@@ -451,8 +466,12 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
                     }
                 }
             }else{
-                MatrixXd tmp_mat = MatrixXd::Identity(num_element, num_element) * varcom(2);
+                MatrixXd tmp_mat = MatrixXd::Identity(num_element, num_element) * varcom(num_cov - 1);
                 tmp_mat += tmp_grm_mat * varcom(0) + tmp_gxe_mat * varcom(1);
+
+                if(!no_noisebye){
+                    tmp_mat += tmp_nxe_vec.asDiagonal() * varcom(2);
+                }
 
                 Eigen::LDLT<Eigen::MatrixXd> ldlt(tmp_mat);
                 Eigen::VectorXd diag = ldlt.vectorD();
@@ -502,6 +521,17 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
         fd_mat(1) = tr_ViKe - tr_XViXi_XViKeViX - (Py.transpose() * KePy).sum();
         KPy_vec[1] = KePy;
 
+        if(!no_noisebye){
+            double tr_ViNxe = (vmat.cwiseProduct(nxe_diag)).sum();
+            MatrixXd XViNxeViX = ViX.transpose() * nxe_diag * ViX;
+            double tr_XViXi_XViNxeViX = (XViXi.cwiseProduct(XViNxeViX)).sum();
+            MatrixXd NxePy = nxe_diag * Py;
+            fd_mat(2) = tr_ViNxe - tr_XViXi_XViNxeViX - (Py.transpose() * NxePy).sum();
+            KPy_vec[2] = NxePy;
+        }
+
+
+
         fd_mat(num_cov - 1) = vmat.diagonal().sum() - (XViXi.cwiseProduct(ViX.transpose() * ViX)).sum() - (Py.transpose() * Py).sum();
         fd_mat *= -0.5;
         KPy_vec[num_cov - 1] = Py;
@@ -521,6 +551,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
             }
         }
         ai_mat *= 0.5;
+        ai_mat_inv_diag = ai_mat.inverse().diagonal();
 
         // EM
         MatrixXd em_mat = MatrixXd::Zero(num_cov, num_cov);
@@ -571,10 +602,16 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
         MatrixXd tmp_gxe_mat = gxe_rm_group_vec[i];
         long long start_index = m_grm_index_vec[i];
         long long num_element = tmp_grm_mat.rows();
+        VectorXd tmp_nxe_vec = nxe_vec.segment(start_index, num_element);
         if(i == 0){
             if(tmp_grm_mat.size() != 0){
+                
                 Eigen::ArrayXXd tmp_mat = tmp_grm_mat.array() * varcom(0) + 
-                            tmp_gxe_mat.array() * varcom(1) + varcom(2);
+                            tmp_gxe_mat.array() * varcom(1) + varcom(num_cov - 1);
+                if(!no_noisebye){
+                    tmp_mat += tmp_nxe_vec.array() * varcom(2);
+                }
+
                 logL += tmp_mat.log().sum();
                 tmp_mat = 1 / tmp_mat.array();
                 for(long long m = 0; m < num_element; m++){
@@ -582,8 +619,13 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
                 }
             }
         }else{
-            MatrixXd tmp_mat = MatrixXd::Identity(num_element, num_element) * varcom(2);
+
+            MatrixXd tmp_mat = MatrixXd::Identity(num_element, num_element) * varcom(num_cov - 1);
             tmp_mat += tmp_grm_mat * varcom(0) + tmp_gxe_mat * varcom(1);
+
+            if(!no_noisebye){
+                tmp_mat += tmp_nxe_vec.asDiagonal() * varcom(2);
+            }
 
             Eigen::LDLT<Eigen::MatrixXd> ldlt(tmp_mat);
             Eigen::VectorXd diag = ldlt.vectorD();
@@ -627,7 +669,10 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, int maxiter0, double cc_par0
         exit(1);
     }
 
-    fout << varcom << std::endl;
+    VectorXd se_varcom = ai_mat_inv_diag.cwiseSqrt();
+    for(int i = 0; i < num_cov; i++){
+        fout << varcom(i) << " " << se_varcom(i) << std::endl;
+    }
 
     return m_varcom_null;
 }
@@ -1626,6 +1671,7 @@ int fastGxE::run(int argc, char **argv) {
     bool test_gxe = false;
     bool phen_correct = false;
     bool standardize_env = true;
+    bool no_noisebye = false;
     
     std::string data_file, agrm_file, bed_file, out_file;
     std::vector<std::string> trait_vec, covariate_vec, class_vec, bye_vec, snp_range_vec;
@@ -1654,6 +1700,12 @@ int fastGxE::run(int argc, char **argv) {
     // Now use 'excludes()' safely
     test_main_flag->excludes(test_gxe_flag);
     test_gxe_flag->excludes(test_main_flag);
+
+    app.add_flag("--no-noisebye", [&no_noisebye](int count) {
+        if (count > 0) no_noisebye = true;  // Flip no_noisebye to true when flag is used
+    }, "Disable noise-by-environment interaction terms.\n"
+       "  - Noise-by-environment interactions are ENABLED by default.\n"
+       "  - Use --no-noisebye to turn it OFF.");
 
     app.add_option("--data", data_file, 
         "Path to input data file (required).")
@@ -1910,7 +1962,7 @@ int fastGxE::run(int argc, char **argv) {
     }else if(test_gxe){
         phen_correct = true; // must be true, save resources
         this->pre_data_GxE(standardize_env, phen_correct);
-        varcom = this->varcom_GxE(init_varcom, maxiter, cc_par, cc_gra, cc_logL);
+        varcom = this->varcom_GxE(init_varcom, no_noisebye, maxiter, cc_par, cc_gra, cc_logL);
     }
     
     

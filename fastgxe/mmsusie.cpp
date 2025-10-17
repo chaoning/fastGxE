@@ -759,6 +759,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
     int threads = 10;
     int phen_correct = 2;
     bool standardize_env = true;
+    bool no_noisebye = false;
     
     std::string data_file, agrm_file, bed_file, out_file;
     std::vector<std::string> trait_vec, covariate_vec, class_vec, bye_vec, snp_focus_vec;
@@ -774,6 +775,11 @@ int MMSUSIE::run(int argc, char *argv[]) {
     // Register CLI11 options
     bool mmsusie=false;
     app.add_flag("--mmsusie", mmsusie, "Mixed model SuSiE");
+    app.add_flag("--no-noisebye", [&no_noisebye](int count) {
+        if (count > 0) no_noisebye = true;  // Flip no_noisebye to true when flag is used
+    }, "Disable noise-by-environment interaction terms.\n"
+       "  - Noise-by-environment interactions are ENABLED by default.\n"
+       "  - Use --no-noisebye to turn it OFF.");
 
     app.add_option("-p,--threads", threads, 
     "Number of threads to use (default: 10).")
@@ -984,7 +990,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
     Eigen::VectorXd varcom;
     phen_correct = true; // must be true, save resources
     this->pre_data_GxE(standardize_env, phen_correct);
-    varcom = this->varcom_GxE(init_varcom, maxiter, cc_par, cc_gra, cc_logL);
+    varcom = this->varcom_GxE(init_varcom, no_noisebye, maxiter, cc_par, cc_gra, cc_logL);
 
     Eigen::MatrixXd X = this->pre_data_mmsusie(bed_file, snp_focus_vec, phen_correct);
     this->mmsusiefun(X, num_causal, maxiter, tol, coverage, min_abs_cor, estimate_sigma);

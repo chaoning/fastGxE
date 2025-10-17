@@ -33,7 +33,7 @@ private:
 public:
     MoM();
     ~MoM();
-    void MoMV(const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
+    void MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
           const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
           const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
           long long num_randomB);
