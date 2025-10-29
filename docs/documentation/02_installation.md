@@ -47,7 +47,7 @@ Modify `CMakeLists.txt` to update the paths of external libraries (MKL, GSL, Eig
 
 #### 3. Build the Project
 
-Run the following commands to compile fastGxE:
+Run the following commands to compile fastGxE (the process will take approximately 5–10 minutes):
 
 ```bash
 mkdir build
