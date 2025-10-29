@@ -55,7 +55,7 @@ void partitionLowerTriangle(long long n, long long npart, long long ipart,
     row_count = end_row - start_row;
     if(row_count <= 0){
         spdlog::error("Partition {} has zero rows. Reduce --npart argument.", ipart);
-        exit;
+        exit(1);
     }
 
     // Log partition details

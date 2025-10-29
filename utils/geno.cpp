@@ -136,14 +136,14 @@ vector<string> GENO::snp_anno(long long start_snp, long long num_snp_read){
     // check the boundary
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check!");
-        exit;
+        exit(1);
     }
     string bim_file = _geno_file + ".bim";
     ifstream fin;
     fin.open(bim_file.c_str());
     if(!fin.is_open()){
         spdlog::error("Fail to open the bim file: {}", bim_file);
-        exit;
+        exit(1);
     }
     string one_line;
     for(long long i = 0; i < start_snp; i++){ // Skip lines before start SNP
@@ -183,7 +183,7 @@ vector<string> GENO::snp_anno_by_snp_index(vector <long long> snp_index_vec){
     fin.open(bim_file.c_str());
     if(!fin.is_open()){
         spdlog::error("Fail to open the bim file:{}", bim_file);
-        exit;
+        exit(1);
     }
     string one_line;
     vector<string> snp_anno_all_vec;
@@ -218,7 +218,7 @@ void GENO::bed_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_ge
     fin.open(in_file, std::ios::binary); // Read the in binary
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: {}", in_file);
-        exit;
+        exit(1);
     }
 
     double code_val;  // coded value for SNP genotype
@@ -275,7 +275,7 @@ void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_
     fin.open(in_file);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the genotype file:{}", in_file);
-        exit;
+        exit(1);
     }
     string line;
     vector <string> tmp;
@@ -290,7 +290,7 @@ void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_
         tmp = split_string(line);
         if(tmp.size() - _num_id != 1){
             spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
-            exit;
+            exit(1);
         }
         // genotypic value mean and NOBS
         freq = 0.0;
@@ -311,13 +311,13 @@ void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_
         igeno++;
         if(igeno > _num_snp){
             spdlog::error("The number of loci exceeds " + std::to_string(_num_snp));
-            exit;
+            exit(1);
         }
     }
     delete[] endptr;
     if(igeno < _num_snp){
         spdlog::error("The number of loci less than " + std::to_string(_num_snp));
-        exit;
+        exit(1);
     }
 }
 
@@ -362,7 +362,7 @@ vector<long long> GENO::find_fam_index(vector<string> id_in_need_vec){
         is = find(id_in_geno_vec.begin(), id_in_geno_vec.end(), *it);
         if(is == id_in_geno_vec.end()){
             spdlog::error(*it + " is not in the fam file");
-            exit;
+            exit(1);
         }
         index = distance(id_in_geno_vec.begin(), is);
         index_vec.push_back(index);
@@ -412,7 +412,7 @@ vector<long long> GENO::find_bim_index(vector<string> snp_in_need_vec){
         is = find(snp_id_in_geno_vec.begin(), snp_id_in_geno_vec.end(), *it);
         if(is == snp_id_in_geno_vec.end()){
             spdlog::error(*it + " is not in the bim file");
-            exit;
+            exit(1);
         }
         index = distance(snp_id_in_geno_vec.begin(), is);
         index_vec.push_back(index);
@@ -460,7 +460,7 @@ void GENO::check_geno_id_order(string geno_file){
     fin.open(geno_file.c_str());
     if(!fin.is_open()){
         spdlog::error("Fail to open the genotypic file: " + geno_file);
-        exit;
+        exit(1);
     }
 
     vector<string> snp_id_in_bim = GENO::sid_vec();
@@ -473,7 +473,7 @@ void GENO::check_geno_id_order(string geno_file){
         if(snp_id_in_bim[igeno] != snp_id){
             spdlog::error("The SNP IDs with the same index " + std::to_string(igeno) + 
                     " do not match in genotypic and bim files: " + snp_id + " " + snp_id_in_bim[igeno]);
-            exit;
+            exit(1);
         }
         igeno++;
     }
@@ -485,7 +485,7 @@ void GENO::check_bed_numChar(){
     std::ifstream fin(_geno_file + ".bed", std::ios::binary | std::ios::ate);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: " + _geno_file + ".bed");
-        exit;
+        exit(1);
     }
 
     std::streampos fileSize = fin.tellg();
@@ -494,7 +494,7 @@ void GENO::check_bed_numChar(){
     long long fileSizeExpected = (_num_id + 3) / 4 * _num_snp;
     if(fileSize != fileSizeExpected + 3){
         spdlog::error("The size of " + _geno_file + ".bed" + " doesn't correspond to the number of iids and SNPs");
-        exit;
+        exit(1);
     }
 }
 
@@ -514,7 +514,7 @@ void GENO::read_bed(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_arr, V
     // check the boundary
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
-        exit;
+        exit(1);
     }
     
     // the number of bytes to store on SNP
@@ -527,7 +527,7 @@ void GENO::read_bed(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_arr, V
     fin.open(in_file, std::ios::binary); // Read the in binary
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit;
+        exit(1);
     }
 
     char* bytes_vec = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
@@ -591,7 +591,7 @@ void GENO::read_bed_omp_spMVLMM(string in_file, double* snp_mat_part_pt, VectorX
     // check the boundary
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
-        exit;
+        exit(1);
     }
     // Compute the number of bytes needed to store genotypes for all individual per SNP.
     long long num_byte_for_one_snp = (_num_id + 3) / 4; //One byte can store 4 SNPs
@@ -600,7 +600,7 @@ void GENO::read_bed_omp_spMVLMM(string in_file, double* snp_mat_part_pt, VectorX
     FILE* fin = fopen(in_file.c_str(), "rb"); // Read the in binary
     if (!fin) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit;
+        exit(1);
     }
 
     // LOGGER.i("Read the PLINK BED file");
@@ -608,7 +608,7 @@ void GENO::read_bed_omp_spMVLMM(string in_file, double* snp_mat_part_pt, VectorX
     std::streamoff startPos = start_snp*num_byte_for_one_snp + 3; // Calculate the starting position of the SNP data
     if (fseek(fin, startPos, SEEK_SET) != 0){
         spdlog::error("Fail to seek the predefined position");
-        exit;
+        exit(1);
     }
     
     // LOGGER.i("Read");
@@ -617,12 +617,12 @@ void GENO::read_bed_omp_spMVLMM(string in_file, double* snp_mat_part_pt, VectorX
     if (read_count != num_byte_for_one_snp * num_snp_read){
         delete [] bytes_vec;
         spdlog::error("fread failed to read the expected amount");
-        exit;
+        exit(1);
     }
     if(ferror(fin)){
         delete [] bytes_vec;
         spdlog::error("Failed to read from file: " + in_file);
-        exit;
+        exit(1);
     }
     fclose(fin);
 
@@ -718,7 +718,7 @@ void GENO::read_bed_omp(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_ar
     // check the boundary
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
-        exit;
+        exit(1);
     }
     // the number of bytes to store on SNP
     long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
@@ -881,7 +881,7 @@ void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_ar
         tmp = split_string(line);
         if(tmp.size() - _num_id != 1){
             spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
-            exit;
+            exit(1);
         }
         // genotypic values
         freq = 0.0;
@@ -972,7 +972,7 @@ void GENO::read_bed_by_snp_index(string in_file, MatrixXd& snp_mat_by_snp_index,
     fin.open(in_file, std::ios::binary); // Read the in binary
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit;
+        exit(1);
     }
 
 
@@ -1056,7 +1056,7 @@ void GENO::read_dgeno_by_geno_index(string in_file, MatrixXd& geno_mat_by_snp_in
     fin.open(in_file);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the dosage genotype file: " + in_file);
-        exit;
+        exit(1);
     }
 
 
@@ -1090,7 +1090,7 @@ void GENO::read_dgeno_by_geno_index(string in_file, MatrixXd& geno_mat_by_snp_in
         tmp = split_string(line);
         if(tmp.size() - _num_id != 1){
             spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
-            exit;
+            exit(1);
         }
 
         
@@ -1185,7 +1185,7 @@ void GENO::read_bed_2Dpart(MatrixXd& snp_mat_part, long long start_snp, long lon
     fin.open(in_file, std::ios::binary); // Read the in binary
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit;
+        exit(1);
     }
     char* bytes_mat = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
     double code_val, mean_allele;  // coded value for SNP genotype

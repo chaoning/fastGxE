@@ -149,7 +149,7 @@ Once GxE genomic loci are identified, the environmental factors driving the GxE 
 First reformat the genomic relationship matrix with fastgxe
 
 ```
-# this step will produce the 
+# This step generates the reformatted GRM used by mmSuSiE.
 fastgxe --process-grm --reformat --grm test.agrm --out-fmt 1 --out test.agrm
 ```
 

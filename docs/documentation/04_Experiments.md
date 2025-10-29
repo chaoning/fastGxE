@@ -6,5 +6,5 @@ description:
 
 Here are the code for runing analysis in fastGxE manuscript. 
 
-Coming soon
+https://github.com/chaoning/fastGxE/tree/main/Manuscript
 

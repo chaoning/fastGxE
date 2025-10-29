@@ -1,20 +1,22 @@
 cmake_minimum_required(VERSION 3.16)
 project(fastgxeProject)
 
+set(CMAKE_CXX_COMPILER "/home/chaoning/intel/oneapi/compiler/2025.2/bin/icpx")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fopenmp")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -qopenmp")
 
 # Set external library paths (modify accordingly)
-set(MKLROOT /net/mulan/home/chaon/intel/oneapi/mkl/2024.1/)
-set(GSLROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/gsl-2.7/)
-set(EIGENROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/eigen-3.4.0/)
-set(LBFGSppROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/LBFGSpp/include/)
-set(BOOSTROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/boost_1_89_0/)
-set(UTILROOT /net/zootopia/disk1/chaon/WORK/fastgxe/utils/)
-set(GMATRIXROOT /net/zootopia/disk1/chaon/WORK/fastgxe/gmatrix/)
-set(SPDROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/)
-set(CLIROOT /net/zootopia/disk1/chaon/WORK/fastgxe/external/)
+set(MKLROOT /home/chaoning/intel/oneapi/mkl/2025.2/)
+set(GSLROOT /home/chaoning/software/fastgxe/external/gsl-2.7/)
+set(EIGENROOT /home/chaoning/software/fastgxe/external/eigen-3.4.0/)
+set(LBFGSppROOT /home/chaoning/software/fastgxe/external/LBFGSpp/include/)
+set(BOOSTROOT /home/chaoning/software/fastgxe/external/boost_1_89_0/)
+set(UTILROOT /home/chaoning/software/fastgxe/utils/)
+set(GMATRIXROOT /home/chaoning/software/fastgxe/gmatrix/)
+set(SPDROOT /home/chaoning/software/fastgxe/external/)
+set(CLIROOT /home/chaoning/software/fastgxe/external/)
 
 # Include directories
 include_directories(

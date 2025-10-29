@@ -75,7 +75,7 @@ int fastGxE::pre_data(string out_file, string data_file, string agrm_file, vecto
     ProcessGRM ProcessGRMA;
     vector<string> id_in_gmat_vec = ProcessGRMA.read_grm_id(agrm_file + ".agrm");
     long long num_id_in_grm = id_in_gmat_vec.size();
-    spdlog::info("The sample size in the GRM is: {}" + num_id_in_grm);
+    spdlog::info("The sample size in the GRM is: {}", num_id_in_grm);
 
     // read data file
     spdlog::info("Read data file");
