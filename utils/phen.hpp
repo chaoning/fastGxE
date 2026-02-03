@@ -23,6 +23,9 @@ class PHEN{
     public:
         PHEN();
         void read_full(string pheno_file, vector<vector<string>>& data_vec);
+        void read_selected_cols(const string& pheno_file,
+                              const vector<long long>& target_cols,
+                              vector<vector<string>>& data_vec);
         void index_keep_byGRM(vector<long long> random_grm_vec, vector<vector<string>> grm_id_used_vec_vec);
         void index_keep_deleteNA(vector<long long> col_used_vec, vector<string> missing_in_data_vec);
         void update_data_vec();

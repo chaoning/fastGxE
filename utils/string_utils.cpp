@@ -37,6 +37,7 @@ void process_line(string &line, const string comment_str) {
 }
 
 // Split a string by spaces into a vector of strings
+/*
 vector<string> split_string(const std::string &str) {
     vector<string> result;
     istringstream stream(str);
@@ -46,6 +47,28 @@ vector<string> split_string(const std::string &str) {
     }
     return result;
 }
+*/
+
+vector<string> split_string(const std::string& s) {
+    vector<string> result;
+    result.reserve(10000);
+
+    size_t start = 0;
+    const size_t n = s.size();
+
+    while (start < n) {
+        while (start < n && isspace(s[start])) ++start;
+        if (start >= n) break;
+
+        size_t end = start;
+        while (end < n && !isspace(s[end])) ++end;
+
+        result.emplace_back(s.substr(start, end - start));
+        start = end;
+    }
+    return result;
+}
+
 
 // Join a vector of strings using a given separator
 string join_string(const std::vector<std::string> &str_vec, const std::string &split_str) {

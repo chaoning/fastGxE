@@ -18,6 +18,8 @@
 #include <cmath>
 #include <string>
 #include <random>
+#include <fstream>
+#include <chrono>
 #include <gsl/gsl_cdf.h>
 #include <spdlog/spdlog.h>
 #include <CLI/CLI.hpp>  // Include CLI11
@@ -69,6 +71,25 @@ int fastGxE::pre_data(string out_file, string data_file, string agrm_file, vecto
     spdlog::info("The number of covariates: {}", num_covariate);
     spdlog::info("The number of classes: {}", num_class);
     spdlog::info("The number of interaction environments: {}", m_num_bye);
+
+    // #region agent log
+    {
+        std::ofstream debug_log("e:\\code\\fastgxe\\.cursor\\debug.log", std::ios::app);
+        if (debug_log.is_open()) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            debug_log
+                << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\","
+                << "\"location\":\"fastgxe/fastgxe.cpp:pre_data\",\"message\":\"pre_data entry\","
+                << "\"data\":{\"num_trait\":" << m_num_trait
+                << ",\"num_covariate\":" << num_covariate
+                << ",\"num_class\":" << num_class
+                << ",\"num_bye\":" << m_num_bye
+                << "},\"timestamp\":" << now_ms << "}"
+                << std::endl;
+        }
+    }
+    // #endregion
 
     // id in grm
     spdlog::info("Read iids in GRM");
@@ -1557,7 +1578,6 @@ void fastGxE::test_GxE(string bed_file,
                     xmatk.col(0) = snpk;
 
                     for(long long m = 0; m < m_num_bye; m++){
-                        if(p_Vec(m+1) < p_approx_cut){
                             xmatk.col(1) = snpkME.col(m);
                             if(speed == 0){
                                 // exact test
@@ -1583,7 +1603,6 @@ void fastGxE::test_GxE(string bed_file,
                                 z_mat(k, m+1) = beta_Mat(k, m+1) / se_Mat(k, m+1);
                                 p_Vec(m+1) = p_val;
                             }
-                        }
                     }
 
                 }
@@ -1654,6 +1673,22 @@ void fastGxE::output_GxE(ofstream& fout, vector<string> snp_info_vec, VectorXd& 
 
 
 int fastGxE::run(int argc, char **argv) {
+    // #region agent log
+    {
+        std::ofstream debug_log("e:\\code\\fastgxe\\.cursor\\debug.log", std::ios::app);
+        if (debug_log.is_open()) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            debug_log
+                << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H1\","
+                << "\"location\":\"fastgxe/fastgxe.cpp:run\",\"message\":\"fastGxE::run entry\","
+                << "\"data\":{\"argc\":" << argc << "},"
+                << "\"timestamp\":" << now_ms << "}"
+                << std::endl;
+        }
+    }
+    // #endregion
+
     CLI::App app{"fastGxE - Scalable and fast multivariate GxE analysis"};
 
     app.description(R"(
@@ -1856,6 +1891,28 @@ int fastGxE::run(int argc, char **argv) {
     spdlog::info("Minor Allele Frequency Cutoff: {}", maf_cut);
     spdlog::info("Missing Rate Cutoff: {}", missing_rate_cut);
     spdlog::info("Number of Random SNPs: {}", num_random_snp);
+
+    // #region agent log
+    {
+        std::ofstream debug_log("e:\\code\\fastgxe\\.cursor\\debug.log", std::ios::app);
+        if (debug_log.is_open()) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            debug_log
+                << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H2\","
+                << "\"location\":\"fastgxe/fastgxe.cpp:run\",\"message\":\"CLI parsed\","
+                << "\"data\":{"
+                << "\"test_main\":" << (test_main ? "true" : "false") << ","
+                << "\"test_gxe\":" << (test_gxe ? "true" : "false") << ","
+                << "\"data_file\":\"" << data_file << "\","
+                << "\"agrm_file\":\"" << agrm_file << "\","
+                << "\"bed_file\":\"" << (bed_file.empty() ? "" : bed_file) << "\","
+                << "\"out_file\":\"" << out_file << "\""
+                << "},\"timestamp\":" << now_ms << "}"
+                << std::endl;
+        }
+    }
+    // #endregion
     
     if(!split_task_vec.empty()) spdlog::info("Task Partitioning: {} parts, running part {}", split_task_vec[0], split_task_vec[1]);
     
@@ -1946,7 +2003,25 @@ int fastGxE::run(int argc, char **argv) {
     }
     strNoFound_vec.clear();
 
-
+    // #region agent log
+    {
+        std::ofstream debug_log("e:\\code\\fastgxe\\.cursor\\debug.log", std::ios::app);
+        if (debug_log.is_open()) {
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            debug_log
+                << "{\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"H3\","
+                << "\"location\":\"fastgxe/fastgxe.cpp:run\",\"message\":\"index resolution\","
+                << "\"data\":{"
+                << "\"trait_index_count\":" << trait_index_vec.size() << ","
+                << "\"covariate_index_count\":" << covariate_index_vec.size() << ","
+                << "\"class_index_count\":" << class_index_vec.size() << ","
+                << "\"bye_index_count\":" << bye_index_vec.size()
+                << "},\"timestamp\":" << now_ms << "}"
+                << std::endl;
+        }
+    }
+    // #endregion
 
     // prepare data
     this->pre_data(out_file, data_file, agrm_file, covariate_index_vec, class_index_vec, 

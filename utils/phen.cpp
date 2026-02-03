@@ -6,6 +6,7 @@
  * @LastEditors: Chao Ning
  * @LastEditTime: 2025-01-31 19:45:56
  */
+#define EIGEN_USE_MKL_ALL  // must be before include Eigen
 
 
 #include<iostream>
@@ -18,6 +19,8 @@
 #include <spdlog/spdlog.h>
 
 #include <boost/algorithm/string.hpp>
+#include "mkl.h"
+#include "omp.h"
 
 #include "phen.hpp"
 #include "iterator_utils.hpp"
@@ -42,37 +45,101 @@ PHEN::PHEN(){
 
 void PHEN::read_full(string pheno_file, vector<vector<string>>& data_vec){
     ifstream fin(pheno_file);
-    if(!fin.is_open()) {
+    if (!fin) {
         spdlog::error("Fail to open the phenotypic file");
         exit(1);
     }
-    
-    // head line
-    string one_line;
-    getline(fin, one_line); // skip header line
-    m_head_column_vec.clear(); // ! class member
-    boost::split(m_head_column_vec, one_line, isspace, boost::token_compress_on);
-    long long num_col_head = m_head_column_vec.size();
 
-    // read
-    data_vec.resize(num_col_head + 1);
-    long long ith_line = 0;
-    while (getline(fin, one_line)) {
-        vector<string> tmp_vec;
-        boost::split(tmp_vec, one_line, isspace, boost::token_compress_on);
-        if(tmp_vec.size() != num_col_head){ // locate line with different columns compared with head lines.
-            cout << "Check this row: " << one_line <<", this row has different number of columns with head lines" << endl;
+    string line;
+
+    // ===================== Read header =====================
+    getline(fin, line);
+    m_head_column_vec = split_string(line);
+    const size_t num_col = m_head_column_vec.size();
+
+    // +1 for row index column
+    data_vec.assign(num_col + 1, {});
+
+    size_t row_id = 0;
+
+    // ===================== Read data =====================
+    while (getline(fin, line)) {
+        process_line(line);
+
+        auto fields = split_string(line);
+
+        if (fields.size() != num_col) {
+            spdlog::error("Column mismatch at row {}: {}", row_id + 1, line);
             exit(1);
         }
-        ith_line++;
-        tmp_vec.push_back(std::to_string(ith_line)); // add line NO.
-        for(int i = 0; i < tmp_vec.size(); i++){
-            data_vec[i].push_back(tmp_vec[i]);
-        }
+
+        ++row_id;
+
+        // Move strings directly into column storage (no copy)
+        for (size_t i = 0; i < num_col; ++i)
+            data_vec[i].push_back(std::move(fields[i]));
+
+        data_vec[num_col].push_back(std::to_string(row_id));
     }
-    fin.close();
 }
 
+void PHEN::read_selected_cols(const string& pheno_file,
+                              const vector<long long>& target_cols,
+                              vector<vector<string>>& data_vec) {
+
+    // Open phenotype file
+    ifstream fin(pheno_file);
+    if (!fin) {
+        spdlog::error("Fail to open the phenotypic file");
+        exit(1);
+    }
+
+    string line;
+
+    // ===================== Read header =====================
+    getline(fin, line);
+    m_head_column_vec = split_string(line);
+    const size_t num_col = m_head_column_vec.size();
+
+    // Validate requested column indices
+    for (auto c : target_cols) {
+        if (c >= num_col) {
+            spdlog::error("Requested column {} out of range (0..{})", c, num_col - 1);
+            exit(1);
+        }
+    }
+
+    const size_t K = target_cols.size();
+
+    // Allocate output: K selected columns + 1 column for row index
+    data_vec.assign(K + 1, {});
+
+    size_t row_id = 0;
+
+    // ===================== Read data =====================
+    while (getline(fin, line)) {
+        process_line(line);
+
+        auto fields = split_string(line);
+
+        // Check column consistency
+        if (fields.size() != num_col) {
+            spdlog::error("Column mismatch at row {}: {}", row_id + 1, line);
+            exit(1);
+        }
+
+        ++row_id;
+
+        // Store selected columns only
+        for (size_t j = 0; j < K; ++j) {
+            size_t col = target_cols[j];
+            data_vec[j].push_back(fields[col]);
+        }
+
+        // Store row index
+        data_vec[K].push_back(std::to_string(row_id));
+    }
+}
 
 void PHEN::index_keep_byGRM(vector<long long> random_grm_vec, vector<vector<string>> grm_id_used_vec_vec){
     
@@ -108,29 +175,48 @@ void PHEN::index_keep_byGRM(vector<long long> random_grm_vec, vector<vector<stri
 }
 
 void PHEN::index_keep_deleteNA(vector<long long> col_used_vec, vector<string> missing_in_data_vec){
-    for(auto val:col_used_vec){
-        auto tmp_vec = m_data_vec[val];
-        long long k = 0;
-        vector<long long> tmp_index_keep_vec;
-        for(auto val:tmp_vec){
-            k++;
-            if(!is_nan(val, missing_in_data_vec)){
-                tmp_index_keep_vec.push_back(k);
-            }
+    const size_t N = m_data_vec[0].size();
+
+    vector<char> keep(N, 1);   // 1 = keep, 0 = drop
+
+    for (size_t col : col_used_vec) {
+
+        auto& column = m_data_vec[col];
+
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < N; ++i) {
+            if (keep[i] && is_nan(column[i], missing_in_data_vec))
+                keep[i] = 0;
         }
-        m_index_keep_vec = set_intersection_(m_index_keep_vec, tmp_index_keep_vec);
     }
+
+    // Build final index list (1-based, same as your convention)
+    m_index_keep_vec.clear();
+    m_index_keep_vec.reserve(N);
+
+    for (size_t i = 0; i < N; ++i)
+        if (keep[i]) m_index_keep_vec.push_back(i + 1);
 }
 
 void PHEN::update_data_vec(){
-    for(auto& tmp_vec:m_data_vec){
-        vector<string> tmp_vec2(m_index_keep_vec.size());
-        long long ith = 0;
-        for(auto val:m_index_keep_vec){
-            tmp_vec2[ith] = tmp_vec[val-1];
-            ith++;
+    const size_t K = m_index_keep_vec.size();
+
+    vector<size_t> keep0;
+    keep0.reserve(K);
+    for (size_t x : m_index_keep_vec) keep0.push_back(x - 1);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t r = 0; r < m_data_vec.size(); ++r) {
+        auto& row = m_data_vec[r];
+
+        vector<string> new_row;
+        new_row.reserve(K);
+
+        for (size_t col : keep0) {
+            new_row.push_back(std::move(row[col]));
         }
-        tmp_vec = tmp_vec2;
+
+        row.swap(new_row);   // zero-copy replacement
     }
 }
 
@@ -156,9 +242,9 @@ void PHEN::read(string pheno_file, vector<long long> random_grm_vec, vector<vect
         val = ith;
     }
 
-    spdlog::info("Map the data with the GRM", 0);
+    spdlog::info("Map the data with the GRM");
     PHEN::index_keep_byGRM(random_grm_vec, grm_id_used_vec_vec);
-    spdlog::info("Delete lines with NA values", 0);
+    spdlog::info("Delete lines with NA values");
     PHEN::index_keep_deleteNA(col_used_vec, missing_in_data_vec);
     
     double ratio = m_index_keep_vec.size() * 1.0 / num_raw_records;
@@ -167,34 +253,44 @@ void PHEN::read(string pheno_file, vector<long long> random_grm_vec, vector<vect
         exit(1);
     }
 
-    spdlog::info("Update the dataframe", 0);
+    spdlog::info("Update the dataframe");
     PHEN::update_data_vec();
 }
 
 void PHEN::update_use_given_idOrder(vector<string> given_id_order_vec){
     
+    // 1) Extract ID column (column 0)
     vector<string> id_in_data_keep_vec;
     this->get_given_column(0, id_in_data_keep_vec);
+
+
+    // 2) Build ID -> index map
     map<string, long long> id_map;
     long long k = 0;
     for(auto tmp:id_in_data_keep_vec){
         id_map[tmp] = k++;
     }
 
-    
+    // 3) Convert given order to index vector
     vector<long long> id_index;
     for(auto tmp:given_id_order_vec){
         id_index.push_back(id_map[tmp]);
     }
+    const size_t K = id_index.size();
 
-    for(auto& tmp_vec:m_data_vec){
-        vector<string> tmp_vec2(id_index.size());
-        long long ith = 0;
-        for(auto val:id_index){
-            tmp_vec2[ith] = tmp_vec[val];
-            ith++;
-        }
-        tmp_vec = tmp_vec2;
+    // 4) Reorder every column in parallel
+    #pragma omp parallel for schedule(static)
+    for (size_t c = 0; c < m_data_vec.size(); ++c) {
+
+        auto& col = m_data_vec[c];
+
+        vector<string> new_col;
+        new_col.reserve(K);
+
+        for (size_t idx : id_index)
+            new_col.push_back(std::move(col[idx]));
+
+        col.swap(new_col);
     }
     
 }
