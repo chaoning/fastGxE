@@ -1,3 +1,5 @@
+#include <cstdint>
+
 #define EIGEN_USE_MKL_ALL  // must be before include Eigen
 
 
@@ -54,13 +56,13 @@ double cal_std(Eigen::VectorXd data) {
 }
 
 
-void read_data(const string &data_file, const vector<long long> &covariate_arr,
-               const vector<long long> &class_arr, const vector<long long> &bye_arr,
-               const vector<long long> &trait, const vector<string> &missing_in_data_vec,
+void read_data(const string &data_file, const vector<std::int64_t> &covariate_arr,
+               const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr,
+               const vector<std::int64_t> &trait, const vector<string> &missing_in_data_vec,
                PHEN &phenoA, const vector<string> &in_in_fam_vec,
                vector<string> &id_in_data_vec) {
-    vector<long long> col_used_vec = vector_merged({covariate_arr, class_arr, bye_arr, trait});
-    phenoA.read(data_file, {0}, {in_in_fam_vec}, col_used_vec, missing_in_data_vec);
+    vector<std::int64_t> col_used_vec = merge_unique_vectors({covariate_arr, class_arr, bye_arr, trait});
+    phenoA.read_and_filter(data_file, {0}, {in_in_fam_vec}, col_used_vec, missing_in_data_vec);
 
     phenoA.get_given_column(0, id_in_data_vec);
     set<string> id_in_data_st = set<string>(id_in_data_vec.begin(), id_in_data_vec.end());
@@ -72,14 +74,16 @@ void read_data(const string &data_file, const vector<long long> &covariate_arr,
 }
 
 
-MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<long long> &covariate_arr,
-                                  const vector<long long> &class_arr, const vector<long long> &bye_arr,
-                                  const vector<long long> &trait, MatrixXd &y) {
-    vector<long long> index_fixed_effect_vec;
+MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<std::int64_t> &covariate_arr,
+                                  const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr,
+                                  const vector<std::int64_t> &trait, MatrixXd &y) {
+    vector<std::int64_t> index_fixed_effect_vec;
     vector<string> fixed_effect_name_vec;
-    MatrixXd xmat = phenoA.dmat(covariate_arr, class_arr, index_fixed_effect_vec, fixed_effect_name_vec, trait, y);
-    vector<long long> column_to_remove_vec;
-    phenoA.dmat_column_full_rank(xmat, index_fixed_effect_vec, fixed_effect_name_vec, column_to_remove_vec);
+    MatrixXd xmat = phenoA.build_fixed_effect_design_matrix(
+        covariate_arr, class_arr, index_fixed_effect_vec, fixed_effect_name_vec, trait, y);
+    vector<std::int64_t> column_to_remove_vec;
+    phenoA.remove_dependent_design_columns(
+        xmat, index_fixed_effect_vec, fixed_effect_name_vec, column_to_remove_vec);
 
     if (!column_to_remove_vec.empty()) {
         spdlog::info("Dependent columns of xmat are removed: ");
@@ -94,11 +98,11 @@ MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<long long> &covaria
 
     MatrixXd bye_mat;
     if (!bye_arr.empty()) {
-        phenoA.get_given_columns_double(bye_arr, bye_mat);
+        phenoA.get_columns_as_matrix(bye_arr, bye_mat);
     }
 
-    long long nrows = xmat.rows();
-    long long ncols = xmat.cols();
+    std::int64_t nrows = xmat.rows();
+    std::int64_t ncols = xmat.cols();
     xmat.conservativeResize(nrows, ncols + bye_mat.cols());
     xmat.rightCols(bye_mat.cols()) = bye_mat;
     ColPivHouseholderQR<MatrixXd> qr(xmat);
@@ -113,8 +117,8 @@ MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<long long> &covaria
     return bye_mat;
 }
 
-void read_plink_bed(const string &bed_file, long long start_snp, long long num_snp_read,
-                    long long num_iid_bed, char* &bytes_vec) {
+void read_plink_bed(const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
+                    std::int64_t num_iid_bed, char* &bytes_vec) {
     string in_file = bed_file + ".bed";
     FILE* fin = fopen(in_file.c_str(), "rb");
     if (!fin) {
@@ -122,7 +126,7 @@ void read_plink_bed(const string &bed_file, long long start_snp, long long num_s
         exit(1);
     }
 
-    long long num_byte_for_one_snp = (num_iid_bed + 3) / 4;
+    std::int64_t num_byte_for_one_snp = (num_iid_bed + 3) / 4;
     std::streamoff startPos = start_snp * num_byte_for_one_snp + 3;
     if (fseek(fin, startPos, SEEK_SET) != 0) {
         spdlog::error("Fail to seek the predefined position");
@@ -130,7 +134,7 @@ void read_plink_bed(const string &bed_file, long long start_snp, long long num_s
     }
 
     bytes_vec = new char[num_byte_for_one_snp * num_snp_read];
-    long long read_count = fread(bytes_vec, sizeof(char), num_byte_for_one_snp * num_snp_read, fin);
+    std::int64_t read_count = fread(bytes_vec, sizeof(char), num_byte_for_one_snp * num_snp_read, fin);
     if (read_count != num_byte_for_one_snp * num_snp_read) {
         delete[] bytes_vec;
         spdlog::error("fread failed to read the expected amount");
@@ -144,15 +148,15 @@ void read_plink_bed(const string &bed_file, long long start_snp, long long num_s
     fclose(fin);
 }
 
-MatrixXd generate_random_Bs(long long num_iid_data, long long num_randomB, const MatrixXd &y) {
+MatrixXd generate_random_Bs(std::int64_t num_iid_data, std::int64_t num_randomB, const MatrixXd &y) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::normal_distribution<> d(0, 1);
     MatrixXd B = MatrixXd::Zero(num_iid_data, num_randomB + 1);
     B.col(0) = y.col(0);
 
-    for (long long i = 0; i < num_iid_data; i++) {
-        for (long long j = 1; j < num_randomB + 1; j++) {
+    for (std::int64_t i = 0; i < num_iid_data; i++) {
+        for (std::int64_t j = 1; j < num_randomB + 1; j++) {
             B(i, j) = d(gen);
         }
     }
@@ -160,15 +164,15 @@ MatrixXd generate_random_Bs(long long num_iid_data, long long num_randomB, const
     return B;
 }
 
-void MoM::process_snps(long long num_snp_read, long long num_iid_bed, long long num_used_id,
-                  long long num_randomB, const char* bytes_vec, const vector<long long> &index_vec,
+void MoM::process_snps(std::int64_t num_snp_read, std::int64_t num_iid_bed, std::int64_t num_used_id,
+                  std::int64_t num_randomB, const char* bytes_vec, const vector<std::int64_t> &index_vec,
                   MatrixXd &GB, MatrixXd &VB, const MatrixXd &B, const MatrixXd &bye_mat) {
-    long long num_byte_for_one_snp = (num_iid_bed + 3) / 4;
+    std::int64_t num_byte_for_one_snp = (num_iid_bed + 3) / 4;
 
     #pragma omp parallel for schedule(dynamic)
-    for (long long isnp = 0; isnp < num_snp_read; isnp++) {
+    for (std::int64_t isnp = 0; isnp < num_snp_read; isnp++) {
         Eigen::VectorXd snp_Vec(num_iid_bed);
-        for (long long i = 0; i < num_iid_bed; i++) {
+        for (std::int64_t i = 0; i < num_iid_bed; i++) {
             unsigned char byte = bytes_vec[i / 4 + isnp * num_byte_for_one_snp];
             unsigned char genotype = (byte >> (2 * (i % 4))) & 3;
             double code_val;
@@ -183,10 +187,10 @@ void MoM::process_snps(long long num_snp_read, long long num_iid_bed, long long 
         }
 
         Eigen::VectorXd snp_used_Vec = Eigen::VectorXd::Zero(num_used_id);
-        vector<long long> missing_index_vec;
+        vector<std::int64_t> missing_index_vec;
         double sum = 0;
-        for (long long i = 0; i < num_used_id; i++) {
-            long long code_int = snp_Vec[index_vec[i]];
+        for (std::int64_t i = 0; i < num_used_id; i++) {
+            std::int64_t code_int = snp_Vec[index_vec[i]];
             if (code_int == -9) {
                 missing_index_vec.push_back(i);
             } else {
@@ -194,7 +198,7 @@ void MoM::process_snps(long long num_snp_read, long long num_iid_bed, long long 
                 sum += code_int;
             }
         }
-        long long num_missing = missing_index_vec.size();
+        std::int64_t num_missing = missing_index_vec.size();
         double missing_rate = num_missing * 1.0 / num_used_id;
         if(missing_rate < m_missing_rate_cut){
             double freq = sum / (2 * (num_used_id - num_missing));
@@ -224,15 +228,15 @@ void MoM::process_snps(long long num_snp_read, long long num_iid_bed, long long 
 }
 
 
-void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long num_used_id,
-                  long long num_randomB, const char* bytes_vec, const vector<long long> &index_vec,
+void process_snps_MV(std::int64_t num_snp_read, std::int64_t num_iid_bed, std::int64_t num_used_id,
+                  std::int64_t num_randomB, const char* bytes_vec, const vector<std::int64_t> &index_vec,
                   vector<MatrixXd> &VB_vec, const MatrixXd &B, const MatrixXd &bye_mat) {
-    long long num_byte_for_one_snp = (num_iid_bed + 3) / 4;
+    std::int64_t num_byte_for_one_snp = (num_iid_bed + 3) / 4;
 
     #pragma omp parallel for schedule(dynamic)
-    for (long long isnp = 0; isnp < num_snp_read; isnp++) {
+    for (std::int64_t isnp = 0; isnp < num_snp_read; isnp++) {
         Eigen::VectorXd snp_Vec(num_iid_bed);
-        for (long long i = 0; i < num_iid_bed; i++) {
+        for (std::int64_t i = 0; i < num_iid_bed; i++) {
             unsigned char byte = bytes_vec[i / 4 + isnp * num_byte_for_one_snp];
             unsigned char genotype = (byte >> (2 * (i % 4))) & 3;
             double code_val;
@@ -247,10 +251,10 @@ void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long nu
         }
 
         Eigen::VectorXd snp_used_Vec = Eigen::VectorXd::Zero(num_used_id);
-        vector<long long> missing_index_vec;
+        vector<std::int64_t> missing_index_vec;
         double sum = 0;
-        for (long long i = 0; i < num_used_id; i++) {
-            long long code_int = snp_Vec[index_vec[i]];
+        for (std::int64_t i = 0; i < num_used_id; i++) {
+            std::int64_t code_int = snp_Vec[index_vec[i]];
             if (code_int == -9) {
                 missing_index_vec.push_back(i);
             } else {
@@ -258,7 +262,7 @@ void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long nu
                 sum += code_int;
             }
         }
-        long long num_missing = missing_index_vec.size();
+        std::int64_t num_missing = missing_index_vec.size();
         if(num_missing != num_used_id){
             double freq = sum / (2 * (num_used_id - num_missing));
             snp_used_Vec = snp_used_Vec.array() - 2 * freq;
@@ -278,7 +282,7 @@ void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long nu
         Eigen::MatrixXd snpByeE = bye_mat.array().colwise() * snp_used_Vec.array();
 
         vector <Eigen::MatrixXd> local_VB_vec;
-        for(long long i = 0; i < snpByeE.cols(); i++){
+        for(std::int64_t i = 0; i < snpByeE.cols(); i++){
             Eigen::MatrixXd local_VB = snpByeE.col(i) * (snpByeE.col(i).transpose() * B) / (num_snp_read * bye_mat.cols());
             local_VB_vec.push_back(local_VB);
         }
@@ -287,7 +291,7 @@ void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long nu
         #pragma omp critical
         {
             VB_vec[0] += local_GB;
-            for(long long i = 0; i < snpByeE.cols(); i++){
+            for(std::int64_t i = 0; i < snpByeE.cols(); i++){
                 VB_vec[i+1] += local_VB_vec[i];
             }
             
@@ -297,8 +301,8 @@ void process_snps_MV(long long num_snp_read, long long num_iid_bed, long long nu
 
 
 VectorXd calculate_variance_components(const MatrixXd &GB, const MatrixXd &VB, const MatrixXd &B, const MatrixXd &y) {
-    long long num_randomB = B.cols() - 1;
-    long long num_used_id = GB.rows();
+    std::int64_t num_randomB = B.cols() - 1;
+    std::int64_t num_used_id = GB.rows();
 
     MatrixXd leftMat(3, 3);
     VectorXd rightVec(3);
@@ -320,8 +324,8 @@ VectorXd calculate_variance_components(const MatrixXd &GB, const MatrixXd &VB, c
 
 
 VectorXd calculate_variance_components_withNxE(const MatrixXd &GB, const MatrixXd &VB, const VectorXd &nxe_vec, const MatrixXd &B, const MatrixXd &y) {
-    long long num_randomB = B.cols() - 1;
-    long long num_used_id = GB.rows();
+    std::int64_t num_randomB = B.cols() - 1;
+    std::int64_t num_used_id = GB.rows();
 
     MatrixXd leftMat(4, 4);
     VectorXd rightVec(4);
@@ -348,16 +352,16 @@ VectorXd calculate_variance_components_withNxE(const MatrixXd &GB, const MatrixX
 }
 
 VectorXd calculate_multi_variance_components(const vector<MatrixXd> &VB_vec, const MatrixXd &B, const MatrixXd &y) {
-    long long num_randomB = B.cols() - 1;
-    long long num_used_id = VB_vec[0].rows();
-    long long num_varcom = VB_vec.size() + 1;
+    std::int64_t num_randomB = B.cols() - 1;
+    std::int64_t num_used_id = VB_vec[0].rows();
+    std::int64_t num_varcom = VB_vec.size() + 1;
 
     MatrixXd leftMat(num_varcom, num_varcom);
     VectorXd rightVec(num_varcom);
 
-    for(long long i = 0; i < num_varcom - 1; i++){
+    for(std::int64_t i = 0; i < num_varcom - 1; i++){
         leftMat(i, i) = (VB_vec[i].rightCols(num_randomB).cwiseProduct(VB_vec[i].rightCols(num_randomB))).sum() / num_randomB;
-        for(long long j = i + 1; j < num_varcom - 1; j ++){
+        for(std::int64_t j = i + 1; j < num_varcom - 1; j ++){
             leftMat(i, j) = leftMat(j, i) = (VB_vec[i].rightCols(num_randomB).cwiseProduct(VB_vec[j].rightCols(num_randomB))).sum() / num_randomB;
         }
 
@@ -365,7 +369,7 @@ VectorXd calculate_multi_variance_components(const vector<MatrixXd> &VB_vec, con
     }
     leftMat(num_varcom - 1, num_varcom - 1) = num_used_id;
 
-    for(long long i = 0; i < num_varcom - 1; i++){
+    for(std::int64_t i = 0; i < num_varcom - 1; i++){
         rightVec(i) = (VB_vec[i].col(0).transpose() * y).sum();
     }
     rightVec(num_varcom - 1) = (y.transpose() * y).sum();
@@ -375,21 +379,21 @@ VectorXd calculate_multi_variance_components(const vector<MatrixXd> &VB_vec, con
 }
 
 
-void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
-          const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
-          const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
-          long long num_randomB) {
+void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<std::int64_t> &covariate_arr,
+          const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr, const vector<std::int64_t> &trait,
+          const vector<string> &missing_in_data_vec, const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
+          std::int64_t num_randomB) {
     spdlog::info("Start analysis...");
 
-    long long num_trait = trait.size();
-    long long num_covariate = covariate_arr.size();
-    long long num_class = class_arr.size();
-    long long num_bye = bye_arr.size();
+    std::int64_t num_trait = trait.size();
+    std::int64_t num_covariate = covariate_arr.size();
+    std::int64_t num_class = class_arr.size();
+    std::int64_t num_bye = bye_arr.size();
 
     spdlog::info("Read IDs from Plink .fam file");
     GENO genoA(bed_file);
-    long long num_iid_bed = genoA.get_num_iid();
-    long long num_sid_bed = genoA.get_num_sid();
+    std::int64_t num_iid_bed = genoA.get_num_iid();
+    std::int64_t num_sid_bed = genoA.get_num_sid();
     vector<string> in_in_fam_vec = genoA.iid_vec();
 
     spdlog::info("Read data file");
@@ -397,7 +401,7 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
     vector<string> id_in_data_vec;
     read_data(data_file, covariate_arr, class_arr, bye_arr, trait, missing_in_data_vec, phenoA, in_in_fam_vec, id_in_data_vec);
 
-    long long num_iid_data = id_in_data_vec.size();
+    std::int64_t num_iid_data = id_in_data_vec.size();
     spdlog::info("The number of used iids in data file: {}", num_iid_data);
 
     spdlog::info("Design matrix for fixed effects");
@@ -411,8 +415,8 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
     spdlog::info("Random Bs");
     MatrixXd B = generate_random_Bs(num_iid_data, num_randomB, y);
 
-    vector<long long> index_vec = genoA.find_fam_index_pro(id_in_data_vec);
-    long long num_used_id = index_vec.size();
+    vector<std::int64_t> index_vec = genoA.find_fam_index(id_in_data_vec);
+    std::int64_t num_used_id = index_vec.size();
 
     MatrixXd GB = MatrixXd::Zero(num_used_id, num_randomB + 1);
     MatrixXd VB = MatrixXd::Zero(num_used_id, num_randomB + 1);
@@ -447,21 +451,21 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
 
 
 
-void MoM::MoMMV(const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
-          const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
-          const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
-          long long num_randomB) {
+void MoM::MoMMV(const string &out_file, const string &data_file, const vector<std::int64_t> &covariate_arr,
+          const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr, const vector<std::int64_t> &trait,
+          const vector<string> &missing_in_data_vec, const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
+          std::int64_t num_randomB) {
     spdlog::info("Start analysis...");
 
-    long long num_trait = trait.size();
-    long long num_covariate = covariate_arr.size();
-    long long num_class = class_arr.size();
-    long long num_bye = bye_arr.size();
+    std::int64_t num_trait = trait.size();
+    std::int64_t num_covariate = covariate_arr.size();
+    std::int64_t num_class = class_arr.size();
+    std::int64_t num_bye = bye_arr.size();
 
     spdlog::info("Read IDs from Plink .fam file");
     GENO genoA(bed_file);
-    long long num_iid_bed = genoA.get_num_iid();
-    long long num_sid_bed = genoA.get_num_sid();
+    std::int64_t num_iid_bed = genoA.get_num_iid();
+    std::int64_t num_sid_bed = genoA.get_num_sid();
     vector<string> in_in_fam_vec = genoA.iid_vec();
 
     spdlog::info("Read data file");
@@ -469,7 +473,7 @@ void MoM::MoMMV(const string &out_file, const string &data_file, const vector<lo
     vector<string> id_in_data_vec;
     read_data(data_file, covariate_arr, class_arr, bye_arr, trait, missing_in_data_vec, phenoA, in_in_fam_vec, id_in_data_vec);
 
-    long long num_iid_data = id_in_data_vec.size();
+    std::int64_t num_iid_data = id_in_data_vec.size();
     spdlog::info("The number of used iids in data file: {}", num_iid_data);
 
 
@@ -484,11 +488,11 @@ void MoM::MoMMV(const string &out_file, const string &data_file, const vector<lo
     spdlog::info("Random Bs");
     MatrixXd B = generate_random_Bs(num_iid_data, num_randomB, y);
 
-    vector<long long> index_vec = genoA.find_fam_index_pro(id_in_data_vec);
-    long long num_used_id = index_vec.size();
+    vector<std::int64_t> index_vec = genoA.find_fam_index(id_in_data_vec);
+    std::int64_t num_used_id = index_vec.size();
 
     vector<MatrixXd> VB_vec;
-    for(long long i = 0; i < num_bye+1; i++){
+    for(std::int64_t i = 0; i < num_bye+1; i++){
         VB_vec.push_back(MatrixXd::Zero(num_used_id, num_randomB + 1));
     }
 
@@ -517,8 +521,8 @@ int MoM::run(int argc, char* argv[]) {
 
     int threads = 10;
     std::string out_file, data_file, bed_file;
-    std::vector<long long> block_vec;
-    long long num_randomB = 10;
+    std::vector<std::int64_t> block_vec;
+    std::int64_t num_randomB = 10;
     std::vector<std::string> covariate_vec, class_vec, bye_vec, trait;
     std::vector<std::string> missing_in_data_vec = {"NA", "Na", "na", "NAN", "NaN", "nan", "-NAN", "-NaN", "-nan", "<NA>", "<na>", "N/A", "n/a"};
 
@@ -615,7 +619,7 @@ int MoM::run(int argc, char* argv[]) {
     // Trait index
     
     std::vector<std::string> strNoFound_vec;
-    std::vector<long long> trait_index_vec = find_index(head_vec, trait, strNoFound_vec);
+    std::vector<std::int64_t> trait_index_vec = find_index(head_vec, trait, strNoFound_vec);
 
     if (!strNoFound_vec.empty()) {
         spdlog::error("Trait names not found in the header: {}", join_string(strNoFound_vec));
@@ -629,7 +633,7 @@ int MoM::run(int argc, char* argv[]) {
         spdlog::info("Number of covariates: {}, Covariates: {}", 
              covariate_vec.size(), join_string(covariate_vec, ", "));
     }
-    vector <long long> covariate_index_vec = find_index(head_vec, covariate_vec, strNoFound_vec);
+    vector <std::int64_t> covariate_index_vec = find_index(head_vec, covariate_vec, strNoFound_vec);
     strNoFound_vec.clear();
 
     // class index
@@ -638,14 +642,14 @@ int MoM::run(int argc, char* argv[]) {
         spdlog::info("Number of class variables: {}, class variables: {}", 
              class_vec.size(), join_string(class_vec, ", "));
     }
-    vector <long long> class_index_vec = find_index(head_vec, class_vec, strNoFound_vec);
+    vector <std::int64_t> class_index_vec = find_index(head_vec, class_vec, strNoFound_vec);
     strNoFound_vec.clear();
 
     // interacting environment
     bye_vec = expand_variable_ranges(bye_vec, head_vec);
     spdlog::info("Number of interacting environmental covariates: {}, Interacting environmental covariates: {}", 
              bye_vec.size(), join_string(bye_vec, ", "));
-    vector <long long> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
+    vector <std::int64_t> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
     if(strNoFound_vec.size() != 0){
         spdlog::error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
         exit(1);
@@ -653,8 +657,8 @@ int MoM::run(int argc, char* argv[]) {
     strNoFound_vec.clear();
     
     if (!bye_index_vec.empty()) {
-        std::vector<long long> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
-        std::vector<long long> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
+        std::vector<std::int64_t> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
+        std::vector<std::int64_t> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
         
         if (!tmp1.empty() || !tmp2.empty()) {
             spdlog::error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
@@ -665,17 +669,17 @@ int MoM::run(int argc, char* argv[]) {
 
     // Load genotype data
     GENO genoA(bed_file);
-    long long num_sid_bed = genoA.get_num_sid();
-    long long start_pos = 0, num_snp_read = num_sid_bed;
+    std::int64_t num_sid_bed = genoA.get_num_sid();
+    std::int64_t start_pos = 0, num_snp_read = num_sid_bed;
 
     if (!block_vec.empty()) {
         if (block_vec[0] < block_vec[1] || block_vec[1] <= 0) {
             spdlog::error("Invalid block parameters: second number must be >0 and <= first number");
             exit(1);
         }
-        long long num_snp_part = num_sid_bed / block_vec[0];
+        std::int64_t num_snp_part = num_sid_bed / block_vec[0];
         start_pos = num_snp_part * (block_vec[1] - 1);
-        long long end_pos = num_snp_part * block_vec[1];
+        std::int64_t end_pos = num_snp_part * block_vec[1];
         if (block_vec[0] == block_vec[1]) end_pos = num_sid_bed;
         num_snp_read = end_pos - start_pos;
     }

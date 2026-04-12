@@ -2,11 +2,12 @@
  * @Description: Genomic Relationship Matrix (GRM) Computation CLI
  * @Author: Chao Ning
  * @Date: 2025-01-30
- * @LastEditTime: 2025-02-01 22:08:13
- * @LastEditors: Chao Ning
+ * LastEditTime: 2026-04-04 00:02:52
+ * LastEditors: Chao Ning
  */
 
 #define EIGEN_USE_MKL_ALL  // Must be defined before including Eigen
+
 
 #include <iostream>
 #include <getopt.h>
@@ -20,7 +21,7 @@
 
 // Display the general help message
 void show_help_general() {
-    std::cout << "Usage: gmatrix [options]\n"
+    std::cout << "Usage: fastgxe [options]\n"
               << "Options:\n"
               << "  -h 1   Compute the Genomic Relationship Matrix (GRM)\n"
               << "  -h 2   Post-process an existing GRM\n"

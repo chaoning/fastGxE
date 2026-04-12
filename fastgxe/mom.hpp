@@ -6,6 +6,8 @@
  * @LastEditors: Chao Ning
  * @LastEditTime: 2025-02-01 19:44:40
  */
+#include <cstdint>
+
 #pragma once
 
 #include <string>
@@ -33,17 +35,17 @@ private:
 public:
     MoM();
     ~MoM();
-    void MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
-          const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
-          const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
-          long long num_randomB);
-    void MoMMV(const string &out_file, const string &data_file, const vector<long long> &covariate_arr,
-          const vector<long long> &class_arr, const vector<long long> &bye_arr, const vector<long long> &trait,
-          const vector<string> &missing_in_data_vec, const string &bed_file, long long start_snp, long long num_snp_read,
-          long long num_randomB);
+    void MoMV(bool no_noisebye, const string &out_file, const string &data_file, const vector<std::int64_t> &covariate_arr,
+          const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr, const vector<std::int64_t> &trait,
+          const vector<string> &missing_in_data_vec, const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
+          std::int64_t num_randomB);
+    void MoMMV(const string &out_file, const string &data_file, const vector<std::int64_t> &covariate_arr,
+          const vector<std::int64_t> &class_arr, const vector<std::int64_t> &bye_arr, const vector<std::int64_t> &trait,
+          const vector<string> &missing_in_data_vec, const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
+          std::int64_t num_randomB);
     int run(int argc, char* argv[]);
 
-    void process_snps(long long num_snp_read, long long num_iid_bed, long long num_used_id,
-                  long long num_randomB, const char* bytes_vec, const vector<long long> &index_vec,
+    void process_snps(std::int64_t num_snp_read, std::int64_t num_iid_bed, std::int64_t num_used_id,
+                  std::int64_t num_randomB, const char* bytes_vec, const vector<std::int64_t> &index_vec,
                   MatrixXd &GB, MatrixXd &VB, const MatrixXd &B, const MatrixXd &bye_mat);
 };

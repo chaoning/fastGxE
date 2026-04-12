@@ -1,15 +1,11 @@
-/*
- * @Description: 
- * @Author: Chao Ning
- * @Date: 2025-01-31 15:05:20
- * @LastEditTime: 2025-01-31 19:45:03
- * @LastEditors: Chao Ning
- */
-
 #pragma once
+
+
+#include <cstdint>
 
 #include <string>
 #include <vector>
+
 #include <Eigen/Core>
 #include <Eigen/Eigen>
 
@@ -17,49 +13,54 @@ using std::string;
 using std::vector;
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
-using Eigen::SparseMatrix;
 
-class PHEN{
-    public:
-        PHEN();
-        void read_full(string pheno_file, vector<vector<string>>& data_vec);
-        void read_selected_cols(const string& pheno_file,
-                              const vector<long long>& target_cols,
-                              vector<vector<string>>& data_vec);
-        void index_keep_byGRM(vector<long long> random_grm_vec, vector<vector<string>> grm_id_used_vec_vec);
-        void index_keep_deleteNA(vector<long long> col_used_vec, vector<string> missing_in_data_vec);
-        void update_data_vec();
-        void update_use_given_idOrder(vector<string> given_id_order_vec);
-        void read(string pheno_file, vector<long long> random_grm_vec, vector<vector<string>> grm_id_used_vec_vec, vector<long long> col_used_vec, vector<string> missing_in_data_vec);
-        
-        
-        MatrixXd dmat(vector<long long> covariate_vec, vector<long long> class_vec, vector <long long>& index_fixed_effect_vec, vector <string>& fixed_effect_name_vec,
-            vector<long long> trait_vec, MatrixXd &y);
-        void dmat_column_full_rank(MatrixXd& xmat, vector <long long>& index_fixed_effect_vec, vector <string>& fixed_effect_name_vec, vector<long long>& column_to_remove_vec);
+class PHEN {
+public:
+    PHEN() = default;
 
-        MatrixXd dmat_for_one_effect(int type, long long effect_col, vector<string>& class_vec);
-        MatrixXd dmat_for_one_class(long long effect_col, vector<string>& class_level_vec);
-        MatrixXd dmat_for_one_covariate(long long effect_col);
+    void read_all_columns_raw(const string& pheno_file, vector<vector<string>>& data_vec);
+    void read_selected_columns_raw(const string& pheno_file,
+                                   const vector<std::int64_t>& target_cols,
+                                   vector<vector<string>>& data_vec);
+    void update_keep_indices_by_grm_ids(const vector<std::int64_t>& random_grm_vec,
+                                        const vector<vector<string>>& grm_id_used_vec_vec);
+    void update_keep_indices_by_non_missing_values(const vector<std::int64_t>& col_used_vec,
+                                                   const vector<string>& missing_in_data_vec);
+    void apply_keep_indices_to_data();
+    void reorder_records_by_sample_id_order(const vector<string>& sample_id_order_vec);
+    void read_and_filter(const string& pheno_file,
+                         const vector<std::int64_t>& random_grm_vec,
+                         const vector<vector<string>>& grm_id_used_vec_vec,
+                         const vector<std::int64_t>& col_used_vec,
+                         const vector<string>& missing_in_data_vec);
 
-        void dmat_for_one_random(long long effect_col, vector<string>& element_uni_vec,
-            long long start_row, long long start_column, vector < Eigen::Triplet < double > >& triplet_vec);
-        
-        
+    MatrixXd build_fixed_effect_design_matrix(const vector<std::int64_t>& covariate_columns,
+                                              const vector<std::int64_t>& class_columns,
+                                              vector<std::int64_t>& fixed_effect_column_offsets,
+                                              vector<string>& fixed_effect_names,
+                                              const vector<std::int64_t>& trait_columns,
+                                              MatrixXd& response_matrix) const;
+    void remove_dependent_design_columns(MatrixXd& design_matrix,
+                                         vector<std::int64_t>& fixed_effect_column_offsets,
+                                         vector<string>& fixed_effect_names,
+                                         vector<std::int64_t>& removed_column_indices) const;
 
-        void dmat_rowid_colid(vector<string>& row_id_vec, vector<string>& col_id_vec, long long row_start, long long col_start, 
-            vector < Eigen::Triplet < double > >& triplet_vec);
+    MatrixXd build_design_block_for_class(std::int64_t effect_column,
+                                          vector<string>& class_levels) const;
 
+    void append_random_effect_design_triplets(std::int64_t effect_column,
+                                              vector<string>& class_levels,
+                                              std::int64_t row_offset,
+                                              std::int64_t column_offset,
+                                              vector<Eigen::Triplet<double>>& triplets) const;
 
-        void get_given_column(long long columnNo, vector<string>& vec);
-        void get_given_column(long long columnNo, vector<double>& vec);
-        void get_given_column(long long columnNo, VectorXd& Vec);
-        void get_given_columns_double(vector<long long> column_vec, MatrixXd& Mat);
-        vector<string> get_used_record_number();
+    void get_stored_column_names(vector<string>& column_names) const;
+    void get_given_column(std::int64_t column_index, vector<string>& values) const;
+    void get_given_column(std::int64_t column_index, VectorXd& values) const;
+    void get_columns_as_matrix(const vector<std::int64_t>& column_indices, MatrixXd& matrix) const;
 
-        long long get_num_used_records();
-
-    private:
-        vector<string> m_head_column_vec;
-        vector<vector<string> > m_data_vec;
-        vector<long long> m_index_keep_vec;
+private:
+    vector<string> m_head_column_vec;
+    vector<vector<string>> m_data_vec;
+    vector<std::int64_t> m_index_keep_vec;
 };

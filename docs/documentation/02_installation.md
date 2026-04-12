@@ -4,67 +4,131 @@ title: Installation
 description: ~
 ---
 
-`fastGxE` is implemented as an C++ package, which can be installed from GitHub by:
+`fastGxE` is a C++ command-line tool for genome-wide genotype-by-environment analysis. This page describes two installation paths:
 
-### Linux Executable
+- use the prebuilt Linux executable
+- build `fastGxE` from source with CMake
 
-A statically compiled executable for 64-bit Linux systems is available: [**fastGxE Linux Executable**](https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe). This can be used directly on compatible systems.
+## 1. Prebuilt Linux executable
 
-```
+A prebuilt 64-bit Linux executable is available here:
+[**fastGxE Linux Executable**](https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe)
+
+After downloading it, make it executable and check that it runs:
+
+```bash
 chmod +x fastgxe
 ./fastgxe -h
 ```
 
+This is the quickest option if you only need to run the program and your system is compatible with the published binary.
 
+## 2. Build from source
+
+Building from source is recommended when you want to modify the code, change compiler settings, or adjust library paths for your local environment.
 
 ### Prerequisites
 
-Ensure the following dependencies are installed on your system:
+The current build system expects:
 
-- **C++ Compiler** (GCC 9+ or Intel C++ Compiler)
-- **CMake** (Version 3.16 or higher)
-- **Intel MKL** (2024.1)
-- **GSL** (2.7)
-- **Eigen** (3.4.0)
-- **LBFGSpp**
-- **OpenMP**
-- **CLI**
-- **spdlog**
-- **boost** (1.89.0)
+- a C++17 compiler
+- CMake 3.16 or newer
+- Intel oneAPI compiler and Intel MKL
+- OpenMP support
 
-### Installation Steps
+The repository already vendors several dependencies under `external/`, including:
 
-#### 1. Clone the Repository
+- `GSL`
+- `Eigen`
+- `LBFGSpp`
+- `CLI`
+- `spdlog`
+- `Boost`
+
+### Clone the repository
 
 ```bash
 git clone https://github.com/chaoning/fastGxE.git
 cd fastGxE
 ```
 
-#### 2. Set Up Dependencies
+### Check and update build paths
 
-Modify `CMakeLists.txt` to update the paths of external libraries (MKL, GSL, Eigen, LBFGSpp, etc.) according to your system. 
+Before compiling, review `CMakeLists.txt` and update the local paths if needed. In particular, these variables often need to match your machine:
 
-#### 3. Build the Project
+- `CMAKE_CXX_COMPILER`
+- `COMPILERROOT`
+- `MKLROOT`
+- `GSLROOT`
+- `EIGENROOT`
 
-Run the following commands to compile fastGxE (the process will take approximately 5–10 minutes):
+The current project configuration is written for an Intel oneAPI-based environment. If you build with a different compiler or install location, adjust the compiler and library paths first.
+
+### Configure and compile
+
+Create a separate build directory and compile with CMake:
 
 ```bash
-mkdir build
+mkdir -p build
 cd build
 cmake ..
-cmake --build .
+cmake --build . -j
 ```
 
-#### 4. Run fastGxE
+The main executable will be generated as:
 
-After compilation, you can execute FastGxE:
+```bash
+./fastgxe
+```
+
+If you are in the repository root instead of the `build/` directory, run:
+
+```bash
+./build/fastgxe -h
+```
+
+### Static linking option
+
+The project currently enables full static linking by default through:
+
+```cmake
+FASTGXE_FULL_STATIC_LINK=ON
+```
+
+To keep the default static-link behavior:
+
+```bash
+cmake .. -DFASTGXE_FULL_STATIC_LINK=ON
+cmake --build . -j
+```
+
+If static linking is not available on your system, switch to dynamic linking:
+
+```bash
+cmake .. -DFASTGXE_FULL_STATIC_LINK=OFF
+cmake --build . -j
+```
+
+You can inspect the resulting binary with:
+
+```bash
+file ./fastgxe
+ldd ./fastgxe
+```
+
+## 3. Quick validation
+
+After compilation, confirm that the executable starts correctly:
 
 ```bash
 ./fastgxe -h
 ```
 
-### Notes
+If you want a minimal end-to-end smoke test, the example files in `example/` can be used together with the commands shown in the tutorial page.
 
-- If you encounter missing library errors, check that all paths in `CMakeLists.txt` are correctly configured.
-- Use `make clean && make` to rebuild after modifications.
+## 4. Troubleshooting
+
+- If CMake cannot find MKL or the Intel compiler, recheck the path variables in `CMakeLists.txt`.
+- If static linking fails, rebuild with `-DFASTGXE_FULL_STATIC_LINK=OFF`.
+- If you changed compiler or dependency paths, it is usually safest to remove the old `build/` directory and configure again from scratch.
+- If the executable starts but fails at runtime, verify that the compiler, MKL, and OpenMP settings are consistent with your local environment.

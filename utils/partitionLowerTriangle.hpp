@@ -1,5 +1,8 @@
 #pragma once
 
-void partitionLowerTriangle(long long n, long long npart, long long ipart, 
-                            long long& start_row, long long& row_count);
+
+#include <cstdint>
+
+void partitionLowerTriangle(std::int64_t n, std::int64_t npart, std::int64_t ipart,
+                            std::int64_t& start_row, std::int64_t& row_count);
                             

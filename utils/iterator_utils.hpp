@@ -5,6 +5,8 @@
  * @LastEditTime: 2025-02-01 14:11:07
  * @LastEditors: Chao Ning
  */
+#include <cstdint>
+
 #pragma once
 
 #include <set>
@@ -44,18 +46,17 @@ T set_difference_(T v1, T v2){
 }
 
 
-
 bool is_duplicated(std::vector<std::string> vec);
 
-std::vector<std::string> vector_unique_keep_order(std::vector<std::string> vec);
+std::vector<std::string> vector_unique_keep_order(const std::vector<std::string>& vec);
 
-std::vector<std::string> vector_unique(std::vector<std::string> vec);
+std::vector<std::string> vector_unique(const std::vector<std::string>& vec);
 
-std::vector<long long> vector_unique(std::vector<long long> vec);
+std::vector<std::int64_t> vector_unique(const std::vector<std::int64_t>& vec);
 
-std::vector<long long> vector_merged(std::vector<std::vector<long long>> vec2D);
+std::vector<std::int64_t> merge_unique_vectors(const std::vector<std::vector<std::int64_t>>& vec2D);
 
-std::vector<std::string> vector_merged(std::vector<std::vector<std::string>> vec2D);
+std::vector<std::string> merge_unique_vectors(const std::vector<std::vector<std::string>>& vec2D);
 
 /**
  * @brief Finds the indices of elements in strSource within strDestination. 
@@ -64,9 +65,9 @@ std::vector<std::string> vector_merged(std::vector<std::vector<std::string>> vec
  * @param strDestination Target vector containing reference elements.
  * @param strSource Source vector containing elements to locate.
  * @param strNoFound Reference vector to store elements that could not be found.
- * @return vector<long long> Vector of indices corresponding to strSource elements in strDestination.
+ * @return vector<std::int64_t> Vector of indices corresponding to strSource elements in strDestination.
  */
-std::vector<long long> find_index(const std::vector<std::string>& strDestination, const std::vector<std::string>& strSource, std::vector<std::string>& strNoFound);
+std::vector<std::int64_t> find_index(const std::vector<std::string>& strDestination, const std::vector<std::string>& strSource, std::vector<std::string>& strNoFound);
 
 
 /**

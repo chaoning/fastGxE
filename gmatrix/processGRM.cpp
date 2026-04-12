@@ -3,9 +3,11 @@
  * @version: 
  * @Author: Chao Ning
  * @Date: 2022-08-12 17:23:31
- * @LastEditors: Chao Ning
- * @LastEditTime: 2025-01-31 12:43:53
+ * LastEditors: Chao Ning
+ * LastEditTime: 2026-04-12 19:22:43
  */
+
+#include <cstdint>
 
 #define EIGEN_USE_MKL_ALL  // !must be before include Eigen
 
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <algorithm>
 #include <set>
+#include <queue>
 #include <string>
 #include <spdlog/spdlog.h>
 #include <CLI/CLI.hpp>
@@ -27,7 +30,6 @@
 
 
 using std::ofstream; using std::ifstream;
-using std::cout; using std::endl;
 using std::getline;
 
 using std::string;
@@ -35,8 +37,56 @@ using std::map;
 using std::vector;
 using std::set;
 
-// typedef Eigen::SparseMatrix<double> SpMat; 
-// typedef Eigen::Triplet<double> T;
+namespace {
+
+std::string grm_prefix(const std::string& prefix) {
+    constexpr const char* suffix = ".grm";
+    const std::size_t suffix_len = std::char_traits<char>::length(suffix);
+    if(prefix.size() >= suffix_len &&
+       prefix.compare(prefix.size() - suffix_len, suffix_len, suffix) == 0){
+        return prefix;
+    }
+    return prefix + suffix;
+}
+
+const char* dense_output_suffix(const int out_fmt) {
+    switch (out_fmt) {
+        case 0: return ".matrix";
+        case 1: return ".index_triplet";
+        case 2: return ".iid_triplet";
+        case 3: return ".bin";
+        default: return nullptr;
+    }
+}
+
+const char* sparse_output_suffix(const int out_fmt) {
+    switch (out_fmt) {
+        case 0: return ".matrix";
+        case 1: return ".index_triplet";
+        case 2: return ".iid_triplet";
+        case 3: return ".sp.bin";
+        default: return nullptr;
+    }
+}
+
+bool read_sparse_grm_record(ifstream& fin, std::int64_t& index0, std::int64_t& index1, double& value, const string& input_file) {
+    if(!fin.read(reinterpret_cast<char*>(&index0), sizeof(std::int64_t))){
+        if(fin.eof()){
+            return false;
+        }
+        spdlog::error("Failed while reading: {}", input_file);
+        exit(1);
+    }
+
+    if(!fin.read(reinterpret_cast<char*>(&index1), sizeof(std::int64_t)) ||
+       !fin.read(reinterpret_cast<char*>(&value), sizeof(double))){
+        spdlog::error("Failed while reading: {}", input_file);
+        exit(1);
+    }
+    return true;
+}
+
+} // namespace
 
 ProcessGRM::ProcessGRM(){
 }
@@ -45,1047 +95,948 @@ ProcessGRM::~ProcessGRM(){
 }
 
 
-vector<string> ProcessGRM::read_grm_id(string grm_file){
-    ifstream fin;
-    fin.open(grm_file + ".id");
+/**
+ * @brief Read sample IDs from `<prefix>.grm.id` in file order.
+ *
+ * Blank lines are ignored after trimming. The returned vector is validated to
+ * ensure there are no duplicated IDs, because downstream matrix readers assume
+ * a one-to-one mapping between ID order and matrix rows.
+ */
+vector<string> ProcessGRM::read_grm_id(const std::string& grm_file){
+    const string grm_id_file = grm_prefix(grm_file) + ".id";
+    ifstream fin(grm_id_file);
     if(!fin.is_open()){
-        spdlog::error("Fail to open: {}.id", grm_file);
+        spdlog::error("Fail to open: {}", grm_id_file);
         exit(EXIT_FAILURE);
     }
 
-    vector<string> vec;
+    vector<string> grm_id_vec;
     string line;
     while(getline(fin, line)){
         process_line(line);
-        vec.push_back(line);
+        if(line.empty()){
+            continue;
+        }
+        grm_id_vec.push_back(line);
     }
-    fin.close();
 
-    if(is_duplicated(vec)){
+    if(is_duplicated(grm_id_vec)){
         spdlog::error("Duplicated iids exist in the grm file");
         exit(EXIT_FAILURE);
     }
-    return vec;
+    return grm_id_vec;
 }
 
 
-vector<string> ProcessGRM::read_gcta_grm_id(string grm_file){
-    ifstream fin;
-    fin.open(grm_file + ".id");
-    if(!fin.is_open()){
-        spdlog::error("Fail to open: {}.id", grm_file);
-        exit(EXIT_FAILURE);
-    }
-
-    vector<string> vec;
-    string line;
-    while(getline(fin, line)){
-        process_line(line);
-        vector<string> tmp_vec = split_string(line);
-        vec.push_back(tmp_vec[1]);
-    }
-    fin.close();
-
-    if(is_duplicated(vec)){
-        spdlog::error("Duplicated iids exist in the grm file");
-        exit(EXIT_FAILURE);
-    }
-    return vec;
-}
-
-
-
-void ProcessGRM::out_grm_id(std::string out_file, std::vector<std::string> grm_id_vec){
-    ofstream fout;
-    fout.open(out_file + ".id");
+/**
+ * @brief Write sample IDs to `<out>.grm.id` in GRM row order.
+ *
+ * The file is emitted as one ID per line so that downstream readers can reuse
+ * the same row/column ordering without additional parsing logic.
+ */
+void ProcessGRM::out_grm_id(const std::string& out_file, const std::vector<std::string>& grm_id_vec){
+    const string out_id_file = grm_prefix(out_file) + ".id";
+    ofstream fout(out_id_file);
     if(!fout.is_open()){
-        spdlog::error("Fail to open: {}", out_file);
+        spdlog::error("Fail to open: {}", out_id_file);
         exit(EXIT_FAILURE);
     }
 
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        fout << *it << endl;
+    for(const auto& grm_id : grm_id_vec){
+        fout << grm_id << '\n';
     }
-    fout.close();
+
+    if(!fout){
+        spdlog::error("Failed while writing: {}", out_id_file);
+        exit(EXIT_FAILURE);
+    }
 }
 
 
-// Read the grm in the given order
-void ProcessGRM::read_grm_bin(string grm_file, map<string, long long> grm_id_map, Eigen::MatrixXd& mat, double val){
-    
-    vector<string> grm_id_vec = ProcessGRM::read_grm_id(grm_file);
-    vector<long long> grm_id_index_vec;
-    long long num_id_used = 0;
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        auto it2 = grm_id_map.find(*it);
-        if(it2 != grm_id_map.end()){
-            grm_id_index_vec.push_back(it2->second);
-            num_id_used++;
-        }else{
-            grm_id_index_vec.push_back(-1);
-        }
-    }
+/**
+ * @brief Read a dense lower-triangular GRM and materialize it as a full matrix.
+ *
+ * The on-disk `.grm.bin` file stores doubles in lower-triangular order. When
+ * `grm_id_map` is empty, the matrix is read in its native order. Otherwise the
+ * GRM is subset and reordered to match the caller-provided ID map.
+ */
+void ProcessGRM::read_grm_bin(const std::string& grm_file, const std::map<std::string, std::int64_t>& grm_id_map, Eigen::MatrixXd& mat, double val){
+    const vector<string> grm_id_vec = this->read_grm_id(grm_file);
+    vector<std::int64_t> grm_id_index_vec;
+    grm_id_index_vec.reserve(grm_id_vec.size());
+    map<string, std::int64_t> working_grm_id_map = grm_id_map;
 
-    if(grm_id_map.empty()){
-        // read in the original order
-        grm_id_index_vec.clear(); // must clear
-        num_id_used = grm_id_vec.size();
-        for(long long i = 0; i < num_id_used; i++){
-            grm_id_map[grm_id_vec[i]] = i;
+    std::int64_t num_id_used = 0;
+    if(working_grm_id_map.empty()){
+        // Read the matrix in its original row/column order.
+        num_id_used = static_cast<std::int64_t>(grm_id_vec.size());
+        for(std::int64_t i = 0; i < num_id_used; ++i){
+            working_grm_id_map[grm_id_vec[i]] = i;
             grm_id_index_vec.push_back(i);
         }
-    }
-
-
-    if(grm_id_map.size() != num_id_used){
-        spdlog::error("iids in the grm do not match the data");
-        exit(1);
-    }
-
-    ifstream fin(grm_file + ".bin", std::ios::binary);
-    if(!fin.is_open()){
-        spdlog::error("Fail to open: " + grm_file + ".bin");
-        exit(1);
-    }
-
-    mat.resize(num_id_used, num_id_used);
-    long long num_id = grm_id_index_vec.size();
-    double tmp_val;
-    long long index0, index1;
-    for(long long i = 0; i < num_id; i++){
-        index0 = grm_id_index_vec[i];
-        for(long long j = 0; j <= i; j++){
-            index1 = grm_id_index_vec[j];
-            fin.read((char*)&tmp_val, sizeof(double));
-            if(index0 != -1 && index1 != -1){
-                if(index0 == index1) tmp_val += val;
-                mat(index0, index1) = mat(index1, index0) = tmp_val;
+    }else{
+        // Preserve the caller's requested order while skipping IDs not present
+        // in the current GRM file.
+        for(const auto& grm_id : grm_id_vec){
+            const auto it = working_grm_id_map.find(grm_id);
+            if(it != working_grm_id_map.end()){
+                grm_id_index_vec.push_back(it->second);
+                ++num_id_used;
+            }else{
+                grm_id_index_vec.push_back(-1);
             }
         }
     }
 
-    fin.close();
-}
-
-
-void ProcessGRM::read_gcta_grm_bin(string grm_file, map<string, long long> grm_id_map, Eigen::MatrixXd& mat, double val){
-    
-    vector<string> grm_id_vec = ProcessGRM::read_gcta_grm_id(grm_file);
-    vector<long long> grm_id_index_vec;
-    long long num_id_used = 0;
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        auto it2 = grm_id_map.find(*it);
-        if(it2 != grm_id_map.end()){
-            grm_id_index_vec.push_back(it2->second);
-            num_id_used++;
-        }else{
-            grm_id_index_vec.push_back(-1);
-        }
-    }
-
-    if(grm_id_map.empty()){
-        // read in the original order
-        grm_id_index_vec.clear(); // must clear
-        num_id_used = grm_id_vec.size();
-        for(long long i = 0; i < num_id_used; i++){
-            grm_id_map[grm_id_vec[i]] = i;
-            grm_id_index_vec.push_back(i);
-        }
-    }
-
-
-    if(grm_id_map.size() != num_id_used){
+    if(working_grm_id_map.size() != static_cast<std::size_t>(num_id_used)){
         spdlog::error("iids in the grm do not match the data");
         exit(1);
     }
 
-    ifstream fin(grm_file + ".bin", std::ios::binary);
+    const string grm_bin_file = grm_prefix(grm_file) + ".bin";
+    ifstream fin(grm_bin_file, std::ios::binary);
     if(!fin.is_open()){
-        spdlog::error("Fail to open: {}.bin", grm_file);
+        spdlog::error("Fail to open: {}", grm_bin_file);
         exit(1);
     }
 
-    mat.resize(num_id_used, num_id_used);
-    long long num_id = grm_id_index_vec.size();
-    float tmp_val;
-    long long index0, index1;
-    for(long long i = 0; i < num_id; i++){
-        index0 = grm_id_index_vec[i];
-        for(long long j = 0; j <= i; j++){
-            index1 = grm_id_index_vec[j];
-            fin.read((char*)&tmp_val, sizeof(float));
+    mat.setZero(num_id_used, num_id_used);
+    const std::int64_t num_id = static_cast<std::int64_t>(grm_id_index_vec.size());
+    for(std::int64_t i = 0; i < num_id; ++i){
+        const std::int64_t index0 = grm_id_index_vec[i];
+        for(std::int64_t j = 0; j <= i; ++j){
+            double tmp_val = 0.0;
+            fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double));
+            if(!fin){
+                spdlog::error("Failed while reading dense GRM file: {}", grm_bin_file);
+                exit(1);
+            }
+
+            const std::int64_t index1 = grm_id_index_vec[j];
             if(index0 != -1 && index1 != -1){
-                if(index0 == index1) tmp_val += val;
+                if(index0 == index1){
+                    tmp_val += val;
+                }
                 mat(index0, index1) = mat(index1, index0) = tmp_val;
             }
         }
     }
-
-    fin.close();
 }
 
 
+/**
+ * @brief Read a sparse triplet GRM and materialize it as a symmetric sparse matrix.
+ *
+ * The `.grm.sp.bin` payload stores lower-triangular triplets `(row, col, value)`
+ * using zero-based indices. As with `read_grm_bin`, an empty ID map preserves
+ * the native order, while a non-empty map subsets and reorders the matrix.
+ */
+void ProcessGRM::read_grm_sp_bin(const std::string& grm_sparse_file, const std::map<std::string, std::int64_t>& grm_id_map, Eigen::SparseMatrix<double>& mat, double val){
+    const vector<string> grm_id_vec = this->read_grm_id(grm_sparse_file);
+    vector<std::int64_t> grm_id_index_vec;
+    grm_id_index_vec.reserve(grm_id_vec.size());
+    map<string, std::int64_t> working_grm_id_map = grm_id_map;
+    std::int64_t num_id_used = 0;
 
-void ProcessGRM::read_grm_sp_bin(std::string grm_sparse_file, std::map<std::string, long long> grm_id_map, Eigen::SparseMatrix<double>& mat, double val){
-    vector<string> grm_id_vec = ProcessGRM::read_grm_id(grm_sparse_file);
-    vector<long long> grm_id_index_vec;
-    long long num_id_used = 0;
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        auto it2 = grm_id_map.find(*it);
-        if(it2 != grm_id_map.end()){
-            grm_id_index_vec.push_back(it2->second);
-            num_id_used++;
-        }else{
-            grm_id_index_vec.push_back(-1);
-        }
-    }
-
-    if(grm_id_map.empty()){
-        // read in the original order
-        grm_id_index_vec.clear(); // must clear
-        num_id_used = grm_id_vec.size();
-        for(long long i = 0; i < num_id_used; i++){
-            grm_id_map[grm_id_vec[i]] = i;
+    if(working_grm_id_map.empty()){
+        num_id_used = static_cast<std::int64_t>(grm_id_vec.size());
+        for(std::int64_t i = 0; i < num_id_used; ++i){
+            working_grm_id_map[grm_id_vec[i]] = i;
             grm_id_index_vec.push_back(i);
+        }
+    }else{
+        for(const auto& grm_id : grm_id_vec){
+            const auto it = working_grm_id_map.find(grm_id);
+            if(it != working_grm_id_map.end()){
+                grm_id_index_vec.push_back(it->second);
+                ++num_id_used;
+            }else{
+                grm_id_index_vec.push_back(-1);
+            }
         }
     }
     
-    if(grm_id_map.size() != num_id_used){
+    if(working_grm_id_map.size() != static_cast<std::size_t>(num_id_used)){
         spdlog::error("iids in the grm do not match the data");
         exit(1);
     }
 
-    ifstream fin(grm_sparse_file + ".sp.bin", std::ios::binary);
+    const string grm_sp_bin_file = grm_prefix(grm_sparse_file) + ".sp.bin";
+    ifstream fin(grm_sp_bin_file, std::ios::binary);
     if(!fin.is_open()){
-        spdlog::error("Fail to open: {}.sp.bin", grm_sparse_file);
+        spdlog::error("Fail to open: {}", grm_sp_bin_file);
         exit(1);
     }
 
 
-    std::vector<Eigen::Triplet<double>> tripletList;
-    double tmp_val;
-    long long index0, index1, index_curr0, index_curr1;
-
-    while(fin.read((char*)&index0, sizeof(long long)) && fin.read((char*)&index1, sizeof(long long)) && fin.read((char*)&tmp_val, sizeof(double))){
-        // cout << index0 + 1 << " " << index1 + 1 << " " << tmp_val << endl;
-        index_curr0 = grm_id_index_vec[index0];
-        index_curr1 = grm_id_index_vec[index1];
+    std::vector<Eigen::Triplet<double>> triplet_list;
+    double tmp_val = 0.0;
+    std::int64_t index0 = 0, index1 = 0;
+    while(read_sparse_grm_record(fin, index0, index1, tmp_val, grm_sp_bin_file)){
+        const std::int64_t index_curr0 = grm_id_index_vec[index0];
+        const std::int64_t index_curr1 = grm_id_index_vec[index1];
         if(index_curr0 != -1 && index_curr1 != -1){
             if(index_curr0 == index_curr1){
-                tmp_val += val;
-                tripletList.push_back(Eigen::Triplet<double>(index_curr0, index_curr1, tmp_val));
+                triplet_list.emplace_back(index_curr0, index_curr1, tmp_val + val);
             }else{
-                tripletList.push_back(Eigen::Triplet<double>(index_curr0, index_curr1, tmp_val));
-                tripletList.push_back(Eigen::Triplet<double>(index_curr1, index_curr0, tmp_val));
+                triplet_list.emplace_back(index_curr0, index_curr1, tmp_val);
+                triplet_list.emplace_back(index_curr1, index_curr0, tmp_val);
             }
         }
     }
-    fin.close();
     
     mat.resize(num_id_used, num_id_used);
-    mat.setFromTriplets(tripletList.begin(), tripletList.end());
+    mat.setFromTriplets(triplet_list.begin(), triplet_list.end());
 }
 
 
 /**
- * @brief merge the grm files from n parts produced by --make-grm --npart n i
- * 
- * @param grm_file 
- * @param sparse 
- * @param npart 
+ * @brief Merge partitioned GRM sidecar files back into a single GRM prefix.
+ *
+ * Partitioned GRM runs store `.id`, `.N`, and dense binary payloads with the
+ * suffix `.<npart>_<ipart>`. This helper reconstructs the original outputs in
+ * the same order they were produced.
  */
-void ProcessGRM::merge_grm(std::string grm_file, int sparse, int npart, string out_file){
-
-    // id
-    spdlog::info(" *.id file");
-    
-    vector<string> file_vec;
-    for(int i = 1; i <= npart; i++){
-        string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".id";
-        file_vec.push_back(tmp_file);
-    }
-    ProcessGRM::merge_file(file_vec, out_file + ".id", false);
-
-    // N
-    spdlog::info(" *.N file");
-    file_vec.clear();
-    for(int i = 1; i <= npart; i++){
-        string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".N";
-        file_vec.push_back(tmp_file);
-    }
-    ProcessGRM::merge_file({file_vec[0]}, out_file + ".N", false);
-
-
-    // bin
-    spdlog::info(" *.bin file");
-    file_vec.clear();
-    for(int i = 1; i <= npart; i++){
-        if(sparse == 0){
-            string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".bin";
-            file_vec.push_back(tmp_file);
-        }else{
-            string tmp_file = grm_file +"." + std::to_string(npart) + "_" + std::to_string(i) + ".sp.bin";
-            file_vec.push_back(tmp_file);
+void ProcessGRM::merge_grm(const std::string& grm_file, int npart, const std::string& out_file){
+    const auto build_part_files = [&](const std::string& suffix) {
+        vector<string> file_vec;
+        file_vec.reserve(static_cast<std::size_t>(npart));
+        const string part_prefix = grm_file;
+        for(int i = 1; i <= npart; ++i){
+            file_vec.push_back(part_prefix + "." + std::to_string(npart) + "_" + std::to_string(i)+ ".grm" + suffix);
         }
+        return file_vec;
+    };
+
+    // All `.id` fragments are concatenated because each partition contributes a
+    // disjoint row block.
+    spdlog::info("Merging *.id files");
+    const vector<string> id_files = build_part_files(".id");
+    ProcessGRM::merge_file(id_files, grm_prefix(out_file) + ".id", false);
+
+    // `.N` is metadata shared across partitions, so one representative file is
+    // enough for the merged output.
+    spdlog::info("Merging *.N file");
+    const vector<string> n_files = build_part_files(".N");
+    ProcessGRM::merge_file({n_files.front()}, grm_prefix(out_file) + ".N", false);
+
+    // The dense binary payload is appended in partition order to recover the
+    // original lower-triangular serialization.
+    const vector<string> dense_bin_files = build_part_files(".bin");
+    if(!ifstream(dense_bin_files.front(), std::ios::binary).good()){
+        spdlog::error("Failed to find partitioned binary GRM files for prefix {}", grm_file);
+        exit(1);
     }
 
-    if(sparse == 0){
-        ProcessGRM::merge_file(file_vec, out_file + ".bin", true);
-    }else{
-        ProcessGRM::merge_file(file_vec, out_file + ".sp.bin", true);
-    }
+    spdlog::info("Merging *.bin files");
+    ProcessGRM::merge_file(dense_bin_files, grm_prefix(out_file) + ".bin", true);
 }
 
 /**
- * @brief merge files
- * 
- * @param file_vec 
- * @param out_file 
- * @param bin 
+ * @brief Concatenate multiple files into one output file.
+ *
+ * The merge order follows `file_vec` exactly. Binary files are copied byte by
+ * byte to preserve the existing behavior, while text files are appended
+ * line-by-line with trailing newlines.
  */
-void ProcessGRM::merge_file(vector<string> file_vec, string out_file, bool bin=false){
-
-    if(bin == true){
-
+void ProcessGRM::merge_file(const vector<string>& file_vec, const std::string& out_file, bool bin){
+    if(bin){
         ofstream fout(out_file, std::ios::binary);
         if(!fout.is_open()){
             spdlog::error("Fail to open the: {}", out_file);
             exit(1);
         }
 
-        for(auto it = file_vec.begin(); it != file_vec.end(); it++){
-            ifstream fin(*it, std::ios::binary);
+        for(const auto& input_file : file_vec){
+            ifstream fin(input_file, std::ios::binary);
             if(!fin.is_open()){
-                spdlog::error("Fail to open the: {}", *it);
+                spdlog::error("Fail to open the: {}", input_file);
                 exit(1);
             }
-            spdlog::info("Merging file: {}", *it);
+            spdlog::info("Merging file: {}", input_file);
 
-            char tmp;
+            char tmp = '\0';
             while(fin.read(&tmp, sizeof(char))){
                 fout.write(&tmp, sizeof(char));
             }
-            fin.close();
-        }
-        fout.close();
 
-    }else{
-        ofstream fout(out_file);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the: {}", out_file);
-            exit(1);
-        }
-
-        for(auto it = file_vec.begin(); it != file_vec.end(); it++){
-            ifstream fin(*it);
-            if(!fin.is_open()){
-                spdlog::error("Fail to open the: {}", *it);
+            if(!fin.eof()){
+                spdlog::error("Failed while reading: {}", input_file);
                 exit(1);
             }
-            spdlog::info("Merging file: {}", *it);
-
-            string line;
-            while(std::getline(fin, line)){
-                fout << line << endl;
-            }
-            fin.close();
         }
-        fout.close();
+
+        if(!fout){
+            spdlog::error("Failed while writing: {}", out_file);
+            exit(1);
+        }
+        return;
     }
-    
+
+    ofstream fout(out_file);
+    if(!fout.is_open()){
+        spdlog::error("Fail to open the: {}", out_file);
+        exit(1);
+    }
+
+    for(const auto& input_file : file_vec){
+        ifstream fin(input_file);
+        if(!fin.is_open()){
+            spdlog::error("Fail to open the: {}", input_file);
+            exit(1);
+        }
+        spdlog::info("Merging file: {}", input_file);
+
+        string line;
+        while(std::getline(fin, line)){
+            fout << line << '\n';
+        }
+
+        if(!fin.eof()){
+            spdlog::error("Failed while reading: {}", input_file);
+            exit(1);
+        }
+    }
+
+    if(!fout){
+        spdlog::error("Failed while writing: {}", out_file);
+        exit(1);
+    }
 }
 
 
 
-void ProcessGRM::out_gmat(Eigen::MatrixXd& gmat, vector<string> grm_id_vec, int out_fmt, string out_file){
-    
-    long long num_id = grm_id_vec.size();
-    string out_gmat_file = out_file;
-    if(out_fmt == 0){ // matrix
-        out_gmat_file += ".mat_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file, std::ios::out);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}", out_gmat_file);
-            exit(1);
-        }
-        for(long long i = 0; i < num_id; i++){
-            for(long long j = 0; j < num_id; j++){
-                fout << gmat(i, j) << " ";
-            }
-            fout << endl;
-        }
-        fout.close();
-    }else if(out_fmt == 1){ //row col val
-        out_gmat_file += ".ind_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}", out_gmat_file);
-            exit(1);
-        }
-        
-        for(long long i = 0; i < num_id; i++){
-            for(long long j = 0; j <= i; j++){
-                fout << i+1 << " " << j+1 << " " << gmat(i, j) << endl;
-            }
-        }
-        fout.close();
-    }else if(out_fmt == 2){ //id1 id2 val
-        out_gmat_file += ".id_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}", out_gmat_file);
-            exit(1);
-        }
-        for(long long i = 0; i < num_id; i++){
-            for(long long j = 0; j <= i; j++){
-                fout << grm_id_vec[i] << " " << grm_id_vec[j] << " " << gmat(i, j) << endl;
-            }
-        }
-        fout.close();
-    }else if(out_fmt == 3){ // .bin
-        std::ofstream fout(out_file + ".bin", std::ios::binary);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}.bin", out_file);
-            exit(1);
-        }
-
-        for(long long i = 0; i < num_id; i++){
-            for(long long j = 0; j <= i; j++){
-                fout.write((char*)&gmat(i, j), sizeof(double));
-            }
-        }
-        fout.close();
-    }else{
+void ProcessGRM::out_gmat(const Eigen::MatrixXd& gmat, const vector<string>& grm_id_vec, int out_fmt, const string& out_file){
+    const std::int64_t num_id = static_cast<std::int64_t>(grm_id_vec.size());
+    const char* suffix = dense_output_suffix(out_fmt);
+    const string out_grm_prefix = grm_prefix(out_file);
+    if(suffix == nullptr){
         spdlog::error("Unsupported output format: --out-fmt {}", out_fmt);
         exit(1);
     }
+
+    if(out_fmt == 0){ // matrix
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
+        }
+        for(std::int64_t i = 0; i < num_id; ++i){
+            for(std::int64_t j = 0; j < num_id; ++j){
+                fout << gmat(i, j) << " ";
+            }
+            fout << '\n';
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }else if(out_fmt == 1){ // index_triplet
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
+        }
+        
+        for(std::int64_t i = 0; i < num_id; ++i){
+            for(std::int64_t j = 0; j <= i; ++j){
+                fout << i + 1 << " " << j + 1 << " " << gmat(i, j) << '\n';
+            }
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }else if(out_fmt == 2){ // iid_triplet
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
+        }
+        for(std::int64_t i = 0; i < num_id; ++i){
+            for(std::int64_t j = 0; j <= i; ++j){
+                fout << grm_id_vec[i] << " " << grm_id_vec[j] << " " << gmat(i, j) << '\n';
+            }
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }else if(out_fmt == 3){ // .bin
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file, std::ios::binary);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
+        }
+
+        for(std::int64_t i = 0; i < num_id; ++i){
+            for(std::int64_t j = 0; j <= i; ++j){
+                const double value = gmat(i, j);
+                fout.write(reinterpret_cast<const char*>(&value), sizeof(double));
+            }
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }
 }
 
 
-void ProcessGRM::out_gmat(Eigen::SparseMatrix<double>& gmat, vector<string> grm_id_vec, int out_fmt, std::string out_file){
-    long long num_id = grm_id_vec.size();
-    string out_gmat_file = out_file;
+void ProcessGRM::out_gmat(const Eigen::SparseMatrix<double>& gmat, const vector<string>& grm_id_vec, int out_fmt, const std::string& out_file){
+    const std::int64_t num_id = static_cast<std::int64_t>(grm_id_vec.size());
+    const Eigen::SparseMatrix<double> upper_gmat = gmat.triangularView<Eigen::Upper>();
+    const char* suffix = sparse_output_suffix(out_fmt);
+    const string out_grm_prefix = grm_prefix(out_file);
+    if(suffix == nullptr){
+        spdlog::error("Unsupported output format: --out-fmt {}", out_fmt);
+        exit(1);
+    }
+
     if(out_fmt == 0){ // matrix
         spdlog::warn("Output sparse relationship matrix in dense format");
-        out_gmat_file += ".mat_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file, std::ios::out);
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
         if(!fout.is_open()){
             spdlog::error("Fail to open the output file: {}", out_gmat_file);
             exit(1);
         }
-        fout << Eigen::MatrixXd(gmat) << endl;
-        fout.close();
-    }else if(out_fmt == 1){ //row col val
-        out_gmat_file += ".ind_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+        fout << Eigen::MatrixXd(gmat) << '\n';
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
             exit(1);
         }
-        
-        gmat = gmat.triangularView<Eigen::Upper>();  // keep the upper triangular part
-        for (long long k = 0; k < gmat.outerSize(); ++k){
-            for (Eigen::SparseMatrix<double>::InnerIterator it(gmat, k); it; ++it){
-                fout << it.col() + 1 << " " << it.row() + 1 << " " << it.value() << endl; // output the transpose of upper triangular part
-            }
-        }
-        fout.close();
-    }else if(out_fmt == 2){ //id1 id2 val
-        out_gmat_file += ".id_fmt";
-        ofstream fout;
-        fout.open(out_gmat_file);
+    }else if(out_fmt == 1){ // index_triplet
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
         if(!fout.is_open()){
             spdlog::error("Fail to open the output file: {}", out_gmat_file);
             exit(1);
         }
         
-        gmat = gmat.triangularView<Eigen::Upper>();  // keep the upper triangular part
-        for (long long k = 0; k < gmat.outerSize(); ++k){
-            for (Eigen::SparseMatrix<double>::InnerIterator it(gmat, k); it; ++it){
-                fout << grm_id_vec[it.col()] << " " << grm_id_vec[it.row()] << " " << it.value() << endl; // output the transpose of upper triangular part
+        for (std::int64_t k = 0; k < upper_gmat.outerSize(); ++k){
+            for (Eigen::SparseMatrix<double>::InnerIterator it(upper_gmat, k); it; ++it){
+                fout << it.col() + 1 << " " << it.row() + 1 << " " << it.value() << '\n'; // output the transpose of upper triangular part
             }
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }else if(out_fmt == 2){ // iid_triplet
+        const string out_gmat_file = out_grm_prefix + suffix;
+        ofstream fout(out_gmat_file);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
+        }
+        
+        for (std::int64_t k = 0; k < upper_gmat.outerSize(); ++k){
+            for (Eigen::SparseMatrix<double>::InnerIterator it(upper_gmat, k); it; ++it){
+                fout << grm_id_vec[it.col()] << " " << grm_id_vec[it.row()] << " " << it.value() << '\n'; // output the transpose of upper triangular part
+            }
+        }
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
+    }else if(out_fmt == 3){
+        const string out_gmat_file = out_grm_prefix + suffix;
+        std::ofstream fout(out_gmat_file, std::ios::binary);
+        if(!fout.is_open()){
+            spdlog::error("Fail to open the output file: {}", out_gmat_file);
+            exit(1);
         }
 
-        fout.close();
-    }else if(out_fmt == 3){
-        std::ofstream fout(out_file + ".sp.bin", std::ios::binary);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open the output file: {}.sp.bin", out_file);
-            exit(1);
-        }
-        long long index0, index1;
-        double val;
-        gmat = gmat.triangularView<Eigen::Upper>();  // keep the upper triangular part
-        for (long long k = 0; k < gmat.outerSize(); ++k){
-            for (Eigen::SparseMatrix<double>::InnerIterator it(gmat, k); it; ++it){
+        for (std::int64_t k = 0; k < upper_gmat.outerSize(); ++k){
+            for (Eigen::SparseMatrix<double>::InnerIterator it(upper_gmat, k); it; ++it){
                 //output the transpose of upper triangular part -> low triangular part
-                index0 = it.col(), index1 = it.row();
-                val = it.value();
-                fout.write((char*)&index0, sizeof(long long));
-                fout.write((char*)&index1, sizeof(long long));
-                fout.write((char*)&val, sizeof(double));
+                const std::int64_t index0 = it.col();
+                const std::int64_t index1 = it.row();
+                const double value = it.value();
+                fout.write(reinterpret_cast<const char*>(&index0), sizeof(std::int64_t));
+                fout.write(reinterpret_cast<const char*>(&index1), sizeof(std::int64_t));
+                fout.write(reinterpret_cast<const char*>(&value), sizeof(double));
             }
         }
-    }else{
-        spdlog::error("Unsupported output format: --out-fmt " + std::to_string(out_fmt));
-        exit(1);
+        if(!fout){
+            spdlog::error("Failed while writing the output file: {}", out_gmat_file);
+            exit(1);
+        }
     }
 }
 
 
 
-void ProcessGRM::pca(Eigen::MatrixXd& gmat, std::string out_file){
+/**
+ * @brief Compute PCA from a dense GRM and write eigenvalues/eigenvectors.
+ *
+ * Eigen returns eigenpairs in ascending order for self-adjoint matrices, so the
+ * output is written in reverse order to keep the leading principal components
+ * first in both files.
+ */
+void ProcessGRM::pca(const Eigen::MatrixXd& gmat, const std::string& out_file){
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigensolver(gmat);
     if (eigensolver.info() != Eigen::Success) {
         spdlog::error("Fail to compute eigenvalues and eigenvectors");
         exit(1);
     }
-    
-    Eigen::VectorXd gmat_eigenvals = eigensolver.eigenvalues();
-    Eigen::MatrixXd gmat_eigenvecs = eigensolver.eigenvectors();
-    long long num_element = gmat_eigenvals.size();
-    gmat_eigenvals = (gmat_eigenvals(Eigen::lastN(num_element).reverse())).eval();
-    gmat_eigenvecs = (gmat_eigenvecs(Eigen::all, Eigen::lastN(num_element).reverse())).eval();
-    ofstream fout1, fout2;
-    fout1.open(out_file + ".eigenvals");
-    fout2.open(out_file + ".eigenvecs");
-    if((!fout1.is_open()) || (!fout2.is_open())){
-        spdlog::error("Fail to open the output file: {}.eigenvals, {}.eigenvecs", out_file , out_file);
+
+    const string out_grm_prefix = grm_prefix(out_file);
+    const string eigenvals_file = out_grm_prefix + ".eigenvals";
+    const string eigenvecs_file = out_grm_prefix + ".eigenvecs";
+    ofstream fout_eigenvals(eigenvals_file);
+    ofstream fout_eigenvecs(eigenvecs_file);
+    if((!fout_eigenvals.is_open()) || (!fout_eigenvecs.is_open())){
+        spdlog::error("Fail to open the output file: {}, {}", eigenvals_file, eigenvecs_file);
         exit(1);
     }
-    for(long long i = 0; i < gmat_eigenvals.size(); i++){
-        fout1 << gmat_eigenvals(i) << endl;
+
+    const auto& eigenvals = eigensolver.eigenvalues();
+    const auto& eigenvecs = eigensolver.eigenvectors();
+    const Eigen::Index num_element = eigenvals.size();
+
+    for(Eigen::Index i = num_element - 1; i >= 0; --i){
+        fout_eigenvals << eigenvals(i) << '\n';
     }
-    fout1.close();
-    for(long long i = 0; i < gmat_eigenvecs.rows(); i++){
-        for(long long j = 0; j < gmat_eigenvecs.cols() - 1; j++){
-            fout2 << gmat_eigenvecs(i, j) << " ";
+
+    for(Eigen::Index i = 0; i < eigenvecs.rows(); ++i){
+        for(Eigen::Index j = num_element - 1; j > 0; --j){
+            fout_eigenvecs << eigenvecs(i, j) << " ";
         }
-        fout2 << gmat_eigenvecs(i, gmat_eigenvecs.cols() - 1) << endl;
+        fout_eigenvecs << eigenvecs(i, 0) << '\n';
     }
-    fout2.close();
-}
 
-
-void ProcessGRM::epistatic_grm(std::string grm_file, int sparse, std::string grm_type, std::string out_file){
-
-    string in_file = grm_file;
-
-    if(grm_type == "aagrm" || grm_type == "ddgrm_as" || grm_type == "ddgrm_gs"){
-
-        if(grm_type == "aagrm"){
-            in_file += ".agrm";
-        }else if(grm_type == "ddgrm_as"){
-            in_file += ".dgrm_as";
-        }else{
-            in_file += ".dgrm_gs";
-        }
-        
-        ProcessGRM::merge_file({in_file + ".id"}, out_file + "." + grm_type + ".id", false);
-        vector<string> grm_id_vec = ProcessGRM::read_grm_id(out_file + "." + grm_type);
-
-        ProcessGRM::merge_file({in_file + ".N", in_file + ".N"}, out_file + "." + grm_type + ".N", false);
-
-        if(sparse == 0){
-            std::map<string, long long> grm_id_map;
-            Eigen::MatrixXd mat;
-            ProcessGRM::read_grm_bin(in_file, grm_id_map, mat);
-            mat = mat.cwiseProduct(mat);
-            ProcessGRM::out_gmat(mat, grm_id_vec, 3, out_file + "." + grm_type);
-        }else{
-            std::map<string, long long> grm_id_map;
-            Eigen::SparseMatrix<double> mat;
-            ProcessGRM::read_grm_sp_bin(in_file, grm_id_map, mat);
-            mat = mat.cwiseProduct(mat);
-            ProcessGRM::out_gmat(mat, grm_id_vec, 3, out_file + "." + grm_type);
-        }
-    }else if(grm_type == "adgrm_as" || grm_type == "adgrm_gs"){
-        string in_file1;
-        string in_file2;
-        if(grm_type == "adgrm_as"){
-            in_file1 = in_file + ".agrm";
-            in_file2 = in_file + ".dgrm_as";
-        }else if(grm_type == "adgrm_gs"){
-            in_file1 = in_file + ".agrm";
-            in_file2 = in_file + ".dgrm_gs";
-        }
-        
-        ProcessGRM::merge_file({in_file1 + ".id"}, out_file + "." + grm_type + ".id", false);
-        vector<string> grm_id_vec = ProcessGRM::read_grm_id(out_file + "." + grm_type);
-
-        // N
-        ProcessGRM::merge_file({in_file1 + ".N", in_file2 + ".N"}, out_file + "." + grm_type + ".N", false);
-
-        // bin
-        if(sparse == 0){
-            std::map<string, long long> grm_id_map;
-            Eigen::MatrixXd mat1;
-            ProcessGRM::read_grm_bin(in_file1, grm_id_map, mat1);
-            Eigen::MatrixXd mat2;
-            ProcessGRM::read_grm_bin(in_file2, grm_id_map, mat2);
-            mat1 = mat1.cwiseProduct(mat2);
-            ProcessGRM::out_gmat(mat1, grm_id_vec, 3, out_file + "." + grm_type);
-        }else{
-            std::map<string, long long> grm_id_map;
-            Eigen::SparseMatrix<double> mat1;
-            ProcessGRM::read_grm_sp_bin(in_file1, grm_id_map, mat1);
-            Eigen::SparseMatrix<double> mat2;
-            ProcessGRM::read_grm_sp_bin(in_file2, grm_id_map, mat2);
-            mat1 = mat1.cwiseProduct(mat2);
-            ProcessGRM::out_gmat(mat1, grm_id_vec, 3, out_file + "." + grm_type);
-        }
-    }else{
-        spdlog::error("Unsupported epistatic GRM type: --make-epis " + grm_type);
+    if((!fout_eigenvals) || (!fout_eigenvecs)){
+        spdlog::error("Failed while writing PCA outputs: {}, {}", eigenvals_file, eigenvecs_file);
         exit(1);
     }
 }
 
-
-void ProcessGRM::remove_id(std::string grm_file, int sparse, std::string id_file, string out_file){
-    ifstream fin(id_file);
-    if(!fin.is_open()){
-        spdlog::error("Fail to open: " + id_file);
+/**
+ * @brief Multiply two dense GRMs elementwise to form an epistatic GRM.
+ *
+ * The two input prefixes must share the same `.grm.id` ordering. The output
+ * keeps that ID order, concatenates the two `.grm.N` metadata files, and
+ * writes the lower-triangular dense payload to `<out>.grm.bin`.
+ */
+void ProcessGRM::epistatic_grm(const std::string& prefix1, const std::string& prefix2, const std::string& out_file){
+    const vector<string> grm_id_vec1 = ProcessGRM::read_grm_id(prefix1);
+    const vector<string> grm_id_vec2 = ProcessGRM::read_grm_id(prefix2);
+    if(grm_id_vec1 != grm_id_vec2){
+        spdlog::error("The ID order in {}.id and {}.id does not match", prefix1, prefix2);
         exit(1);
     }
 
-    string line;
-    vector<string> id_remove_vec;
-    while (getline(fin, line))
-    {
-        process_line(line);
-        id_remove_vec.push_back(line);
+    // The output GRM reuses the first ID file after verifying that both inputs
+    // describe the same samples in the same order.
+    ProcessGRM::merge_file({grm_prefix(prefix1) + ".id"}, grm_prefix(out_file) + ".id", false);
+
+    // Preserve both input metadata files in order for downstream inspection.
+    ProcessGRM::merge_file({grm_prefix(prefix1) + ".N", grm_prefix(prefix2) + ".N"}, grm_prefix(out_file) + ".N", false);
+
+    const string bin_file1 = grm_prefix(prefix1) + ".bin";
+    const string bin_file2 = grm_prefix(prefix2) + ".bin";
+    const string out_bin_file = grm_prefix(out_file) + ".bin";
+    ifstream fin1(bin_file1, std::ios::binary);
+    ifstream fin2(bin_file2, std::ios::binary);
+    ofstream fout(out_bin_file, std::ios::binary);
+    if(!fin1.is_open()){
+        spdlog::error("Fail to open: {}", bin_file1);
+        exit(1);
     }
-    fin.close();
-    
-    std::vector<std::string> grm_id_vec = ProcessGRM::read_grm_id(grm_file);
-    std::map<std::string, long long> grm_id_map;
-    vector<string> id_keep_vec;
-    long long k = 0;
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        if(std::find(id_remove_vec.begin(), id_remove_vec.end(), *it) == id_remove_vec.end()){
-            grm_id_map[*it] = k;
-            id_keep_vec.push_back(*it);
-            k++;
-        }
+    if(!fin2.is_open()){
+        spdlog::error("Fail to open: {}", bin_file2);
+        exit(1);
     }
-
-    ProcessGRM::out_grm_id(out_file, id_keep_vec);
-    ProcessGRM::merge_file({grm_file + ".N"}, out_file + ".N", false);
-
-    if(sparse==0){
-        Eigen::MatrixXd mat;
-        ProcessGRM::read_grm_bin(grm_file, grm_id_map, mat);
-        ProcessGRM::out_gmat(mat, id_keep_vec, 3, out_file);
-    }else{
-        Eigen::SparseMatrix<double> mat;
-        ProcessGRM::read_grm_sp_bin(grm_file, grm_id_map, mat);
-        ProcessGRM::out_gmat(mat, id_keep_vec, 3, out_file);
-    }
-}
-
-
-void ProcessGRM::keep_id(std::string grm_file, int sparse, std::string id_file, string out_file){
-    ifstream fin(id_file);
-    if(!fin.is_open()){
-        spdlog::error("Fail to open: " + id_file);
+    if(!fout.is_open()){
+        spdlog::error("Fail to open: {}", out_bin_file);
         exit(1);
     }
 
-    string line;
-    vector<string> id_keep_all_vec;
-    while (getline(fin, line))
-    {
-        process_line(line);
-        id_keep_all_vec.push_back(line);
-    }
-    fin.close();
-    
-    std::vector<std::string> grm_id_vec = ProcessGRM::read_grm_id(grm_file);
-    std::map<std::string, long long> grm_id_map;
-    vector<string> id_keep_vec;
-    long long k = 0;
-    for(auto it = grm_id_vec.begin(); it != grm_id_vec.end(); it++){
-        if(std::find(id_keep_all_vec.begin(), id_keep_all_vec.end(), *it) != id_keep_all_vec.end()){
-            grm_id_map[*it] = k;
-            id_keep_vec.push_back(*it);
-            k++;
+    double val1 = 0.0;
+    double val2 = 0.0;
+    while(fin1.read(reinterpret_cast<char*>(&val1), sizeof(double))){
+        if(!fin2.read(reinterpret_cast<char*>(&val2), sizeof(double))){
+            spdlog::error("Dense GRM files have inconsistent lengths: {} and {}", bin_file1, bin_file2);
+            exit(1);
+        }
+        const double product = val1 * val2;
+        fout.write(reinterpret_cast<const char*>(&product), sizeof(double));
+        if(!fout){
+            spdlog::error("Failed while writing: {}", out_bin_file);
+            exit(1);
         }
     }
 
-    ProcessGRM::out_grm_id(out_file, id_keep_vec);
-    ProcessGRM::merge_file({grm_file + ".N"}, out_file + ".N", false);
+    if(!fin1.eof()){
+        spdlog::error("Failed while reading: {}", bin_file1);
+        exit(1);
+    }
 
-    if(sparse==0){
-        Eigen::MatrixXd mat;
-        ProcessGRM::read_grm_bin(grm_file, grm_id_map, mat);
-        ProcessGRM::out_gmat(mat, id_keep_vec, 3, out_file);
-    }else{
-        Eigen::SparseMatrix<double> mat;
-        ProcessGRM::read_grm_sp_bin(grm_file, grm_id_map, mat);
-        ProcessGRM::out_gmat(mat, id_keep_vec, 3, out_file);
+    if(fin2.read(reinterpret_cast<char*>(&val2), sizeof(double))){
+        spdlog::error("Dense GRM files have inconsistent lengths: {} and {}", bin_file1, bin_file2);
+        exit(1);
+    }
+    if(!fin2.eof()){
+        spdlog::error("Failed while reading: {}", bin_file2);
+        exit(1);
     }
 }
 
-
-void ProcessGRM::remove_close_id(std::string grm_file, int sparse, double cutoff, std::string out_file){
-    vector<string> id_in_grm_vec = ProcessGRM::read_grm_id(grm_file);
+/**
+ * @brief Greedily remove one IID from each set of overly related pairs.
+ *
+ * A graph edge is added whenever the pairwise GRM exceeds `cutoff`. The
+ * routine repeatedly removes the IID with the largest current degree until no
+ * close pairs remain, then writes the pruned IDs to `<out>.grm.pruned_iid`.
+ */
+void ProcessGRM::remove_close_id(const std::string& grm_file, int sparse, double cutoff, const std::string& out_file){
+    const vector<string> id_in_grm_vec = this->read_grm_id(grm_file);
+    const std::int64_t num_id = static_cast<std::int64_t>(id_in_grm_vec.size());
     map<string, set<string>> close_id_map;
-    long long num_close = 0;
-    for(auto it = id_in_grm_vec.begin(); it != id_in_grm_vec.end(); it++){
-        close_id_map[*it] = {};
+    std::int64_t num_close = 0;
+
+    for(const auto& id : id_in_grm_vec){
+        close_id_map.emplace(id, set<string>{});
     }
-    if(sparse==0){
-        ifstream fin(grm_file + ".bin", std::ios::binary);
+
+    const auto prune_isolated_ids = [&close_id_map]() {
+        vector<string> isolated_id_vec;
+        isolated_id_vec.reserve(close_id_map.size());
+        for(const auto& [id, close_ids] : close_id_map){
+            if(close_ids.empty()){
+                isolated_id_vec.push_back(id);
+            }
+        }
+        for(const auto& id : isolated_id_vec){
+            close_id_map.erase(id);
+        }
+    };
+
+    if(sparse == 0){
+        const string grm_bin_file = grm_prefix(grm_file) + ".bin";
+        ifstream fin(grm_bin_file, std::ios::binary);
         if(!fin.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".bin");
+            spdlog::error("Fail to open: {}", grm_bin_file);
             exit(1);
         }
 
-        long long num_id = id_in_grm_vec.size();
-        double tmp_val;
-        for(long long i = 0; i < num_id; i++){
-            for(long long j = 0; j <= i; j++){
-                fin.read((char*)&tmp_val, sizeof(double));
+        double tmp_val = 0.0;
+        for(std::int64_t i = 0; i < num_id; ++i){
+            for(std::int64_t j = 0; j <= i; ++j){
+                if(!fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+                    spdlog::error("Failed while reading: {}", grm_bin_file);
+                    exit(1);
+                }
                 if(tmp_val > cutoff && i != j){
-                    num_close++;
+                    ++num_close;
                     close_id_map[id_in_grm_vec[i]].insert(id_in_grm_vec[j]);
                     close_id_map[id_in_grm_vec[j]].insert(id_in_grm_vec[i]);
                 }
             }
         }
-        fin.close();
     }else{
-        ifstream fin(grm_file + ".sp.bin", std::ios::binary);
+        const string grm_sp_bin_file = grm_prefix(grm_file) + ".sp.bin";
+        ifstream fin(grm_sp_bin_file, std::ios::binary);
         if(!fin.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".sp.bin");
+            spdlog::error("Fail to open: {}", grm_sp_bin_file);
             exit(1);
         }
 
-        double tmp_val;
-        long long index0, index1;
-        while(fin.read((char*)&index0, sizeof(long long)) && fin.read((char*)&index1, sizeof(long long)) && fin.read((char*)&tmp_val, sizeof(double))){
+        double tmp_val = 0.0;
+        std::int64_t index0 = 0, index1 = 0;
+        while(read_sparse_grm_record(fin, index0, index1, tmp_val, grm_sp_bin_file)){
             if(tmp_val > cutoff && index0 != index1){
-                num_close++;
+                ++num_close;
                 close_id_map[id_in_grm_vec[index0]].insert(id_in_grm_vec[index1]);
                 close_id_map[id_in_grm_vec[index1]].insert(id_in_grm_vec[index0]);
             }
         }
-        fin.close();
     }
 
-    spdlog::info("There are " + std::to_string(num_close) + " pair of close individuals");
+    spdlog::info("There are {} pair of close individuals", num_close);
 
-    vector <string> key_vec;
-    for(auto it = close_id_map.begin(); it != close_id_map.end(); it++){
-        key_vec.push_back(it->first);
-    }
+    prune_isolated_ids();
 
-    for(auto it = key_vec.begin(); it != key_vec.end(); it++){
-        if(close_id_map[*it].size() == 0){
-            close_id_map.erase(*it);
-        }
-    }
+    vector<string> remove_id_vec;
+    while(!close_id_map.empty()){
+        const auto closest_it = std::max_element(
+            close_id_map.begin(),
+            close_id_map.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.second.size() < rhs.second.size();
+            });
 
-    vector <string> remove_id_vec;
-    while(close_id_map.size() != 0){
-
-        long long max_num_close = 0;
-        string closest_id;
-
-        for(auto it = close_id_map.begin(); it != close_id_map.end(); it++){
-            if(it->second.size() > max_num_close){
-                max_num_close = it->second.size();
-                closest_id = it->first;
-            }
-        }
-
+        const string closest_id = closest_it->first;
         remove_id_vec.push_back(closest_id);
 
-        set<string> removed_set = close_id_map[closest_id];
-        close_id_map.erase(closest_id);
+        const set<string> removed_set = closest_it->second;
+        close_id_map.erase(closest_it);
 
-        for(auto it = removed_set.begin(); it != removed_set.end(); it++){
-            close_id_map[*it].erase(closest_id);
+        for(const auto& removed_id : removed_set){
+            close_id_map[removed_id].erase(closest_id);
         }
 
-        vector <string> key_vec;
-        for(auto it = close_id_map.begin(); it != close_id_map.end(); it++){
-            key_vec.push_back(it->first);
-        }
-
-        for(auto it = key_vec.begin(); it != key_vec.end(); it++){
-            if(close_id_map[*it].size() == 0){
-                close_id_map.erase(*it);
-            }
-        }
+        prune_isolated_ids();
     }
 
-    ofstream fout(out_file + ".removed_id");
+    const string pruned_iid_file = grm_prefix(out_file) + ".pruned_iid";
+    ofstream fout(pruned_iid_file);
     if(!fout.is_open()){
-        spdlog::error("Fail to open: " + out_file + ".removed_id");
+        spdlog::error("Fail to open: {}", pruned_iid_file);
         exit(1);
     }
 
-    for(auto it = remove_id_vec.begin(); it != remove_id_vec.end(); it++){
-        fout << *it << endl;
+    for(const auto& removed_id : remove_id_vec){
+        fout << removed_id << '\n';
     }
-    fout.close();
-
+    if(!fout){
+        spdlog::error("Failed while writing: {}", pruned_iid_file);
+        exit(1);
+    }
 }
 
+/**
+ * @brief Group individuals by connected components in the thresholded GRM graph.
+ *
+ * Every IID is a graph node and edges are created for dense GRM values above
+ * `cutoff`. The output is written with the input GRM prefix and includes
+ * per-group sizes, a per-IID group assignment, and a derived sparse GRM that
+ * keeps only within-group pairs.
+ */
+void ProcessGRM::group_related_samples(const std::string& grm_file, double cutoff){
+    const vector<string> id_in_grm_vec = this->read_grm_id(grm_file);
+    const std::int64_t num_id_in_grm = static_cast<std::int64_t>(id_in_grm_vec.size());
+    vector<vector<std::int64_t>> adjacency_list(num_id_in_grm);
+    std::int64_t num_edges_above_cutoff = 0;
 
-void ProcessGRM::group(std::string grm_file, int sparse, double cutoff, std::string out_file){
-    vector<string> id_in_grm_vec = ProcessGRM::read_grm_id(grm_file);
-    long long num_id_in_grm = id_in_grm_vec.size();
-    set<long long> id_index_in_grm_set;
-    map<long long, set<long long>> group_map;
+    spdlog::info(
+        "Grouping {} samples from dense GRM input with cutoff {}",
+        num_id_in_grm,
+        cutoff);
 
-    spdlog::info("Read");
-    for(long long i = 0; i < id_in_grm_vec.size(); i++){
-        set<long long> vec;
-        group_map[i] = vec;
-        id_index_in_grm_set.insert(i);
+    if(num_id_in_grm == 0){
+        spdlog::warn("No sample IDs were found in {}.grm.id", grm_file);
+        return;
     }
 
-    if(sparse == 0){
-        ifstream fin(grm_file + ".bin", std::ios::binary);
-        if(!fin.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".bin");
-            exit(1);
-        }
-
-        double tmp_val;
-        for(long long i = 0; i < id_in_grm_vec.size(); i++){
-            for(long long j = 0; j <= i; j++){
-                fin.read((char*)&tmp_val, sizeof(double));
-                if(tmp_val > cutoff){
-                    group_map[i].insert(j);
-                    group_map[j].insert(i);
-                }
-            }
-        }
-        fin.close();
-    }else{
-        ifstream fin(grm_file + ".sp.bin", std::ios::binary);
-        if(!fin.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".sp.bin");
-            exit(1);
-        }
-
-        double tmp_val;
-        long long index0, index1;
-        while(fin.read((char*)&index0, sizeof(long long)) && fin.read((char*)&index1, sizeof(long long)) && fin.read((char*)&tmp_val, sizeof(double))){
-            if(index0 != index1){
-                if(tmp_val > cutoff){
-                    group_map[index0].insert(index1);
-                    group_map[index1].insert(index0);
-                }
-            }
-        }
-        fin.close();
-    }
-
-    spdlog::info("Group...");
-    vector<set<long long>> group_vec;
-    set<long long> id_index_in_grm_left_set = id_index_in_grm_set;
-    while(id_index_in_grm_left_set.size() != 0){
-
-        spdlog::info("  The proportion of Un-group samples: " + 
-            std::to_string(id_index_in_grm_left_set.size() * 100.0 / num_id_in_grm) + "%");
-        set<long long> id_index_in_group_set;
-        id_index_in_group_set.insert(*id_index_in_grm_left_set.begin());
-        vector<long long> id_index_in_group_added_vec = {*id_index_in_grm_left_set.begin()};
-
-        while(1){
-            long long size0 = id_index_in_group_set.size();
-            set<long long> id_index_in_group_added_set;
-            for(auto tmp:id_index_in_group_added_vec){
-                id_index_in_group_added_set = set_union_(id_index_in_group_added_set, group_map[tmp]);
-            }
-
-            id_index_in_group_added_set = set_difference_(id_index_in_group_added_set, id_index_in_group_set);
-            id_index_in_group_set = set_union_(id_index_in_group_added_set, id_index_in_group_set);
-
-            id_index_in_group_added_vec.clear();
-            id_index_in_group_added_vec.assign(id_index_in_group_added_set.begin(), id_index_in_group_added_set.end());
-            long long size1 = id_index_in_group_set.size();
-            spdlog::info("    Group size (increasing): " + std::to_string(id_index_in_group_set.size()));
-            if(size0 == size1){
-                break;
-            }
-        }
-        id_index_in_grm_left_set = set_difference_(id_index_in_grm_left_set, id_index_in_group_set);
-        group_vec.push_back(id_index_in_group_set);
-    }
-
-    spdlog::info("All iids are divided into " + std::to_string(group_vec.size()), 0);
-    // string cutoff_str = std::to_string(cutoff);
-    // cutoff_str.erase(cutoff_str.find_last_not_of('0') + 1, string::npos);
-    // if(cutoff_str == "") cutoff_str = "0.0";
-    ofstream fout;
-    fout.open(grm_file + ".group.size" );
-    if(!fout.is_open()){
-        spdlog::error("Fail to open: " + out_file + ".group.size");
-        exit(1);
-    }
-    map<long long, long long> id_index_group_map;
-    map<long long, long long> group_size_map;
-    for(long long i = 0; i < group_vec.size(); i++){
-        set<long long> tmp_set = group_vec[i];
-        // LOGGER.i("Group " + std::to_string(i+1) + ": Sample size is " + std::to_string(tmp_set.size()), 0);
-        fout << i + 1 << " " << tmp_set.size() << endl;
-        for(auto tmp:tmp_set){
-            id_index_group_map[tmp] = i + 1;
-            group_size_map[tmp] = tmp_set.size();
-        }
-    }
-    fout.close();
-    
-    fout.open(grm_file + ".group");
-    if(!fout.is_open()){
-        spdlog::error("Fail to open: " + out_file + ".group");
+    const string grm_bin_file = grm_prefix(grm_file) + ".bin";
+    ifstream fin(grm_bin_file, std::ios::binary);
+    if(!fin.is_open()){
+        spdlog::error("Fail to open: {}", grm_bin_file);
         exit(1);
     }
 
-    for(long long i = 0; i < id_in_grm_vec.size(); i++){
-        fout << i + 1 << " " << id_in_grm_vec[i] << " " << id_index_group_map[i] << " " << group_size_map[i] << endl;
-    }
-
-    fout.close();
-
-    
-    if(sparse == 0){
-        spdlog::info("Keep within-group elements and output the sparse GRM");
-        ofstream fout;
-        // fout.open("group.test.txt");
-        map<string, int> group_index0_index1_map;
-        for(long long i = 0; i < group_vec.size(); i++){
-            set<long long> tmp_set = group_vec[i];
-            for(auto tmp0:tmp_set){
-                for(auto tmp1:tmp_set){
-                    // fout << tmp0 << "_" << tmp1 << " ";
-                    group_index0_index1_map[std::to_string(tmp0) + "_" + std::to_string(tmp1)] = 1;
-                }
-                fout << std::endl;
+    double tmp_val = 0.0;
+    for(std::int64_t i = 0; i < num_id_in_grm; ++i){
+        for(std::int64_t j = 0; j <= i; ++j){
+            if(!fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+                spdlog::error("Failed while reading: {}", grm_bin_file);
+                exit(1);
+            }
+            if(i != j && tmp_val > cutoff){
+                adjacency_list[i].push_back(j);
+                adjacency_list[j].push_back(i);
+                ++num_edges_above_cutoff;
             }
         }
-        // fout.close();
+    }
 
-        ifstream fin(grm_file + ".bin", std::ios::binary);
-        if(!fin.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".bin");
-            exit(1);
+    spdlog::info("Built relatedness graph with {} edges above cutoff", num_edges_above_cutoff);
+
+    vector<std::int64_t> id_to_group(num_id_in_grm, -1);
+    vector<std::int64_t> group_sizes;
+    std::int64_t grouped_count = 0;
+    std::int64_t num_groups = 0;
+
+    for(std::int64_t seed_index = 0; seed_index < num_id_in_grm; ++seed_index){
+        if(id_to_group[seed_index] != -1){
+            continue;
         }
 
-        fout.open(grm_file + ".sp.bin", std::ios::binary);
-        if(!fout.is_open()){
-            spdlog::error("Fail to open: " + grm_file + ".sp.bin");
-            exit(1);
-        }
+        std::queue<std::int64_t> frontier;
+        frontier.push(seed_index);
+        id_to_group[seed_index] = num_groups;
+        std::int64_t current_group_size = 0;
 
-        double tmp_val;
-        for(long long i = 0; i < id_in_grm_vec.size(); i++){
-            for(long long j = 0; j <= i; j++){
-                fin.read((char*)&tmp_val, sizeof(double));
-                string tmp_str = std::to_string(i) + "_" + std::to_string(j);
-                if(group_index0_index1_map.find(tmp_str) != group_index0_index1_map.end()){
-                    fout.write((char*)&i, sizeof(long long));
-                    fout.write((char*)&j, sizeof(long long));
-                    fout.write((char*)&tmp_val, sizeof(double));
+        // Breadth-first expansion finds one connected component without the
+        // repeated set copies used by the previous implementation.
+        while(!frontier.empty()){
+            const std::int64_t current_index = frontier.front();
+            frontier.pop();
+            ++current_group_size;
+
+            for(const auto neighbor_index : adjacency_list[current_index]){
+                if(id_to_group[neighbor_index] == -1){
+                    id_to_group[neighbor_index] = num_groups;
+                    frontier.push(neighbor_index);
                 }
             }
         }
-        fin.close();
-        fout.close();
+
+        group_sizes.push_back(current_group_size);
+        grouped_count += current_group_size;
+        ++num_groups;
+
+        spdlog::info(
+            "Identified group {} with {} samples ({} / {} assigned)",
+            num_groups,
+            current_group_size,
+            grouped_count,
+            num_id_in_grm);
     }
-    
+
+    spdlog::info("All iids are divided into {} groups", num_groups);
+
+    const string group_size_file = grm_prefix(grm_file) + ".group.size";
+    ofstream group_size_out(group_size_file);
+    if(!group_size_out.is_open()){
+        spdlog::error("Fail to open: {}", group_size_file);
+        exit(1);
+    }
+
+    for(std::int64_t group_index = 0; group_index < num_groups; ++group_index){
+        group_size_out << group_index + 1 << " " << group_sizes[group_index] << '\n';
+    }
+    if(!group_size_out){
+        spdlog::error("Failed while writing: {}", group_size_file);
+        exit(1);
+    }
+
+    const string group_file = grm_prefix(grm_file) + ".group";
+    ofstream group_out(group_file);
+    if(!group_out.is_open()){
+        spdlog::error("Fail to open: {}", group_file);
+        exit(1);
+    }
+
+    for(std::int64_t i = 0; i < num_id_in_grm; ++i){
+        const std::int64_t group_index = id_to_group[i];
+        group_out << i + 1 << " " << id_in_grm_vec[i] << " "
+                  << group_index + 1 << " " << group_sizes[group_index] << '\n';
+    }
+    if(!group_out){
+        spdlog::error("Failed while writing: {}", group_file);
+        exit(1);
+    }
+
+    spdlog::info("Writing sparse GRM that keeps only within-group entries");
+
+    ifstream dense_grm_in(grm_bin_file, std::ios::binary);
+    if(!dense_grm_in.is_open()){
+        spdlog::error("Fail to open: {}", grm_bin_file);
+        exit(1);
+    }
+
+    const string grm_sp_bin_file = grm_prefix(grm_file) + ".sp.bin";
+    ofstream fout(grm_sp_bin_file, std::ios::binary);
+    if(!fout.is_open()){
+        spdlog::error("Fail to open: {}", grm_sp_bin_file);
+        exit(1);
+    }
+
+    tmp_val = 0.0;
+    std::int64_t num_values_kept = 0;
+    for(std::int64_t i = 0; i < num_id_in_grm; ++i){
+        for(std::int64_t j = 0; j <= i; ++j){
+            if(!dense_grm_in.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+                spdlog::error("Failed while reading: {}", grm_bin_file);
+                exit(1);
+            }
+            if(id_to_group[i] == id_to_group[j]){
+                fout.write(reinterpret_cast<const char*>(&i), sizeof(std::int64_t));
+                fout.write(reinterpret_cast<const char*>(&j), sizeof(std::int64_t));
+                fout.write(reinterpret_cast<const char*>(&tmp_val), sizeof(double));
+                ++num_values_kept;
+            }
+        }
+    }
+    if(!fout){
+        spdlog::error("Failed while writing: {}", grm_sp_bin_file);
+        exit(1);
+    }
+
+    spdlog::info("Wrote {} within-group lower-triangular values to {}", num_values_kept, grm_sp_bin_file);
 }
 
 
 int ProcessGRM::run(int argc, char* argv[]){
     CLI::App app{"GMAT: GRM Processing Tool"};
 
-    std::string description = R"(Quick start: 
-    Merge GRM files
-        gmat --process-grm --merge --grm test.agrm --npart 5
-        gmat --process-grm --sparse --merge --grm test.agrm --npart 5
+    // Keep the help text task-oriented: each block shows the primary flag plus
+    // the minimal extra inputs typically needed to run that subcommand.
+    app.description(R"(Quick start:
+    Merge partitioned GRMs
+        gmat --process-grm --merge --grm test --npart 5
 
     PCA
-        gmat --process-grm --pca --grm test.agrm --out test
+        gmat --process-grm --pca --grm test --out test
 
-    Calculate epistatic GRM
-        gmat --process-grm --make-epis --grm test --epis-type aagrm --out test
-        gmat --process-grm --make-epis --sparse --grm test --epis-type aagrm --out test
+    Epistatic GRM from two dense GRMs
+        gmat --process-grm --make-epis --prefix1 test1 --prefix2 test2 --out test
 
     Reformat GRM
-        gmat --process-grm --reformat --grm test.agrm --out-fmt 0/1/2/3 --out test
-        gmat --process-grm --reformat --sparse --grm test.agrm --out-fmt 0/1/2/3 --out test
+        gmat --process-grm --reformat --grm test --out-fmt 0 --out test         # test.grm.matrix
+        gmat --process-grm --reformat --grm test --out-fmt 1 --out test         # test.grm.index_triplet
+        gmat --process-grm --reformat --grm test --out-fmt 2 --out test         # test.grm.iid_triplet
+        gmat --process-grm --reformat --grm test --out-fmt 3 --out test         # test.grm.bin
+        gmat --process-grm --reformat --sparse --grm test --out-fmt 0 --out test # test.grm.matrix
+        gmat --process-grm --reformat --sparse --grm test --out-fmt 1 --out test # test.grm.index_triplet
+        gmat --process-grm --reformat --sparse --grm test --out-fmt 2 --out test # test.grm.iid_triplet
+        gmat --process-grm --reformat --sparse --grm test --out-fmt 3 --out test # test.grm.sp.bin
 
-    Reformat GRM from GCTA
-        gmat --process-grm --reformat-gcta --grm test.grm --out test.agrm
+    GRM inverse
+        gmat --process-grm --make-inv --grm test --out-fmt 0 --out test.inv     # test.inv.grm.matrix
+        gmat --process-grm --make-inv --grm test --out-fmt 1 --out test.inv     # test.inv.grm.index_triplet
+        gmat --process-grm --make-inv --grm test --out-fmt 2 --out test.inv     # test.inv.grm.iid_triplet
+        gmat --process-grm --make-inv --grm test --out-fmt 3 --out test.inv     # test.inv.grm.bin
 
-    Check if the GRM is positive
-        gmat --process-grm --check-positive --grm test.agrm
-        gmat --process-grm --check-positive --grm test.agrm --sparse
+    Output one IID from each close pair
+        gmat --process-grm --out-close --grm test --out test
 
-    Calculate the inverse of GRM
-        gmat --process-grm --make-inv --grm test.agrm --out-fmt 0/1/2/3 --out test.inv
-        gmat --process-grm --make-inv --grm test.agrm --out-fmt 0/1/2/3 --out test.inv --sparse
-
-    Remove the elements of given iids from GRM
-        gmat --process-grm --remove-iid --grm test.agrm --iid id.txt --out test2.agrm
-        gmat --process-grm --remove-iid --grm test.agrm --iid id.txt --out test2.agrm --sparse
-
-    Output the one of the paired individuals with grm larger than the cut value
-        gmat --process-grm --out-close --grm test.agrm --out test
-        gmat --process-grm --out-close --grm test.agrm --out test --sparse
-
-    Group iids according to the relationship
-        gmat --process-grm --group --grm test.agrm --cut-value 0.05 --out test
-        gmat --process-grm --group --grm test.agrm --cut-value 0.05 --out test --sparse
-    )";
-
-    app.description(description);
+    Group related IIDs
+        gmat --process-grm --group --grm test --cut-value 0.05
+    )");
     
+    // `--process-grm` selects this top-level tool, while the remaining boolean
+    // flags choose the concrete operation to run.
     bool process_grm = false;
-    app.add_flag("--process-grm", process_grm, "Calculate GRM")->required();
+    bool merge = false, pca = false, make_epis = false, reformat = false,
+         make_inv = false, out_close = false, group = false;
 
+    // Runtime controls and shared command inputs.
     int threads = 10;
+    string grm_file, out_file, prefix1, prefix2;
+    int sparse = 0, out_fmt = 2;
+    std::int64_t npart = 0;
+    double cut_value = 0.05;
+
+    app.add_flag("--process-grm", process_grm, "Process an existing GRM")->required();
     app.add_option("--threads", threads, "Number of threads (default: 10)");
 
-    string grm_file, iid_file, out_file, epis_type;
-    int sparse = 0, out_fmt = 2;
-    long long npart = 0;
-    double val = 0, cut_value = 0.05;
-
-    bool merge = false, pca = false, make_epis = false, reformat = false, 
-         check_positive = false, make_inv = false, remove_iid = false, 
-         out_close = false, keep_iid = false, reformat_gcta = false, group = false;
-
+    // Task-selection flags. Exactly one of these should describe the requested
+    // action; dispatch happens after argument parsing.
     app.add_flag("--merge", merge, "Merge GRM files");
     app.add_flag("--pca", pca, "Perform PCA");
     app.add_flag("--make-epis", make_epis, "Calculate epistatic GRM");
     app.add_flag("--reformat", reformat, "Reformat GRM");
-    app.add_flag("--check-positive", check_positive, "Check if the GRM is positive");
     app.add_flag("--make-inv", make_inv, "Calculate the inverse of GRM");
-    app.add_flag("--remove-iid", remove_iid, "Remove given iids from GRM");
     app.add_flag("--out-close", out_close, "Output pairs with GRM larger than cut value");
-    app.add_flag("--keep-iid", keep_iid, "Keep given iids in GRM");
-    app.add_flag("--reformat-gcta", reformat_gcta, "Reformat GCTA GRM");
     app.add_flag("--group", group, "Group individuals by GRM relationships");
 
-    app.add_option("--grm", grm_file, "GRM file")->required();
-    app.add_option("--iid", iid_file, "IID file for filtering");
-    app.add_option("--out", out_file, "Output file prefix");
-    app.add_option("--epis-type", epis_type, "Epistatic GRM type");
+    // Shared file and numeric options. Individual subcommands only consume the
+    // subset that is relevant to them.
+    app.add_option("--grm", grm_file, "GRM prefix without the .grm suffix");
+    app.add_option("--out", out_file, "Output prefix without the .grm suffix");
+    app.add_option("--prefix1", prefix1, "First dense GRM prefix without the .grm suffix for --make-epis");
+    app.add_option("--prefix2", prefix2, "Second dense GRM prefix without the .grm suffix for --make-epis");
     app.add_option("--npart", npart, "Partition count (for merging)");
-    app.add_option("--out-fmt", out_fmt, "Output format (0-3)");
-    app.add_option("--val", val, "Diagonal value adjustment");
+    app.add_option("--out-fmt", out_fmt, "Output format: 0=matrix, 1=index_triplet, 2=iid_triplet, 3=binary");
     app.add_option("--cut-value", cut_value, "Cutoff value for filtering");
     app.add_flag("--sparse", sparse, "Indicate sparse GRM");
 
@@ -1095,33 +1046,81 @@ int ProcessGRM::run(int argc, char* argv[]){
     mkl_set_num_threads(threads);
     omp_set_num_threads(threads);
 
-    if (merge) {
-        spdlog::info("Merging GRM files");
-        if (npart <= 1) {
-            spdlog::error("--npart must be greater than 1");
-            exit(1);
+    const bool sparse_input = (sparse != 0);
+
+    // Small local helpers keep the command branches focused on their own logic
+    // instead of repeating the same input-validation and loading boilerplate.
+    const auto require_grm_file = [&]() {
+        if (grm_file.empty()) {
+            spdlog::error("--grm is required for this operation");
+            std::exit(1);
         }
-        this->merge_grm(grm_file, sparse, npart, out_file);
-    } else if (pca) {
-        spdlog::info("Performing PCA");
+    };
+
+    const auto require_prefix_pair = [&]() {
+        if (prefix1.empty() || prefix2.empty()) {
+            spdlog::error("--prefix1 and --prefix2 are required for --make-epis");
+            std::exit(1);
+        }
+    };
+
+    const auto load_dense_grm = [&](bool allow_sparse_input) {
         Eigen::MatrixXd mat;
-        std::map<std::string, long long> grm_id_map;
-        if (!sparse) {
+        std::map<std::string, std::int64_t> grm_id_map;
+        if (!sparse_input || !allow_sparse_input) {
             this->read_grm_bin(grm_file, grm_id_map, mat);
         } else {
-            Eigen::SparseMatrix<double> mat2;
-            this->read_grm_sp_bin(grm_file, grm_id_map, mat2);
-            mat = Eigen::MatrixXd(mat2);
+            Eigen::SparseMatrix<double> sparse_mat;
+            this->read_grm_sp_bin(grm_file, grm_id_map, sparse_mat);
+            mat = Eigen::MatrixXd(sparse_mat);
         }
+        return mat;
+    };
+
+    // Merge is special because it operates directly on partitioned files instead
+    // of materializing a matrix first.
+    if (merge) {
+        spdlog::info("Merging GRM files");
+        require_grm_file();
+        if (npart <= 1) {
+            spdlog::error("--npart must be greater than 1");
+            std::exit(1);
+        }
+        this->merge_grm(grm_file, npart, out_file);
+        return 0;
+    }
+
+    // PCA always runs on a dense matrix. Sparse input is therefore expanded
+    // before decomposition when `--sparse` is set.
+    if (pca) {
+        spdlog::info("Performing PCA");
+        require_grm_file();
+        Eigen::MatrixXd mat = load_dense_grm(true);
         this->pca(mat, out_file);
-    } else if (make_epis) {
+        return 0;
+    }
+
+    // Epistatic GRM construction multiplies two dense lower-triangular GRM
+    // payloads element by element after verifying that their ID order matches.
+    if (make_epis) {
         spdlog::info("Calculating epistatic GRM");
-        this->epistatic_grm(grm_file, sparse, epis_type, out_file);
-    } else if (reformat) {
+        require_prefix_pair();
+        if (sparse_input) {
+            spdlog::error("--make-epis no longer supports --sparse");
+            std::exit(1);
+        }
+        this->epistatic_grm(prefix1, prefix2, out_file);
+        return 0;
+    }
+
+    // Reformat preserves the original storage mode: dense input stays dense,
+    // sparse input stays sparse, and both paths reuse the same ID ordering.
+    if (reformat) {
         spdlog::info("Reformatting GRM");
-        vector<string> grm_id_vec = this->read_grm_id(grm_file);
-        std::map<std::string, long long> grm_id_map;
-        if (!sparse) {
+        require_grm_file();
+        const vector<string> grm_id_vec = this->read_grm_id(grm_file);
+        std::map<std::string, std::int64_t> grm_id_map;
+        if (!sparse_input) {
             Eigen::MatrixXd mat;
             this->read_grm_bin(grm_file, grm_id_map, mat);
             this->out_gmat(mat, grm_id_vec, out_fmt, out_file);
@@ -1130,51 +1129,45 @@ int ProcessGRM::run(int argc, char* argv[]){
             this->read_grm_sp_bin(grm_file, grm_id_map, mat);
             this->out_gmat(mat, grm_id_vec, out_fmt, out_file);
         }
-    } else if (check_positive) {
-        spdlog::info("Checking if GRM is positive");
-        Eigen::MatrixXd mat;
-        std::map<std::string, long long> grm_id_map;
-        this->read_grm_bin(grm_file, grm_id_map, mat);
-        for (long long i = 0; i < mat.rows(); i++) {
-            mat(i, i) += val;
-        }
-        CustomLLT LLTA;
-        LLTA.compute(mat);
-        spdlog::info("GRM is positive");
-    } else if (make_inv) {
+        this->out_grm_id(out_file, grm_id_vec);
+        return 0;
+    }
+
+    // Inversion also goes through the dense representation because the current
+    // linear-algebra helper expects a dense positive-definite matrix.
+    if (make_inv) {
         spdlog::info("Computing GRM inverse");
-        Eigen::MatrixXd mat;
-        std::map<std::string, long long> grm_id_map;
-        this->read_grm_bin(grm_file, grm_id_map, mat);
+        require_grm_file();
+        Eigen::MatrixXd mat = load_dense_grm(false);
         CustomLLT LLTA;
         LLTA.compute(mat);
         mat = LLTA.inverse();
-        vector<string> grm_id_vec = this->read_grm_id(grm_file);
+        const vector<string> grm_id_vec = this->read_grm_id(grm_file);
         this->out_gmat(mat, grm_id_vec, out_fmt, out_file);
-    } else if(group){
-        spdlog::info("Grouping individuals by GRM relationships");
-        this->group(grm_file, sparse, cut_value, out_file);
-    } else if (remove_iid) {
-        spdlog::info("Removing specified iids from GRM");
-        if (iid_file.empty()) {
-            spdlog::error("--iid is required for removing iids");
-            exit(1);
-        }
-        this->remove_id(grm_file, sparse, iid_file, out_file);
-    } else if (keep_iid) {
-        spdlog::info("Keeping specified iids in GRM");
-        if (iid_file.empty()) {
-            spdlog::error("--iid is required for keeping iids");
-            exit(1);
-        }
-        this->keep_id(grm_file, sparse, iid_file, out_file);
-    } else if (out_close) {
-        spdlog::info("Outputting one of each pair of close individuals");
-        this->remove_close_id(grm_file, sparse, cut_value, out_file);
-    } else {
-        spdlog::error("No valid operation specified");
-        exit(1);
+        return 0;
     }
 
-    return 0;
+    // Grouping is a graph-style post-processing step driven by the supplied
+    // relatedness cutoff. It currently operates on dense GRM input only.
+    if(group){
+        spdlog::info("Grouping individuals by GRM relationships");
+        require_grm_file();
+        if (sparse_input) {
+            spdlog::error("--group no longer supports --sparse");
+            std::exit(1);
+        }
+        this->group_related_samples(grm_file, cut_value);
+        return 0;
+    }
+
+    // `out_close` writes one representative from each overly related pair.
+    if (out_close) {
+        spdlog::info("Outputting one of each pair of close individuals");
+        require_grm_file();
+        this->remove_close_id(grm_file, sparse, cut_value, out_file);
+        return 0;
+    }
+
+    spdlog::error("No valid operation specified");
+    std::exit(1);
 }

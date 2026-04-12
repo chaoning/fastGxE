@@ -7,11 +7,6 @@
  */
 #pragma once
 
-#include <Eigen/Eigen>
 #include <Eigen/Core>
-#include <Eigen/Dense>
 
-double LiuSF(double t, Eigen::VectorXd &lambs, Eigen::VectorXd &dofs, Eigen::VectorXd &deltas, 
-                        bool kurtosis = false);
-
-double saddle(double x, Eigen::VectorXd& lambda);
+double saddle(double x, const Eigen::VectorXd& lambda);

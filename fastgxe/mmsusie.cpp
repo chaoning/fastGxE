@@ -5,6 +5,8 @@
  * @LastEditTime: 2025-02-01 22:14:58
  * @LastEditors: Chao Ning
  */
+#include <cstdint>
+
 #define EIGEN_USE_MKL_ALL  // Must be defined before including Eigen
 
 
@@ -113,10 +115,10 @@ private:
     double vmat_logdet;
     SparseMatrix < double > Vi;
     SparseMatrix < double > gxe_rm, grm_mat;
-    long long num_id;
+    std::int64_t num_id;
 
     vector<MatrixXd> grm_mat_group_vec;
-    vector<long long> grm_index_vec;
+    vector<std::int64_t> grm_index_vec;
     MatrixXd bye_mat;
 
 public:
@@ -124,7 +126,7 @@ public:
 
     void set_value(VectorXd& y_, MatrixXd& X_, SparseMatrix < double >& gxe_rm_, SparseMatrix < double >& grm_mat_,
         VectorXd& Xr_Vec_, MatrixXd& alpha_Mat_, MatrixXd& mu_Mat_, MatrixXd& mu2_Mat_,
-        vector<MatrixXd>& grm_mat_group_vec_, vector<long long>& grm_index_vec_,
+        vector<MatrixXd>& grm_mat_group_vec_, vector<std::int64_t>& grm_index_vec_,
                     MatrixXd& bye_mat_){
         y = y_;
         num_id = y.size();
@@ -152,14 +154,14 @@ public:
 
     void calVi(const VectorXd& varcom){
         std::vector<Eigen::Triplet<double>> tripletList;
-        long long num_bye = bye_mat.cols();
-        long long num_id = bye_mat.rows();
+        std::int64_t num_bye = bye_mat.cols();
+        std::int64_t num_id = bye_mat.rows();
         CustomLLT llt_solver;
         vmat_logdet = 0;
-        for(long long i = 0; i < grm_mat_group_vec.size(); i++){
+        for(std::int64_t i = 0; i < grm_mat_group_vec.size(); i++){
             MatrixXd tmp_grm_mat = grm_mat_group_vec[i];
-            long long start_index = grm_index_vec[i];
-            long long num_element = tmp_grm_mat.rows();
+            std::int64_t start_index = grm_index_vec[i];
+            std::int64_t num_element = tmp_grm_mat.rows();
             MatrixXd bye_mat_part = bye_mat.middleRows(start_index, num_element);
             if(i == 0){
                 if(tmp_grm_mat.size() != 0){
@@ -169,7 +171,7 @@ public:
                                 tmp_gxe_mat.array() * varcom(1) + varcom(2);
                     vmat_logdet += tmp_mat.log().sum();
                     tmp_mat = 1 / tmp_mat.array();
-                    for(long long m = 0; m < num_element; m++){
+                    for(std::int64_t m = 0; m < num_element; m++){
                         tripletList.push_back(Eigen::Triplet<double>(m, m, tmp_mat(m, 0)));
                     }
                 }
@@ -182,8 +184,8 @@ public:
                 llt_solver.compute(tmp_mat);
                 vmat_logdet += llt_solver.logDeterminant();
                 tmp_mat = llt_solver.inverse();
-                for(long long m = 0; m < num_element; m++){
-                    for(long long n = 0; n < num_element; n++)
+                for(std::int64_t m = 0; m < num_element; m++){
+                    for(std::int64_t n = 0; n < num_element; n++)
                         tripletList.push_back(Eigen::Triplet<double>(start_index + m, start_index + n, tmp_mat(m, n)));
                 }
             }
@@ -196,24 +198,24 @@ public:
     }
     
 
-    SparseMatrix < double > calGxEGRM(vector<MatrixXd>& grm_mat_group_vec, vector<long long>& grm_index_vec,
+    SparseMatrix < double > calGxEGRM(vector<MatrixXd>& grm_mat_group_vec, vector<std::int64_t>& grm_index_vec,
                     MatrixXd& bye_mat){
-        long long num_bye = bye_mat.cols();
-        long long num_id = bye_mat.rows();
+        std::int64_t num_bye = bye_mat.cols();
+        std::int64_t num_id = bye_mat.rows();
         std::vector<Eigen::Triplet<double>> tripletList;
         vector<MatrixXd> gxe_rm_group_vec(grm_mat_group_vec.size());
-        for(long long i = 0; i < grm_mat_group_vec.size(); i++){
+        for(std::int64_t i = 0; i < grm_mat_group_vec.size(); i++){
             MatrixXd tmp_mat = grm_mat_group_vec[i];
             gxe_rm_group_vec[i] = tmp_mat; // Elements index 0 will not be null
-            long long start_index = grm_index_vec[i];
-            long long num_element = tmp_mat.rows();
+            std::int64_t start_index = grm_index_vec[i];
+            std::int64_t num_element = tmp_mat.rows();
             MatrixXd bye_mat_part = bye_mat.middleRows(start_index, num_element);
             if(i == 0){
                 if(tmp_mat.size() != 0){
                     MatrixXd tmp_mat2 = (bye_mat_part.cwiseProduct(bye_mat_part)).rowwise().sum() / num_bye;
                     tmp_mat2 = (tmp_mat2.cwiseProduct(tmp_mat)).eval();
                     gxe_rm_group_vec[i] = tmp_mat2;
-                    for(long long m = 0; m < num_element; m++){
+                    for(std::int64_t m = 0; m < num_element; m++){
                         tripletList.push_back(Eigen::Triplet<double>(m, m, tmp_mat2(m, 0)));
                     }
                 }
@@ -221,8 +223,8 @@ public:
                 MatrixXd tmp_mat2 = bye_mat_part * bye_mat_part.transpose() / num_bye;
                 tmp_mat2 = (tmp_mat2.cwiseProduct(tmp_mat)).eval();
                 gxe_rm_group_vec[i] = tmp_mat2;
-                for(long long m = 0; m < num_element; m++){
-                    for(long long n = 0; n < num_element; n++)
+                for(std::int64_t m = 0; m < num_element; m++){
+                    for(std::int64_t n = 0; n < num_element; n++)
                         tripletList.push_back(Eigen::Triplet<double>(start_index + m, start_index + n, tmp_mat2(m, n)));
                 }
             }
@@ -235,9 +237,9 @@ public:
     }
 
     double neg_loglik(){
-        long long p = X.cols();
+        std::int64_t p = X.cols();
         VectorXd X_xtVix(p);
-        for(long long i = 0; i < p; i++){
+        for(std::int64_t i = 0; i < p; i++){
             X_xtVix(i) = X.col(i).transpose() * this->Vi * X.col(i);
         }
         double fx = - 0.5 * n * std::log(2 * M_PI) - 0.5 * this->vmat_logdet 
@@ -249,9 +251,9 @@ public:
     }
 
     void neg_gradVec(VectorXd& grad){
-        long long p = X.cols();
+        std::int64_t p = X.cols();
         grad.resize(3);
-        for(long long i = 0; i < 3; i++){
+        for(std::int64_t i = 0; i < 3; i++){
             SparseMatrix < double > spFD(num_id, num_id);
             if(i == 0)
                 spFD = grm_mat;
@@ -261,7 +263,7 @@ public:
                 spFD.setIdentity();
             
             VectorXd X_xtVi3x(p);
-            for(long long i = 0; i < p; i++){
+            for(std::int64_t i = 0; i < p; i++){
                 X_xtVi3x(i) = X.col(i).transpose() * this->Vi * spFD * this->Vi * X.col(i);
             }
             grad(i) = -0.5 * this->Vi.cwiseProduct(spFD).sum() 
@@ -303,14 +305,14 @@ void MMSUSIE::pre_data_GxE(bool standardize_env, int phen_correct){
     if(phen_correct == 1)
     {
         this->m_y = (this->m_y - m_xmat * ((m_xmat.transpose() * m_xmat).inverse() * (m_xmat.transpose() * m_y))).eval();
-        long long nrows = this->m_xmat.rows();
+        std::int64_t nrows = this->m_xmat.rows();
         this->m_xmat = MatrixXd::Ones(nrows, 1);
         this->m_xmat.conservativeResize(nrows, 1 + this->m_bye_mat.cols());
         this->m_xmat.rightCols(this->m_bye_mat.cols()) = this->m_bye_mat; // interaction covariate
     }else if (phen_correct == 2)
     {
-        long long nrows = this->m_xmat.rows();
-        long long ncols = this->m_xmat.cols();
+        std::int64_t nrows = this->m_xmat.rows();
+        std::int64_t ncols = this->m_xmat.cols();
         this->m_xmat.conservativeResize(nrows, ncols + this->m_bye_mat.cols());
         this->m_xmat.rightCols(this->m_bye_mat.cols()) = this->m_bye_mat; // interaction covariate
         qr.compute(this->m_xmat);
@@ -340,12 +342,12 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
         }
     }else{
         GENO GenoA(bed_file);
-        vector<long long> id_index_in_bed_vec = GenoA.find_fam_index_pro(m_id_in_data_vec);
-        vector<long long> snp_index_vec = GenoA.find_bim_index_pro(snp_vec);
+        vector<std::int64_t> id_index_in_bed_vec = GenoA.find_fam_index(m_id_in_data_vec);
+        vector<std::int64_t> snp_index_vec = GenoA.find_bim_index(snp_vec);
 
         MatrixXd snp_mat;
-        VectorXd freq_arr, missing_rate_arr;
-        GenoA.read_bed_by_snp_index(bed_file + ".bed", snp_mat, freq_arr, missing_rate_arr, snp_index_vec, id_index_in_bed_vec);
+        VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
+        GenoA.read_bed_by_snp_indices(bed_file + ".bed", snp_mat, freq_arr, missing_rate_arr, nobs_geno_arr, snp_index_vec, id_index_in_bed_vec);
         
         // scale to zero mean and 1 std
         snp_mat.rowwise() -= 2*freq_arr.transpose();
@@ -358,9 +360,9 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
             X.resize(id_index_in_bed_vec.size(), snp_index_vec.size() + this->m_bye_mat.cols() + snp_index_vec.size() * this->m_bye_mat.cols());
             X.leftCols(snp_mat.cols()) = snp_mat;
             X.middleCols(snp_mat.cols(), this->m_bye_mat.cols()) = this->m_bye_mat;
-            long long k = snp_mat.cols() + this->m_bye_mat.cols();
-            for(long long i = 0; i < snp_index_vec.size(); i++){
-                for(long long j = 0; j < this->m_bye_mat.cols(); j++){
+            std::int64_t k = snp_mat.cols() + this->m_bye_mat.cols();
+            for(std::int64_t i = 0; i < snp_index_vec.size(); i++){
+                for(std::int64_t j = 0; j < this->m_bye_mat.cols(); j++){
                     X.col(k) = snp_mat.col(i).cwiseProduct(this->m_bye_mat.col(j));
                     k++;
                 }
@@ -370,9 +372,9 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
         {
             X.resize(id_index_in_bed_vec.size(), snp_index_vec.size() + snp_index_vec.size() * this->m_bye_mat.cols());
             X.leftCols(snp_mat.cols()) = snp_mat;
-            long long k = snp_mat.cols();
-            for(long long i = 0; i < snp_index_vec.size(); i++){
-                for(long long j = 0; j < this->m_bye_mat.cols(); j++){
+            std::int64_t k = snp_mat.cols();
+            for(std::int64_t i = 0; i < snp_index_vec.size(); i++){
+                for(std::int64_t j = 0; j < this->m_bye_mat.cols(); j++){
                     X.col(k) = snp_mat.col(i).cwiseProduct(this->m_bye_mat.col(j));
                     k++;
                 }
@@ -384,23 +386,23 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
 }
 
 
-void MMSUSIE::mmsusiefun(MatrixXd X, long long L, long long maxiter, double tol, 
+void MMSUSIE::mmsusiefun(MatrixXd X, std::int64_t L, std::int64_t maxiter, double tol, 
                double coverage, double min_abs_corr, bool estimate_sigma){
     this->mmsusiefun2(X, this->m_y, L, maxiter, tol, coverage, min_abs_corr, estimate_sigma);
 }
 
 /**
- * long long L: the number of pre-defined casual variables
+ * std::int64_t L: the number of pre-defined casual variables
 */
-void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, long long L, long long maxiter, double tol, 
+void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, std::int64_t L, std::int64_t maxiter, double tol, 
                double coverage, double min_abs_corr, bool estimate_sigma){
-    long long p = X.cols(), n = X.rows();
+    std::int64_t p = X.cols(), n = X.rows();
     if(p < L) L = p;
     double varY = (y.array() - y.mean()).square().sum() / y.size();
 
     // X.col(i).T * Vi * X.col(i) for each element, simple linear regression
     VectorXd X_xtVix(p);
-    for(long long i = 0; i < p; i++){
+    for(std::int64_t i = 0; i < p; i++){
         X_xtVix(i) = X.col(i).transpose() * this->m_Vi0 * X.col(i);
     }
     VectorXd shat2_Vec = 1 / X_xtVix.array(); // (x'V(-1)x)(-1) for simple linear regression
@@ -427,10 +429,10 @@ void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, long long L, long long maxiter
     VectorXd varcom = this->m_varcom_null;
     SparseMatrix <double> Vi = this->m_Vi0;
     double V_logdet = this->m_V0_logdet;
-    for(long long iter = 0; iter < maxiter; iter++){
+    for(std::int64_t iter = 0; iter < maxiter; iter++){
         spdlog::info("Iteration: {}", iter + 1);
         // update each effect once
-        for(long long l = 0; l < L; l++){
+        for(std::int64_t l = 0; l < L; l++){
             // Remove lth effect from fitted values
             Xr_Vec = Xr_Vec - X * (alpha_Mat.row(l).cwiseProduct(mu_Mat.row(l))).transpose();
 
@@ -532,7 +534,7 @@ void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, long long L, long long maxiter
             Vi = optimize_sigmaA.get_Vi();
             V_logdet = optimize_sigmaA.get_V_logdet();
             
-            for(long long i = 0; i < p; i++){
+            for(std::int64_t i = 0; i < p; i++){
                 X_xtVix(i) = X.col(i).transpose() * Vi * X.col(i);
             }
             shat2_Vec = 1 / X_xtVix.array();
@@ -641,7 +643,7 @@ Eigen::VectorXi MMSUSIE::in_CS_x(const Eigen::VectorXd& x, double coverage) {
 
 Eigen::MatrixXi MMSUSIE::in_CS(Eigen::MatrixXd& alpha, double coverage) {
     Eigen::MatrixXi status(alpha.rows(), alpha.cols());
-    for (long long i = 0; i < alpha.rows(); i++) {
+    for (std::int64_t i = 0; i < alpha.rows(); i++) {
         Eigen::VectorXd x = alpha.row(i);
         status.row(i) = in_CS_x(x, coverage);
     }
@@ -696,11 +698,11 @@ double MMSUSIE::computeMinCorrelation(const Eigen::MatrixXd& matrix) {
         (cov.diagonal().array().sqrt().replicate(1, cov.cols())).transpose().array();
     
     // low tri elements
-    long long num_row = correlation.rows();
+    std::int64_t num_row = correlation.rows();
     Eigen::VectorXd correlation_trilVec(num_row * (num_row - 1) / 2);
-    long long k = 0;
-    for(long long i = 0; i < num_row; i++){
-        for(long long j = 0; j < i; j++){
+    std::int64_t k = 0;
+    for(std::int64_t i = 0; i < num_row; i++){
+        for(std::int64_t j = 0; j < i; j++){
             correlation_trilVec(k++) = std::fabs(correlation(i, j));
         }
     }
@@ -709,14 +711,14 @@ double MMSUSIE::computeMinCorrelation(const Eigen::MatrixXd& matrix) {
 
 
 void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& claimed_coverage, Eigen::MatrixXd& X, double& min_abs_corr){
-    long long numCS = cs.size();
+    std::int64_t numCS = cs.size();
     std::vector<int> isPurity;
-    for(long long i = 0; i < numCS; i++){
+    for(std::int64_t i = 0; i < numCS; i++){
         std::vector<int> csi = cs[i];
         if(csi.size() == 1){
             isPurity.push_back(i);
         }else{
-            Eigen::MatrixXd Xsub = X(Eigen::all, csi);
+            Eigen::MatrixXd Xsub = X(Eigen::indexing::all, csi);
             double minCorr = computeMinCorrelation(Xsub);
             if(minCorr > min_abs_corr){
                 isPurity.push_back(i);
@@ -726,7 +728,7 @@ void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& cl
 
     std::vector<std::vector<int>> csPurity;
     Eigen::VectorXd claimed_coveragePurity(isPurity.size());
-    for(long long i = 0; i < isPurity.size(); i++){
+    for(std::int64_t i = 0; i < isPurity.size(); i++){
         csPurity.push_back(cs[isPurity[i]]);
         claimed_coveragePurity[i] = claimed_coverage[isPurity[i]];
     }
@@ -737,9 +739,9 @@ void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& cl
 Eigen::VectorXd MMSUSIE::getPIP(Eigen::MatrixXd& alpha_Mat){
     Eigen::MatrixXd alpha_Mat_tmp = 1 - alpha_Mat.array();
     Eigen::VectorXd pipVec(alpha_Mat_tmp.cols());
-    for(long long j = 0; j < alpha_Mat_tmp.cols(); j++){
+    for(std::int64_t j = 0; j < alpha_Mat_tmp.cols(); j++){
         double mac = 1;
-        for(long long i = 0; i < alpha_Mat_tmp.rows(); i++){
+        for(std::int64_t i = 0; i < alpha_Mat_tmp.rows(); i++){
             mac = mac * alpha_Mat_tmp(i, j);
         }
         pipVec(j) = 1 - mac;
@@ -764,7 +766,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
     std::string data_file, agrm_file, bed_file, out_file;
     std::vector<std::string> trait_vec, covariate_vec, class_vec, bye_vec, snp_focus_vec;
     std::vector<std::string> missing_in_data_vec = {"NA", "Na", "na", "NAN", "NaN", "nan", "-NAN", "-NaN", "-nan", "<NA>", "<na>", "N/A", "n/a"};
-    long long num_causal = 10;
+    std::int64_t num_causal = 10;
     double tol = 1e-3;
     double coverage = 0.95;
     double min_abs_cor = 0.5;
@@ -928,7 +930,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
     // Trait index
     
     std::vector<std::string> strNoFound_vec;
-    std::vector<long long> trait_index_vec = find_index(head_vec, trait_vec, strNoFound_vec);
+    std::vector<std::int64_t> trait_index_vec = find_index(head_vec, trait_vec, strNoFound_vec);
 
     if (!strNoFound_vec.empty()) {
         spdlog::error("Trait names not found in the header: {}", join_string(strNoFound_vec));
@@ -942,7 +944,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
         spdlog::info("Number of covariates: {}, Covariates: {}", 
              covariate_vec.size(), join_string(covariate_vec, ", "));
     }
-    vector <long long> covariate_index_vec = find_index(head_vec, covariate_vec, strNoFound_vec);
+    vector <std::int64_t> covariate_index_vec = find_index(head_vec, covariate_vec, strNoFound_vec);
     strNoFound_vec.clear();
 
     // class index
@@ -951,7 +953,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
         spdlog::info("Number of class variables: {}, class variables: {}", 
              class_vec.size(), join_string(class_vec, ", "));
     }
-    vector <long long> class_index_vec = find_index(head_vec, class_vec, strNoFound_vec);
+    vector <std::int64_t> class_index_vec = find_index(head_vec, class_vec, strNoFound_vec);
     strNoFound_vec.clear();
 
 
@@ -959,7 +961,7 @@ int MMSUSIE::run(int argc, char *argv[]) {
     bye_vec = expand_variable_ranges(bye_vec, head_vec);
     spdlog::info("Number of interacting environmental covariates: {}, Interacting environmental covariates: {}", 
              bye_vec.size(), join_string(bye_vec, ", "));
-    vector <long long> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
+    vector <std::int64_t> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
     if(strNoFound_vec.size() != 0){
         spdlog::error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
         exit(1);
@@ -967,8 +969,8 @@ int MMSUSIE::run(int argc, char *argv[]) {
     strNoFound_vec.clear();
     
     if (!bye_index_vec.empty()) {
-        std::vector<long long> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
-        std::vector<long long> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
+        std::vector<std::int64_t> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
+        std::vector<std::int64_t> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
         
         if (!tmp1.empty() || !tmp2.empty()) {
             spdlog::error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
@@ -997,4 +999,3 @@ int MMSUSIE::run(int argc, char *argv[]) {
     
     return 0;
 }
-

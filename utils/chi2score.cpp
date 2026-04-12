@@ -7,120 +7,134 @@
  */
 
 #include <iostream>
-#include <Eigen/Eigen>
 #include <Eigen/Core>
-#include <Eigen/Dense>
-#include <vector>
 #include <cmath>
-#include <algorithm>
+#include <limits>
 #include <gsl/gsl_cdf.h>
-#include <boost/math/distributions/non_central_chi_squared.hpp>
 #include <boost/math/tools/roots.hpp>
 #include <boost/math/distributions/normal.hpp>
 
+namespace {
 
-
-double LiuSF(double t, Eigen::VectorXd &lambs, Eigen::VectorXd &dofs, Eigen::VectorXd &deltas, 
-                        bool kurtosis){
-    // lambs**1, lambs**2, lambs**3, lambs**4
-    std::vector <Eigen::VectorXd> lambs_vec(4);
-    for(long long i = 0; i < 4; i++){
-        lambs_vec[i] = lambs.array().pow(i+1);
+double clamp_probability(double p) {
+    if (!std::isfinite(p)) {
+        return std::numeric_limits<double>::quiet_NaN();
     }
-
-    // c[0..3]
-    std::vector <double> c_vec(4);
-    for(long long i = 0; i < 4; i++){
-        c_vec[i] = (lambs_vec[i].cwiseProduct(dofs)).sum() + (i + 1) * (lambs_vec[i].cwiseProduct(deltas)).sum();
-    }
-
-    // s1, s2, s1**2
-    double s1 = c_vec[2] / std::pow(c_vec[1], 3.0/2.0);
-    double s2 = c_vec[3] / std::pow(c_vec[1], 2.0);
-    double s12 = std::pow(s1, 2);
-
-    double delta_x, dof_x, a;
-    if(s12 > s2){
-        a = 1 / (s1 - std::sqrt(s12 - s2));
-        delta_x = s1 * std::pow(a, 3) - std::pow(a, 2);
-        dof_x = std::pow(a, 2) - 2 * delta_x;
-    }else{
-        delta_x = 0;
-        if(kurtosis){
-            a = 1 / std::sqrt(s2);
-            dof_x = 1 / s2;
-        }
-        else{
-            a = 1 / s1;
-            dof_x = 1 / s12;
-        }
-    }
-
-    double mu_q = c_vec[0];
-    double sigma_q = std::sqrt(2 * c_vec[1]);
-
-    double mu_x = dof_x + delta_x;
-    double sigma_x = std::sqrt(2 * (dof_x + 2 * delta_x));
-
-    double t_star = (t - mu_q) / sigma_q;
-    double tfinal = t_star * sigma_x + mu_x;
-    
-    if(tfinal < 0) return 1.0;
-
-    if(delta_x < 1.e-9) delta_x = 1.0e-9;
-    boost::math::non_central_chi_squared_distribution<> dist(dof_x, delta_x);
-    double p = boost::math::cdf(complement(dist, tfinal));
-
-    return p;
+    return std::min(1.0, std::max(0.0, p));
 }
 
-
-
-double saddle(double x, Eigen::VectorXd& lambda) {
-    double d = lambda.maxCoeff();
-    Eigen::VectorXd lambda_norm = lambda / d;
-    double x_norm = x / d;
-
-    double lmin, lmax, hatzeta, w, v;
-    if (lambda_norm.minCoeff() < 0) {
-        std::vector<double> lambda_norm_vec;
-        for(auto tmp:lambda_norm){
-            if(tmp < 0) lambda_norm_vec.push_back(tmp);
-        }
-        auto max_element_iter = std::max_element(lambda_norm_vec.begin(), lambda_norm_vec.end());
-        lmin = 1 / (2 * *max_element_iter) * 0.99999;
-    } else if (x_norm > lambda_norm.sum()) {
-        lmin = -0.01;
-    } else {
-        lmin = -lambda_norm.size() / (2 * x_norm);
+double weighted_chisq_sf_fallback(double x, const Eigen::VectorXd& lambda) {
+    if (!std::isfinite(x)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (x <= 0.0) {
+        return 1.0;
     }
 
-    lmax = 1 / (2 * lambda_norm.maxCoeff()) * 0.99999;
+    Eigen::ArrayXd lambda_pos = lambda.array().max(0.0);
+    double sum1 = lambda_pos.sum();
+    double sum2 = lambda_pos.square().sum();
+    if (sum1 <= 0.0 || sum2 <= 0.0) {
+        return 0.0;
+    }
 
-    // root-finding function
+    double scale = sum2 / sum1;
+    double df = sum1 * sum1 / sum2;
+    if (!(scale > 0.0) || !(df > 0.0) || !std::isfinite(scale) || !std::isfinite(df)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    return clamp_probability(gsl_cdf_chisq_Q(x / scale, df));
+}
+
+Eigen::VectorXd sanitize_lambda(const Eigen::VectorXd& lambda) {
+    if (lambda.size() == 0) {
+        return lambda;
+    }
+
+    double max_abs = lambda.cwiseAbs().maxCoeff();
+    double zero_tol = std::max(1.0, max_abs) * 1e-12;
+    Eigen::VectorXd sanitized(lambda.size());
+    for (Eigen::Index i = 0; i < lambda.size(); ++i) {
+        double value = lambda(i);
+        if (!std::isfinite(value) || value <= zero_tol) {
+            sanitized(i) = 0.0;
+        } else {
+            sanitized(i) = value;
+        }
+    }
+    return sanitized;
+}
+
+}  // namespace
+
+double saddle(double x, const Eigen::VectorXd& lambda) {
+    if (!std::isfinite(x)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (x <= 0.0) {
+        return 1.0;
+    }
+    if (lambda.size() == 0) {
+        return 0.0;
+    }
+
+    Eigen::VectorXd lambda_clean = sanitize_lambda(lambda);
+    if (lambda_clean.maxCoeff() <= 0.0) {
+        return 0.0;
+    }
+
+    double d = lambda_clean.maxCoeff();
+    Eigen::VectorXd lambda_norm = lambda_clean / d;
+    double x_norm = x / d;
+
+    double lmin;
+    if (x_norm > lambda_norm.sum()) {
+        lmin = -0.01;
+    } else {
+        lmin = -static_cast<double>(lambda_norm.size()) / (2.0 * x_norm);
+    }
+
+    double lmax = 0.5 / lambda_norm.maxCoeff() * 0.99999;
+    if (!std::isfinite(lmin) || !std::isfinite(lmax) || !(lmin < lmax)) {
+        return weighted_chisq_sf_fallback(x, lambda_clean);
+    }
+
     int digits = std::numeric_limits<double>::digits;
     boost::uintmax_t max_iter = 500;
     auto f = [&](double zeta) {
-        return (lambda_norm.array() / (1 - 2*zeta*lambda_norm.array())).sum() - x_norm;
+        return (lambda_norm.array() / (1 - 2 * zeta * lambda_norm.array())).sum() - x_norm;
     };
-    std::pair<double, double> result = boost::math::tools::toms748_solve(f, lmin, lmax, boost::math::tools::eps_tolerance<double>(digits), max_iter);
 
-    hatzeta = result.first + (result.second - result.first) / 2;
-
-    double k0 = -(1 - 2 * hatzeta * lambda_norm.array()).log().sum() / 2;
-    w = std::copysign(std::sqrt(2*(hatzeta*x_norm - k0)), hatzeta);
-    double kpprime0 = 2 * (lambda_norm.array().square() / (1 - 2*hatzeta*lambda_norm.array()).square()).sum();
-    v = hatzeta*std::sqrt(kpprime0);
-
-    if (std::abs(hatzeta) < 1e-4) {
-        double tr = lambda.mean();
-        double tr2 = lambda.array().square().mean() / (tr * tr);
-        double scale = tr*tr2;
-        double df = lambda.size() / tr2;
-        double guess = gsl_cdf_chisq_Q(x / scale, df);
-        return guess;
-    } else {
-        boost::math::normal_distribution<> dist;
-        return boost::math::cdf(complement(dist, w + std::log(v / w) / w));
+    double f_lmin = f(lmin);
+    double f_lmax = f(lmax);
+    if (!std::isfinite(f_lmin) || !std::isfinite(f_lmax) || f_lmin * f_lmax > 0.0) {
+        return weighted_chisq_sf_fallback(x, lambda_clean);
     }
+
+    double hatzeta;
+    try {
+        std::pair<double, double> result = boost::math::tools::toms748_solve(
+            f, lmin, lmax, boost::math::tools::eps_tolerance<double>(digits), max_iter);
+        hatzeta = result.first + (result.second - result.first) / 2.0;
+    } catch (...) {
+        return weighted_chisq_sf_fallback(x, lambda_clean);
+    }
+
+    double k0 = -(1 - 2 * hatzeta * lambda_norm.array()).log().sum() / 2.0;
+    double w_sq = 2.0 * (hatzeta * x_norm - k0);
+    double kpprime0 = 2.0 * (lambda_norm.array().square() / (1 - 2 * hatzeta * lambda_norm.array()).square()).sum();
+    if (!(w_sq > 0.0) || !(kpprime0 > 0.0) || !std::isfinite(w_sq) || !std::isfinite(kpprime0)) {
+        return weighted_chisq_sf_fallback(x, lambda_clean);
+    }
+
+    double w = std::copysign(std::sqrt(w_sq), hatzeta);
+    double v = hatzeta * std::sqrt(kpprime0);
+
+    if (std::abs(hatzeta) < 1e-4 || std::abs(w) < 1e-8 || !(v / w > 0.0) || !std::isfinite(v)) {
+        return weighted_chisq_sf_fallback(x, lambda_clean);
+    }
+
+    boost::math::normal_distribution<> dist;
+    return clamp_probability(boost::math::cdf(complement(dist, w + std::log(v / w) / w)));
 }

@@ -1,11 +1,14 @@
 /*
+ * @Description: 
  * @Author: Chao Ning
- * @Date: 2022-04-13 08:44:51
- * @LastEditTime: 2025-01-31 22:49:32
- * @LastEditors: Chao Ning
- * @Description: process genotype files
- * @FilePath: \gmat64\geno\geno.hpp
+ * @Date: 2025-01-29 14:13:31
+ * LastEditTime: 2026-04-01 17:47:23
+ * LastEditors: Chao Ning
  */
+
+
+#include <cstdint>
+
 #define EIGEN_USE_MKL_ALL  // !must be before include Eigen
 
 #include "geno.hpp"
@@ -13,264 +16,366 @@
 #include "EigenMatrix_utils.hpp"
 #include "iterator_utils.hpp"
 
-/**
- * @brief Construct a new GENO::GENO object
- * !Calculate the number of iids and sids
- * @param geno_file 
- */
-GENO::GENO(string geno_file) {
-    _geno_file = geno_file;
-    // the number of IDs
-    string fam_file = _geno_file + ".fam";
-    ifstream fin(fam_file);
+namespace {
+
+constexpr double kMissingGenotypeValue = -9.0;
+constexpr unsigned char kBedGenotypeMask = 0x03;
+
+inline std::int64_t bed_bytes_per_snp(std::int64_t num_id) {
+    return (num_id + 3) / 4;
+}
+
+inline double decode_bed_sample(const char* snp_bytes, std::int64_t sample_idx) {
+    const unsigned char byte = static_cast<unsigned char>(snp_bytes[sample_idx >> 2]);
+    const unsigned char genotype = (byte >> ((sample_idx & 3) << 1)) & kBedGenotypeMask;
+    switch (genotype) {
+        case 0: return 2.0;
+        case 1: return kMissingGenotypeValue;
+        case 2: return 1.0;
+        case 3: return 0.0;
+        default: throw std::logic_error("Invalid genotype value");
+    }
+}
+
+inline bool is_missing_genotype(double geno_value) {
+    return geno_value < 0.0;
+}
+
+std::int64_t count_lines_or_throw(const string& file_path, const char* file_label) {
+    ifstream fin(file_path);
     if (!fin.is_open()) {
-        spdlog::error("Failed to open the fam file: {}", fam_file);
+        spdlog::error("Failed to open the {} file: {}", file_label, file_path);
         throw std::runtime_error("File open error");
     }
-    _num_id = 0;
+
+    std::int64_t line_count = 0;
     string one_line;
-    while (getline(fin, one_line)) { // read line by line different from fin.getline(char* s,size_t n)
-        _num_id++;
+    while (getline(fin, one_line)) {
+        ++line_count;
     }
-    fin.close();
-    // the number of SNPs
-    string bim_file = _geno_file + ".bim";
-    fin.open(bim_file);
+    return line_count;
+}
+
+vector<string> read_id_column_or_throw(const string& file_path,
+                                       const char* file_label,
+                                       size_t expected_num_columns,
+                                       size_t id_column_index,
+                                       size_t reserve_count) {
+    ifstream fin(file_path);
     if (!fin.is_open()) {
-        spdlog::error("Failed to open the bim file: {}", bim_file);
+        spdlog::error("Failed to open the {} file: {}", file_label, file_path);
         throw std::runtime_error("File open error");
     }
-    _num_snp = 0;
-    while (getline(fin, one_line)) { // read line by line different from fin.getline(char* s,size_t n)
-        _num_snp++;
+
+    vector<string> id_vec;
+    id_vec.reserve(reserve_count);
+
+    string one_line;
+    vector<string> fields;
+    while (getline(fin, one_line)) {
+        process_line(one_line);
+        fields = split_string(one_line);
+        if (fields.size() != expected_num_columns) {
+            spdlog::error("Line: {} should have {} columns!", one_line, expected_num_columns);
+            throw std::runtime_error("Incorrect genotype sidecar file format");
+        }
+        id_vec.push_back(std::move(fields[id_column_index]));
     }
-    fin.close();
+
+    return id_vec;
+}
+
+vector<std::int64_t> locate_ids_or_throw(const vector<string>& ids_in_need_vec,
+                                      const vector<string>& ids_in_geno_vec) {
+    std::unordered_map<string, std::int64_t> id_in_geno_map;
+    id_in_geno_map.reserve(ids_in_geno_vec.size());
+
+    std::int64_t val = 0;
+    for (const auto& tmp : ids_in_geno_vec) {
+        id_in_geno_map.emplace(tmp, val++);
+    }
+
+    set<string> missing_id_set;
+    for (const auto& tmp : ids_in_need_vec) {
+        if (id_in_geno_map.find(tmp) == id_in_geno_map.end()) {
+            missing_id_set.insert(tmp);
+        }
+    }
+    if (!missing_id_set.empty()) {
+        vector<string> missing_ids(missing_id_set.begin(), missing_id_set.end());
+        spdlog::error("Some requested IDs were not found: {}", join_string(missing_ids, " "));
+        exit(1);
+    }
+
+    vector<std::int64_t> index_vec;
+    index_vec.reserve(ids_in_need_vec.size());
+    for (const auto& tmp : ids_in_need_vec) {
+        index_vec.push_back(id_in_geno_map.at(tmp));
+    }
+    return index_vec;
+}
+
+void parse_feature_row_or_throw(const vector<string>& fields,
+                                const vector<string>& missing_in_geno_vec,
+                                vector<double>& parsed_values,
+                                double& observed_sum,
+                                std::int64_t& num_missing_geno) {
+    parsed_values.resize(fields.size());
+    observed_sum = 0.0;
+    num_missing_geno = 0;
+
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (is_nan(fields[i], missing_in_geno_vec)) {
+            parsed_values[i] = kMissingGenotypeValue;
+            ++num_missing_geno;
+        } else {
+            parsed_values[i] = string_to_double(fields[i]);
+            observed_sum += parsed_values[i];
+        }
+    }
+}
+
+}  // namespace
+
+/**
+ * @brief Initialize genotype metadata from the PLINK prefix.
+ *
+ * The constructor records the file prefix, counts individuals from `.fam`,
+ * and counts markers from `.bim`. The actual genotype matrix is still read
+ * lazily by the downstream `read_*` helpers.
+ *
+ * Used in:
+ * - `gmatrix/gmatrix.cpp`
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mom.cpp`
+ * - `fastgxe/mmsusie.cpp`
+ */
+GENO::GENO(const string& geno_file) : _geno_file(geno_file) {
+    _num_id = count_lines_or_throw(_geno_file + ".fam", "fam");
+    _num_snp = count_lines_or_throw(_geno_file + ".bim", "bim");
 }
 
 /**
- * @brief 
- * ! get the number of iids
- * @return long long 
+ * @brief Return the number of samples recorded in the backing genotype dataset.
+ *
+ * Used in:
+ * - `gmatrix/gmatrix.cpp`
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mom.cpp`
  */
-long long GENO::get_num_iid() {
+std::int64_t GENO::get_num_iid() {
     return _num_id;
 }
 
 /**
- * @brief 
- * ! get the number of SNPs
- * @return long long 
+ * @brief Return the number of markers recorded in the backing genotype dataset.
+ *
+ * Used in:
+ * - `gmatrix/gmatrix.cpp`
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mom.cpp`
  */
-long long GENO::get_num_sid() {
+std::int64_t GENO::get_num_sid() {
     return _num_snp;
 }
 
 
 /**
- * @brief 
- * !get the iids
- * @return vector<string> 
+ * @brief Read the sample IDs from the `.fam` file in file order.
+ *
+ * The returned IDs are the second column of the PLINK `.fam` file and define
+ * the row order used by genotype reads.
+ *
+ * Used in:
+ * - `gmatrix/gmatrix.cpp`
+ * - `fastgxe/mom.cpp`
+ * - `utils/geno.cpp`
  */
 vector<string> GENO::iid_vec(){
-    std::string fam_file = _geno_file + ".fam";
-    ifstream fin;
-    fin.open(fam_file.c_str());
-    if (!fin.is_open()) {
-        spdlog::error("Failed to open the fam file: {}", _geno_file + ".fam");
-        throw std::runtime_error("File open error");
+    if (!_iid_cache_loaded) {
+        _iid_cache = read_id_column_or_throw(_geno_file + ".fam", "fam", 6, 1,
+                                             static_cast<size_t>(_num_id));
+        _iid_cache_loaded = true;
     }
-    string one_line;
-    vector<string> id_in_geno_vec;
-    vector<string> tmp;
-    while (getline(fin, one_line)) {
-        process_line(one_line);
-        tmp = split_string(one_line);
-        if(tmp.size() != 6){
-            spdlog::error("Line: {} should have 6 columns!", one_line);
-            throw std::runtime_error("Incorrect .fam file format");
-        }
-        id_in_geno_vec.push_back(tmp[1]);
-    }
-    fin.close();
-    return id_in_geno_vec;
+    return _iid_cache;
 }
 
 /**
- * @brief 
- * ! get the sids
- * @return vector<string> 
+ * @brief Read the marker IDs from the `.bim` file in file order.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
  */
 vector<string> GENO::sid_vec(){
-    string bim_file = _geno_file + ".bim";
-    ifstream fin;
-    fin.open(bim_file.c_str());
-    if(!fin.is_open()){
-        spdlog::error("Failed to open the bim file: {}", _geno_file + ".bim");
-        throw std::runtime_error("File open error");
+    if (!_sid_cache_loaded) {
+        _sid_cache = read_id_column_or_throw(_geno_file + ".bim", "bim", 6, 1,
+                                             static_cast<size_t>(_num_snp));
+        _sid_cache_loaded = true;
     }
-    std::string one_line;
-    vector<string> tmp; //match pattern *chro snpID base allele1 allele2
-    vector<string> snp_id_vec;
-    while (getline(fin, one_line)) {
-        process_line(one_line);
-        tmp = split_string(one_line);
-        if(tmp.size() != 6){
-            spdlog::error("Line: {} should have 6 columns!", one_line);
-            throw std::runtime_error("Incorrect .bim file format");
-        }
-        snp_id_vec.push_back(tmp[1]);
-    }
-    return snp_id_vec;
+    return _sid_cache;
 }
 
 
 
 /**
- * @brief 
- * ! get the snp annotation information of given number of SNPs from start snp
- * @param start_snp 
- * @param num_snp_read 
- * @return vector<string> 
+ * @brief Read a contiguous block of raw `.bim` annotation lines.
+ *
+ * Each returned string is the processed `.bim` line for one SNP in the
+ * requested range.
+ *
+ * Used in:
+ * - `fastgxe/fastgxe.cpp`
  */
-vector<string> GENO::snp_anno(long long start_snp, long long num_snp_read){
-    // check the boundary
-    if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
+vector<string> GENO::snp_anno(std::int64_t start_snp, std::int64_t num_snp_read){
+    if (start_snp < 0 || num_snp_read <= 0 || start_snp + num_snp_read > _num_snp) {
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check!");
         exit(1);
     }
-    string bim_file = _geno_file + ".bim";
-    ifstream fin;
-    fin.open(bim_file.c_str());
-    if(!fin.is_open()){
+
+    const string bim_file = _geno_file + ".bim";
+    ifstream fin(bim_file);
+    if (!fin.is_open()) {
         spdlog::error("Fail to open the bim file: {}", bim_file);
         exit(1);
     }
+
     string one_line;
-    for(long long i = 0; i < start_snp; i++){ // Skip lines before start SNP
-        getline(fin, one_line);
+    for (std::int64_t snp_index = 0; snp_index < start_snp; ++snp_index) {
+        if (!getline(fin, one_line)) {
+            spdlog::error("Failed to skip to SNP index {} in {}", start_snp, bim_file);
+            exit(1);
+        }
     }
+
     vector<string> snp_anno_vec;
-    long long count_line = 0;
-    while (getline(fin, one_line)) {
+    snp_anno_vec.reserve(static_cast<size_t>(num_snp_read));
+    for (std::int64_t offset = 0; offset < num_snp_read; ++offset) {
+        if (!getline(fin, one_line)) {
+            spdlog::error("Expected {} SNP annotation rows from index {} in {}",
+                          num_snp_read, start_snp, bim_file);
+            exit(1);
+        }
         process_line(one_line);
         snp_anno_vec.push_back(one_line);
-        count_line++;
-        if(count_line >= num_snp_read){
-            break;
-        }
     }
     return snp_anno_vec;
 }
 
 
 /**
- * @brief 
- * ! get the snp annotation information with given snp index vector
- * @param snp_index_vec 
- * @return vector<string> 
+ * @brief Read raw `.bim` annotation lines for an arbitrary SNP index set.
+ *
+ * Used in:
+ * - currently no in-tree call sites were found
  */
-vector<string> GENO::snp_anno_by_snp_index(vector <long long> snp_index_vec){
-    /*
-    set<long long> snp_index_set(snp_index_vec.begin(), snp_index_vec.end());
-    if(snp_index_set.size() != snp_index_vec.size()){
-        cout << "Duplicate IDs exist in the given SNPs" << endl;
-        exit(1);
+vector<string> GENO::snp_anno_by_snp_index(const vector<std::int64_t>& snp_index_vec){
+    if (snp_index_vec.empty()) {
+        return {};
     }
-    */
 
-    string bim_file = _geno_file + ".bim";
-    ifstream fin;
-    fin.open(bim_file.c_str());
+    const string bim_file = _geno_file + ".bim";
+    ifstream fin(bim_file);
     if(!fin.is_open()){
         spdlog::error("Fail to open the bim file:{}", bim_file);
         exit(1);
     }
-    string one_line;
-    vector<string> snp_anno_all_vec;
-    while (getline(fin, one_line)) { //one_line *chro snpID base allele1 allele2
-        process_line(one_line);
-        snp_anno_all_vec.push_back(one_line);
+    vector<std::pair<std::int64_t, size_t>> requested_indices;
+    requested_indices.reserve(snp_index_vec.size());
+    for (size_t i = 0; i < snp_index_vec.size(); ++i) {
+        const std::int64_t snp_index = snp_index_vec[i];
+        if (snp_index < 0 || snp_index >= _num_snp) {
+            spdlog::error("SNP index {} is out of range [0, {})", snp_index, _num_snp);
+            exit(1);
+        }
+        requested_indices.emplace_back(snp_index, i);
     }
+    std::sort(requested_indices.begin(), requested_indices.end());
 
-
-    vector<string> snp_anno_vec;
-    for(vector<long long>::iterator it=snp_index_vec.begin(); it != snp_index_vec.end(); it++) {
-        snp_anno_vec.push_back(snp_anno_all_vec[*it]);
+    vector<string> snp_anno_vec(snp_index_vec.size());
+    string one_line;
+    std::int64_t current_snp_index = -1;
+    for (size_t request_idx = 0; request_idx < requested_indices.size(); ++request_idx) {
+        const std::int64_t target_snp_index = requested_indices[request_idx].first;
+        while (current_snp_index < target_snp_index) {
+            if (!getline(fin, one_line)) {
+                spdlog::error("Failed to read SNP annotation row {} from {}", target_snp_index, bim_file);
+                exit(1);
+            }
+            ++current_snp_index;
+        }
+        process_line(one_line);
+        snp_anno_vec[requested_indices[request_idx].second] = one_line;
+        while (request_idx + 1 < requested_indices.size() &&
+               requested_indices[request_idx + 1].first == target_snp_index) {
+            ++request_idx;
+            snp_anno_vec[requested_indices[request_idx].second] = one_line;
+        }
     }
     return snp_anno_vec;
 }
 
 
 /**
- * @brief 
- * ! Get the allele frequence and number of observed genotypes from bed file
- * @param freq_arr 
- * @param nobs_geno_arr 
+ * @brief Compute per-SNP allele frequency and observed-genotype counts from a PLINK BED file.
+ *
+ * The BED file is decoded SNP by SNP. Each 2-bit PLINK genotype code is
+ * translated into the project's 0/1/2 dosage scale, while missing calls are
+ * excluded from both the dosage sum and the observed-count denominator.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
  */
-void GENO::bed_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_geno_arr){
-    // the number of bytes to store on SNP
-    long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
-    if ( _num_id % 4 != 0) {
-       num_byte_for_one_snp += 1;
-    }
-    // read
-    ifstream fin;
-    fin.open(in_file, std::ios::binary); // Read the in binary
+void GENO::bed_allele_freq(const string& in_file, VectorXd& freq_arr, VectorXd& nobs_geno_arr){
+    const std::int64_t num_byte_for_one_snp = bed_bytes_per_snp(_num_id);
+
+    ifstream fin(in_file, std::ios::binary);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: {}", in_file);
         exit(1);
     }
 
-    double code_val;  // coded value for SNP genotype
-    double freq = 0.0;  // SNP frequence
-    long long iid = 0, isnp = 0;
-    long long num_missing_geno = 0;
-    char x03 = '3' - 48; // binary 00000011
-    char* bytes_vec = new char[num_byte_for_one_snp]; // store readed btyes for one individual
-    VectorXd snp_arr = VectorXd::Zero(_num_id); //SNP array for one individual
+    vector<char> bytes_vec(num_byte_for_one_snp);
     freq_arr.setZero(_num_snp);
     nobs_geno_arr.setZero(_num_snp);
-    fin.read(bytes_vec, sizeof(char) * 3); // Read the first three bytes
-    while (fin.read(bytes_vec, sizeof(char) * num_byte_for_one_snp)) { // read the SNP genotypes for one locus
-        iid = 0;
-        num_missing_geno = 0;
-        for (long long i = 0; i < num_byte_for_one_snp; i++) {
-            for (long long j = 0; j < 4; j++) {
-                code_val = (bytes_vec[i] >> (2 * j))& x03; // move two bits from left to right; two bits contain a SNP
-                code_val = (code_val * code_val + code_val) / 6.0;
-                if (std::fabs(code_val - 2.0 / 6.0) < 0.00001) { // set missing genotype as 2
-                    num_missing_geno += 1;
-                    code_val = 2;
-                }
-                snp_arr(iid) = 2 - code_val;  // missing genotype is translated into 0, not affect mean
-                iid++; // move to next individual
-                if(iid >= _num_id) break;
+    if (!fin.read(bytes_vec.data(), sizeof(char) * 3)) {
+        spdlog::error("Failed to read the BED header from {}", in_file);
+        exit(1);
+    }
+
+    std::int64_t isnp = 0;
+    while (fin.read(bytes_vec.data(), sizeof(char) * num_byte_for_one_snp)) {
+        double dosage_sum = 0.0;
+        std::int64_t num_missing_geno = 0;
+        for (std::int64_t iid = 0; iid < _num_id; ++iid) {
+            const double geno_value = decode_bed_sample(bytes_vec.data(), iid);
+            if (is_missing_genotype(geno_value)) {
+                ++num_missing_geno;
+            } else {
+                dosage_sum += geno_value;
             }
         }
-        nobs_geno_arr(isnp) = _num_id - num_missing_geno;
-        if(std::fabs(nobs_geno_arr(isnp)) < 0.01){
-            freq = 0;
-        }else{
-            freq = snp_arr.sum() / (2*_num_id - 2*num_missing_geno);  // delete the miising allele
-        }
-        freq_arr(isnp) = freq;
-        isnp++; // move to next SNP
+
+        const std::int64_t nobs_geno = _num_id - num_missing_geno;
+        nobs_geno_arr(isnp) = nobs_geno;
+        freq_arr(isnp) = (nobs_geno == 0) ? 0.0 : dosage_sum / (2 * nobs_geno);
+        ++isnp;
     }
-    fin.close();
-    delete [] bytes_vec;
 }
 
 
 
 
 /**
- * @brief 
- * ! Get the allele frequence and number of observed genotypes from dgeno file
- * @param freq_arr 
- * @param nobs_geno_arr 
- * @param missing 
+ * @brief Compute per-feature means and observed-value counts from a feature-by-sample text matrix.
+ *
+ * Each row is one feature and each column is one sample value. The matrix has
+ * no header row and no leading feature-name column.
+ * Missing values are excluded when computing the row mean.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
  */
-void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_geno_arr, vector<string> missing_in_geno_vec){
+void GENO::fs_feature_mean(const string& in_file, VectorXd& freq_arr, VectorXd& nobs_geno_arr, const vector<string>& missing_in_geno_vec){
     ifstream fin;
     fin.open(in_file);
     if (!fin.is_open()) {
@@ -278,43 +383,31 @@ void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_
         exit(1);
     }
     string line;
-    vector <string> tmp;
-    long long igeno = 0; // ith geno
-    long long nobs_geno = 0;
-    double freq = 0;
-    char *endptr = new char[1000];
+    vector<string> tmp;
+    vector<double> parsed_values;
+    std::int64_t igeno = 0;
     freq_arr.setZero(_num_snp);
     nobs_geno_arr.setZero(_num_snp);
     while(getline(fin, line)){
         process_line(line);
         tmp = split_string(line);
-        if(tmp.size() - _num_id != 1){
+        if(tmp.size() != _num_id){
             spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
             exit(1);
         }
-        // genotypic value mean and NOBS
-        freq = 0.0;
-        nobs_geno = 0;
-        for(long long i = 1; i < tmp.size(); i++){
-            if(!is_nan(tmp[i], missing_in_geno_vec)){
-                freq += string_to_double(tmp[i], endptr);
-                nobs_geno++;
-            }
-        }
-        if(nobs_geno == 0){
-            freq = 0;
-        }else{
-            freq /= 2 * nobs_geno;
-        }
-        freq_arr(igeno) = freq;
+
+        double observed_sum = 0.0;
+        std::int64_t num_missing_geno = 0;
+        parse_feature_row_or_throw(tmp, missing_in_geno_vec, parsed_values, observed_sum, num_missing_geno);
+        const std::int64_t nobs_geno = _num_id - num_missing_geno;
         nobs_geno_arr(igeno) = nobs_geno;
-        igeno++;
+        freq_arr(igeno) = (nobs_geno == 0) ? 0.0 : observed_sum / nobs_geno;
+        ++igeno;
         if(igeno > _num_snp){
             spdlog::error("The number of loci exceeds " + std::to_string(_num_snp));
             exit(1);
         }
     }
-    delete[] endptr;
     if(igeno < _num_snp){
         spdlog::error("The number of loci less than " + std::to_string(_num_snp));
         exit(1);
@@ -323,23 +416,24 @@ void GENO::dgeno_allele_freq(string in_file, VectorXd& freq_arr, VectorXd& nobs_
 
 
 /**
- * @brief 
- * ! Get the allele frequences (or means/2) and number of observed genotypes from genotypic file
- * @param input_geno_fmt 0, bed file, 1 dgeno file, 2 cgeno file
- * @param freq_arr frequence array for bed and dgeno file, mean array for cgeno file
- * @param nobs_geno_arr 
- * @param missing 
+ * @brief Dispatch summary-statistic computation by genotype input format.
+ *
+ * BED input (`0`) returns allele frequency, while feature-by-sample input (`1`)
+ * returns per-feature row means in `freq_arr`.
+ *
+ * Used in:
+ * - currently no in-tree call sites were found
  */
-void GENO::allele_freq(int input_geno_fmt, VectorXd& freq_arr, VectorXd& nobs_geno_arr, vector<string> missing_in_geno_vec){
+void GENO::allele_freq(int input_geno_fmt, VectorXd& freq_arr, VectorXd& nobs_geno_arr, const vector<string>& missing_in_geno_vec){
     if(input_geno_fmt == 0){
         string in_file = _geno_file + ".bed";
         GENO::bed_allele_freq(in_file, freq_arr, nobs_geno_arr);
     }else if(input_geno_fmt == 1){
-        string in_file = _geno_file + ".dgeno";
-        GENO::dgeno_allele_freq(in_file, freq_arr, nobs_geno_arr, missing_in_geno_vec);
-    }else if(input_geno_fmt == 2){
-        string in_file = _geno_file + ".cgeno";
-        GENO::dgeno_allele_freq(in_file, freq_arr, nobs_geno_arr, missing_in_geno_vec);
+        string in_file = _geno_file + ".fmat";
+        GENO::fs_feature_mean(in_file, freq_arr, nobs_geno_arr, missing_in_geno_vec);
+    }else{
+        spdlog::error("The input genotypic format is not supported");
+        std::exit(1);
     }
 }
 
@@ -348,510 +442,299 @@ void GENO::allele_freq(int input_geno_fmt, VectorXd& freq_arr, VectorXd& nobs_ge
 
 
 /**
- * @brief 
- * ! Get the iid index in the fam file with given iids
- * @param id_in_need_vec A vector of given iids
- * @return vector<long long> 
+ * @brief Locate sample indices in `.fam` order with pre-validation and a hash map.
+ *
+ * The output preserves the order of `id_in_need_vec`.
+ *
+ * Used in:
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mom.cpp`
+ * - `fastgxe/mmsusie.cpp`
  */
-vector<long long> GENO::find_fam_index(vector<string> id_in_need_vec){
-    vector <string> id_in_geno_vec = GENO::iid_vec(); // id in fam
-    vector<long long> index_vec;
-    long long index;
-    vector<string>::iterator is;
-    for(vector<string>::iterator it = id_in_need_vec.begin(); it < id_in_need_vec.end(); it++){
-        is = find(id_in_geno_vec.begin(), id_in_geno_vec.end(), *it);
-        if(is == id_in_geno_vec.end()){
-            spdlog::error(*it + " is not in the fam file");
-            exit(1);
-        }
-        index = distance(id_in_geno_vec.begin(), is);
-        index_vec.push_back(index);
-    }
-    return index_vec;
-}
-
-vector<long long> GENO::find_fam_index_pro(vector<string> id_in_need_vec){
-    set<string> id_in_need_set(id_in_need_vec.begin(), id_in_need_vec.end());
-    vector <string> id_in_geno_vec = GENO::iid_vec(); // id in fam
-    set<string> id_in_geno_set(id_in_geno_vec.begin(), id_in_geno_vec.end());
-    set<string> tmp_set = set_difference_(id_in_need_set, id_in_geno_set);
-    if(!tmp_set.empty()){
-        spdlog::info("ERROR! These iids are not in the fam file: ", 0, 0, "");
-        for(auto tmp:tmp_set){
-            spdlog::info(tmp, 0, 0, " ");
-        }
-        spdlog::info("");
-        exit(1);
-    }
-
-    std::map<string, long long> id_in_geno_map;
-    long long val = 0;
-    for(auto tmp:id_in_geno_vec){
-        id_in_geno_map[tmp] = val++;
-    }
-    
-    vector<long long> index_vec;
-    for(auto tmp:id_in_need_vec){
-        index_vec.push_back(id_in_geno_map[tmp]);
-    }
-    return index_vec;
+vector<std::int64_t> GENO::find_fam_index(const vector<string>& id_in_need_vec){
+    return locate_ids_or_throw(id_in_need_vec, GENO::iid_vec());
 }
 
 /**
- * @brief 
- * ! Get the sid index in the bim file with given sids
- * @param snp_in_need_vec A vector of given sids
- * @return vector<long long> 
+ * @brief Locate SNP indices in `.bim` order with pre-validation and a hash map.
+ *
+ * Used in:
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mmsusie.cpp`
  */
-vector<long long> GENO::find_bim_index(vector<string> snp_in_need_vec){
-    vector <string> snp_id_in_geno_vec = GENO::sid_vec(); // id in bim
-    vector<long long> index_vec;
-    long long index;
-    vector<string>::iterator is;
-    for(vector<string>::iterator it = snp_in_need_vec.begin(); it < snp_in_need_vec.end(); it++){
-        is = find(snp_id_in_geno_vec.begin(), snp_id_in_geno_vec.end(), *it);
-        if(is == snp_id_in_geno_vec.end()){
-            spdlog::error(*it + " is not in the bim file");
-            exit(1);
-        }
-        index = distance(snp_id_in_geno_vec.begin(), is);
-        index_vec.push_back(index);
-    }
-    return index_vec;
-}
-
-
-vector<long long> GENO::find_bim_index_pro(vector<string> snp_in_need_vec){
-    set<string> snp_in_need_set(snp_in_need_vec.begin(), snp_in_need_vec.end());
-    vector <string> snp_id_in_geno_vec = GENO::sid_vec(); // id in bim
-    set<string> snp_id_in_geno_set(snp_id_in_geno_vec.begin(), snp_id_in_geno_vec.end());
-    set<string> tmp_set = set_difference_(snp_in_need_set, snp_id_in_geno_set);
-    if(!tmp_set.empty()){
-
-        spdlog::info("ERROR! These iids are not in the bim file: ", 0, 0, "");
-        for(auto tmp:tmp_set){
-            spdlog::info(tmp, 0, 0, " ");
-        }
-        spdlog::info("");
-        exit(1);
-        
-    }
-
-    std::map<string, long long> id_in_geno_map;
-    long long val = 0;
-    for(auto tmp:snp_id_in_geno_vec){
-        id_in_geno_map[tmp] = val++;
-    }
-    
-    vector<long long> index_vec;
-    for(auto tmp:snp_in_need_vec){
-        index_vec.push_back(id_in_geno_map[tmp]);
-    }
-    return index_vec;
+vector<std::int64_t> GENO::find_bim_index(const vector<string>& snp_in_need_vec){
+    return locate_ids_or_throw(snp_in_need_vec, GENO::sid_vec());
 }
 
 
 /**
- * @brief 
- * ! Check the  sids in bim and genotypic (dgeno or cgeno) file, they should be in the same order
+ * @brief Check that the `.bed` file size matches the expected sample-by-marker layout.
+ *
+ * Used in:
+ * - `fastgxe/fastgxe.cpp`
  */
-void GENO::check_geno_id_order(string geno_file){
-    ifstream fin;
-    fin.open(geno_file.c_str());
-    if(!fin.is_open()){
-        spdlog::error("Fail to open the genotypic file: " + geno_file);
-        exit(1);
-    }
-
-    vector<string> snp_id_in_bim = GENO::sid_vec();
-    string one_line;
-    string snp_id;
-    long long igeno = 0;
-    while (getline(fin, one_line)) {
-        std::istringstream is(one_line);
-        is>>snp_id;
-        if(snp_id_in_bim[igeno] != snp_id){
-            spdlog::error("The SNP IDs with the same index " + std::to_string(igeno) + 
-                    " do not match in genotypic and bim files: " + snp_id + " " + snp_id_in_bim[igeno]);
-            exit(1);
-        }
-        igeno++;
-    }
-}
-
-
-
-void GENO::check_bed_numChar(){
-    std::ifstream fin(_geno_file + ".bed", std::ios::binary | std::ios::ate);
+void GENO::validate_bed_size(){
+    const string bed_file = _geno_file + ".bed";
+    std::ifstream fin(bed_file, std::ios::binary | std::ios::ate);
     if (!fin.is_open()) {
-        spdlog::error("Fail to open the plink bed file: " + _geno_file + ".bed");
+        spdlog::error("Fail to open the plink bed file: {}", bed_file);
         exit(1);
     }
 
-    std::streampos fileSize = fin.tellg();
+    const std::streampos actual_file_size = fin.tellg();
     fin.close();
 
-    long long fileSizeExpected = (_num_id + 3) / 4 * _num_snp;
-    if(fileSize != fileSizeExpected + 3){
-        spdlog::error("The size of " + _geno_file + ".bed" + " doesn't correspond to the number of iids and SNPs");
+    const std::int64_t expected_data_bytes = (_num_id + 3) / 4 * _num_snp;
+    const std::int64_t expected_file_size = expected_data_bytes + 3;
+    if (actual_file_size != expected_file_size) {
+        spdlog::error("The size of {} doesn't correspond to the number of iids and SNPs",
+                      bed_file);
         exit(1);
     }
 }
 
 /**
- * @brief 
- * ! Read genotypic matrix from bed file
- * @param in_file bed file
- * @param snp_mat_part snp matrix
- * @param maf_arr frequence array
- * @param missing_rate_arr missing rate
- * @param start_snp start snp
- * @param num_snp_read the number of readed snp
- * @param index_vec a vector of index to reorder the row (individuals) of snp matrix
+ * @brief Read a contiguous BED block into a centered raw buffer.
+ *
+ * This variant centers genotypes on the fly and writes them into a caller-owned
+ * contiguous buffer instead of an Eigen matrix.
+ *
+ * Used in:
+ * - `fastgxe/fastgxe.cpp`
  */
-void GENO::read_bed(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, long long start_snp, long long num_snp_read, 
-                vector<long long> index_vec){
-    // check the boundary
+void GENO::read_bed_centered_to_buffer_omp(const string& in_file, double* snp_mat_part_pt, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, std::int64_t start_snp, std::int64_t num_snp_read, 
+                                           const vector<std::int64_t>& index_vec){
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
         exit(1);
     }
-    
-    // the number of bytes to store on SNP
-    long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
-    if ( _num_id % 4 != 0) {
-       num_byte_for_one_snp += 1;
-    }
-    // read
-    ifstream fin;
-    fin.open(in_file, std::ios::binary); // Read the in binary
-    if (!fin.is_open()) {
-        spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit(1);
-    }
+    const std::int64_t num_byte_for_one_snp = bed_bytes_per_snp(_num_id); // One byte stores four samples for one SNP.
+    const std::int64_t total_bytes_to_read = num_byte_for_one_snp * num_snp_read;
 
-    char* bytes_vec = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
-    fin.read(bytes_vec, sizeof(char) * 3); // Read the first three bytes
-    fin.seekg(start_snp*num_byte_for_one_snp, std::ios::cur); // move to the position for the start SNP
-    fin.read(bytes_vec, sizeof(char) * num_byte_for_one_snp * num_snp_read);
-
-    double code_val;  // coded value for SNP genotype
-    double freq = 0.0;  // SNP frequence
-    char x03 = '3' - 48; // binary 00000011
-    VectorXd snp_arr = VectorXd::Zero(_num_id); //SNP array for one individual
-    maf_arr.setZero(num_snp_read);
-    missing_rate_arr.setZero(num_snp_read);
-    snp_mat_part.setZero(_num_id, num_snp_read);
-
-    for(long long isnp = 0; isnp < num_snp_read; isnp++){
-        long long iid = 0;
-        vector<long long> missing_geno_index;
-        for (long long i = 0; i < num_byte_for_one_snp; i++) {
-            char one_byte = bytes_vec[i + isnp*num_byte_for_one_snp];
-            for (long long j = 0; j < 4; j++) {
-                code_val = (one_byte >> (2 * j))& x03; // move two bits from left to right; two bits contain a SNP
-                code_val = (code_val * code_val + code_val) / 6.0;
-                if (std::fabs(code_val - 2.0 / 6.0) < 0.00001) { // set missing genotype as 2
-                    missing_geno_index.push_back(iid);
-                    code_val = 2;
-                }
-                snp_arr(iid) = 2 - code_val;  // missing genotype is translated into 0, not affect mean
-                iid++; // move to next individual
-                if(iid >= _num_id) break;
-            }
-        }
-        // missing rate
-        long long num_missing_geno = missing_geno_index.size();
-        missing_rate_arr(isnp) = num_missing_geno * 1.0 / _num_id;
-        // maf
-        if(std::fabs(missing_rate_arr(isnp)) >= 0.99999){
-            freq = 0;
-        }else{
-            freq = snp_arr.sum() / (2 * _num_id - 2 * num_missing_geno);  // delete the missing genotypes
-        }
-        // set missing genotypes as mean values
-        for(vector<long long>::iterator it = missing_geno_index.begin(); it != missing_geno_index.end(); it++){ 
-            snp_arr(*it) = 2 * freq; // mean = 2 *freq
-        }
-        maf_arr(isnp) = freq;
-        snp_mat_part.col(isnp) = snp_arr;
-    }
-    delete [] bytes_vec;
-    // reorder the snp matrix
-    if(!index_vec.empty()){
-        snp_mat_part = (snp_mat_part(index_vec, Eigen::all)).eval();
-        maf_arr = snp_mat_part.colwise().sum() / (2 * index_vec.size());
-    }
-    fin.close();
-}
-
-
-void GENO::read_bed_omp_spMVLMM(string in_file, double* snp_mat_part_pt, VectorXd& maf_arr, VectorXd& missing_rate_arr, long long start_snp, long long num_snp_read, 
-                vector<long long> index_vec){
-    // check the boundary
-    if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
-        spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
-        exit(1);
-    }
-    // Compute the number of bytes needed to store genotypes for all individual per SNP.
-    long long num_byte_for_one_snp = (_num_id + 3) / 4; //One byte can store 4 SNPs
-    
-    // read
-    FILE* fin = fopen(in_file.c_str(), "rb"); // Read the in binary
+    FILE* fin = fopen(in_file.c_str(), "rb");
     if (!fin) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
         exit(1);
     }
 
-    // LOGGER.i("Read the PLINK BED file");
-    // LOGGER.i("Seek");
-    std::streamoff startPos = start_snp*num_byte_for_one_snp + 3; // Calculate the starting position of the SNP data
-    if (fseek(fin, startPos, SEEK_SET) != 0){
+    // Skip the 3-byte BED header, then jump to the first requested SNP block.
+    const std::int64_t start_pos = start_snp * num_byte_for_one_snp + 3;
+    if (fseek(fin, start_pos, SEEK_SET) != 0){
+        fclose(fin);
         spdlog::error("Fail to seek the predefined position");
         exit(1);
     }
-    
-    // LOGGER.i("Read");
-    char* bytes_vec = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
-    long long read_count = fread(bytes_vec, sizeof(char), num_byte_for_one_snp * num_snp_read, fin);
-    if (read_count != num_byte_for_one_snp * num_snp_read){
-        delete [] bytes_vec;
+
+    vector<char> bytes_vec(total_bytes_to_read);
+    const size_t read_count = fread(bytes_vec.data(), sizeof(char), total_bytes_to_read, fin);
+    if (read_count != static_cast<size_t>(total_bytes_to_read)){
+        fclose(fin);
         spdlog::error("fread failed to read the expected amount");
         exit(1);
     }
     if(ferror(fin)){
-        delete [] bytes_vec;
+        fclose(fin);
         spdlog::error("Failed to read from file: " + in_file);
         exit(1);
     }
     fclose(fin);
 
-    // LOGGER.i("Decode the genotype");
-    char x03 = '3' - 48; // binary 00000011
     maf_arr.setZero(num_snp_read);
     missing_rate_arr.setZero(num_snp_read);
+    nobs_geno_arr.setZero(num_snp_read);
 
-    long long num_used_id = _num_id;
-    if(!index_vec.empty()){
-        num_used_id = index_vec.size();
-    }
-    long long *index_vec_pt = new long long[num_used_id];
-
-    if(index_vec.empty()){
-        for(long long i = 0; i < num_used_id; i++)
-            index_vec_pt[i] = i;
-    }else{
-        long long k = 0;
-        for(auto tmp:index_vec) 
-            index_vec_pt[k++] = tmp;
-    }
-
-    long long _omp_max_threads = omp_get_max_threads();
-    double **snp_arr_part = new double*[_omp_max_threads];
-    for(int i = 0; i < _omp_max_threads; i++){
-        snp_arr_part[i] = new double[_num_id];
-    }
+    const bool use_all_ids = index_vec.empty();
+    const std::int64_t num_used_id = use_all_ids ? _num_id : static_cast<std::int64_t>(index_vec.size());
 
     #pragma omp parallel for schedule(dynamic)
-    for(long long isnp = 0; isnp < num_snp_read; isnp++){
-        
-        long long thread_id = omp_get_thread_num();
-        double freq = 0; // SNP frequence
-        long long num_missing = 0;
+    for(std::int64_t isnp = 0; isnp < num_snp_read; isnp++){
+        const char* snp_bytes = bytes_vec.data() + isnp * num_byte_for_one_snp;
+        double* output_row = snp_mat_part_pt + isnp * num_used_id;
+        double freq = 0.0; // Sum of observed allele dosages before scaling to MAF.
+        std::int64_t num_missing = 0;
         double code_val;
 
-        for(long long i = 0; i < _num_id; i++){
-            unsigned char byte = bytes_vec[i / 4 + isnp*num_byte_for_one_snp];
-            unsigned char genotype = (byte >> (2 * (i % 4))) & 3;
-            
-            switch (genotype) {
-                case 0: code_val = 2.0; freq += code_val; break;  // Homozygous for the major allele.
-                case 1: code_val = -9; num_missing++; break;  // Missing genotype.
-                case 2: code_val = 1.0; freq += code_val; break;  // Heterozygous.
-                case 3: code_val = 0.0; break;  // Homozygous for the minor allele.
-                default: throw std::logic_error("Invalid genotype value");
+        if(use_all_ids){
+            // Fast path: decode directly into the caller-provided row buffer,
+            // then center that row in place once the SNP mean is known.
+            for(std::int64_t i = 0; i < _num_id; i++){
+                code_val = decode_bed_sample(snp_bytes, i);
+                if(is_missing_genotype(code_val)){
+                    num_missing++;
+                }else{
+                    freq += code_val;
+                }
+                output_row[i] = code_val;
             }
-
-            snp_arr_part[thread_id][i] = code_val;
-            
+        }else{
+            // Subset path: estimate statistics from the requested individuals
+            // only, so the returned MAF/missingness/nobs all match the output.
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes, index_vec[i]);
+                if(is_missing_genotype(code_val)){
+                    num_missing++;
+                }else{
+                    freq += code_val;
+                }
+            }
         }
 
-        // missing rate
-        missing_rate_arr(isnp) = num_missing * 1.0 / _num_id;
+        const std::int64_t nobs_geno = num_used_id - num_missing;
+        missing_rate_arr(isnp) = num_missing * 1.0 / num_used_id;
+        nobs_geno_arr(isnp) = nobs_geno;
 
-        // maf
-        if(num_missing != _num_id){
-            freq /= (2 * _num_id - 2 * num_missing);
+        // The allele frequency only uses observed genotypes.
+        if(num_missing != num_used_id){
+            freq /= (2 * num_used_id - 2 * num_missing);
         }else{
             freq = 0.0;
         }
         maf_arr(isnp) = freq;
-        
-        // -2*p, nan->0
-        long long code_int;
-        for(long long i = 0; i < num_used_id; i++){
-            code_int = snp_arr_part[thread_id][index_vec_pt[i]];
-            if(code_int == -9){
-                code_val = 0;
-            }else{
-                code_val = code_int - 2 * freq;
+
+        const double center = 2 * freq;
+        if(use_all_ids){
+            for(std::int64_t i = 0; i < _num_id; i++){
+                if(output_row[i] < 0.0){
+                    output_row[i] = 0.0;
+                }else{
+                    output_row[i] -= center;
+                }
             }
-            snp_mat_part_pt[isnp*num_used_id + i] = code_val;
+        }else{
+            // Only materialize the requested samples, preserving input order.
+            // Missing values are mapped to 0 after centering, matching the
+            // current downstream logic.
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes, index_vec[i]);
+                if(is_missing_genotype(code_val)){
+                    output_row[i] = 0.0;
+                }else{
+                    output_row[i] = code_val - center;
+                }
+            }
         }
-        
     }
-    
-    // free memory
-    delete [] bytes_vec;
-    delete [] index_vec_pt;
-    for(int i = 0; i < _omp_max_threads; i++){
-        delete [] snp_arr_part[i];
-    }
-    delete [] snp_arr_part;
-    
-    // LOGGER.i("Finish");
 }
 
-
-void GENO::read_bed_omp(string in_file, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, long long start_snp, long long num_snp_read, 
-                vector<long long> index_vec){
-    // check the boundary
+/**
+ * @brief Read a contiguous BED block in parallel into a dense Eigen matrix.
+ *
+ * This is the main BED reader used by current GRM-building paths.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
+ */
+void GENO::read_bed_omp(const string& in_file, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, std::int64_t start_snp, std::int64_t num_snp_read, 
+                const vector<std::int64_t>& index_vec){
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
         exit(1);
     }
-    // the number of bytes to store on SNP
-    long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
-    if ( _num_id % 4 != 0) {
-       num_byte_for_one_snp += 1;
-    }
-    // read
+    const std::int64_t num_byte_for_one_snp = bed_bytes_per_snp(_num_id);
+    const std::int64_t total_bytes_to_read = num_byte_for_one_snp * num_snp_read;
     ifstream fin;
-    fin.open(in_file, std::ios::binary); // Read the in binary
+    fin.open(in_file, std::ios::binary);
     if (!fin.is_open()) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
         exit(1);
     }
 
-    // spdlog::info("Read the PLINK BED file");
-    char* bytes_vec = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
-    fin.read(bytes_vec, sizeof(char) * 3); // Read the first three bytes
-    fin.seekg(start_snp*num_byte_for_one_snp, std::ios::cur); // move to the position for the start SNP
-    fin.read(bytes_vec, sizeof(char) * num_byte_for_one_snp * num_snp_read);
+    vector<char> bytes_vec(total_bytes_to_read);
+    fin.read(bytes_vec.data(), sizeof(char) * 3);
+    fin.seekg(start_snp * num_byte_for_one_snp, std::ios::cur);
+    fin.read(bytes_vec.data(), sizeof(char) * total_bytes_to_read);
 
-
-    // spdlog::info("Decode the genotype");
-    char x03 = '3' - 48; // binary 00000011
     maf_arr.setZero(num_snp_read);
     missing_rate_arr.setZero(num_snp_read);
+    nobs_geno_arr.setZero(num_snp_read);
 
-    long long num_used_id;
-    if(index_vec.empty()){
-        num_used_id = _num_id;
-    }else{
-        num_used_id = index_vec.size();
-    }
+    const bool use_all_ids = index_vec.empty();
+    const std::int64_t num_used_id = use_all_ids ? _num_id : static_cast<std::int64_t>(index_vec.size());
+    snp_mat_part.resize(num_used_id, num_snp_read);
+    double* snp_mat_part_pt = snp_mat_part.data();
 
+    #pragma omp parallel for schedule(static)
+    for(std::int64_t isnp = 0; isnp < num_snp_read; isnp++){
+        const char* snp_bytes = bytes_vec.data() + isnp * num_byte_for_one_snp;
+        double* output_col = snp_mat_part_pt + isnp * num_used_id;
+        double freq = 0.0;
+        std::int64_t num_missing_geno = 0;
+        double code_val;
 
-    double *snp_mat_part_pt = new double[num_snp_read * num_used_id];
-    long long *index_vec_pt = new long long[num_used_id];
-    long long k = 0;
-    for(auto tmp:index_vec) index_vec_pt[k++] = tmp;
-
-    #pragma omp parallel for schedule(dynamic)
-    for(long long isnp = 0; isnp < num_snp_read; isnp++){
-        long long iid = 0;
-        vector<long long> missing_geno_index;
-        // VectorXd snp_arr = VectorXd::Zero(_num_id); //SNP array for one individual
-        double *snp_arr = new double[_num_id];
-        double freq = 0; // SNP frequence
-        for (long long i = 0; i < num_byte_for_one_snp; i++) {
-            char one_byte = bytes_vec[i + isnp*num_byte_for_one_snp];
-            for (long long j = 0; j < 4; j++) {
-                double code_val = (one_byte >> (2 * j))& x03; // move two bits from left to right; two bits contain a SNP
-                code_val = (code_val * code_val + code_val) / 6.0;
-                if (std::fabs(code_val - 2.0 / 6.0) < 0.00001) { // set missing genotype as 2
-                    missing_geno_index.push_back(iid);
-                    code_val = 2;
+        if(use_all_ids){
+            // Fast path: decode directly into the output column, then replace
+            // missing values with the SNP mean once frequency is known.
+            for(std::int64_t i = 0; i < _num_id; i++){
+                code_val = decode_bed_sample(snp_bytes, i);
+                if(is_missing_genotype(code_val)){
+                    num_missing_geno++;
+                }else{
+                    freq += code_val;
                 }
-                code_val = 2 - code_val;
-                snp_arr[iid] = code_val;  // missing genotype is translated into 0, not affect mean
-                freq += code_val;
-                iid++; // move to next individual
-                if(iid >= _num_id) break;
+                output_col[i] = code_val;
+            }
+        }else{
+            // Subset path: estimate statistics from the requested individuals
+            // only, so the returned summaries match the output matrix.
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes, index_vec[i]);
+                if(is_missing_genotype(code_val)){
+                    num_missing_geno++;
+                }else{
+                    freq += code_val;
+                }
             }
         }
-        
-        // missing rate
-        long long num_missing_geno = missing_geno_index.size();
-        missing_rate_arr(isnp) = num_missing_geno * 1.0 / _num_id;
 
-        // maf
+        nobs_geno_arr(isnp) = num_used_id - num_missing_geno;
+        missing_rate_arr(isnp) = num_missing_geno * 1.0 / num_used_id;
+
         if(std::fabs(missing_rate_arr(isnp)) >= 0.99999){
-            freq = 0;
+            freq = 0.0;
         }else{
-            freq /= (2 * _num_id - 2 * num_missing_geno);  // delete the missing genotypes
+            freq /= (2 * num_used_id - 2 * num_missing_geno);
         }
         maf_arr(isnp) = freq;
-        // set missing genotypes as mean values
-        for(auto tmp:missing_geno_index){
-            snp_arr[tmp] = 2 * freq;
-        }
 
-
-        if(index_vec.empty()){
-            for(long long i = 0; i < _num_id; i++){
-                snp_mat_part_pt[isnp*_num_id + i] = snp_arr[i];
+        const double imputed_value = 2 * freq;
+        if(use_all_ids){
+            for(std::int64_t i = 0; i < _num_id; i++){
+                if(is_missing_genotype(output_col[i])){
+                    output_col[i] = imputed_value;
+                }
             }
         }else{
-            for(long long i = 0; i < num_used_id; i++){
-                snp_mat_part_pt[isnp*num_used_id + i] = snp_arr[index_vec_pt[i]];
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes, index_vec[i]);
+                output_col[i] = is_missing_genotype(code_val) ? imputed_value : code_val;
             }
         }
-        delete [] snp_arr;
     }
 
-    // spdlog::info("Map");
-    snp_mat_part = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic > > (snp_mat_part_pt, num_used_id, num_snp_read);
-    /*
-    snp_mat_part.resize(num_used_id, num_snp_read);
-    #pragma omp parallel for schedule(dynamic)
-    for(long long i = 0; i < num_used_id; i++){
-        for(long long j = 0; j < num_snp_read; j++)
-            snp_mat_part(i, j) = snp_mat_part_pt[j*num_used_id + i];
-    }
-    */
-    delete [] bytes_vec;
-    delete [] index_vec_pt;
-    delete [] snp_mat_part_pt;
-    // spdlog::info("Finish");
     fin.close();
 }
 
 
 
 /**
- * @brief 
- * ! Read genotypic matrix from dgeno file
- * @param in_file dgeno file
- * @param geno_mat_part genotypic matrix
- * @param freq_arr frequence array = mean/2
- * @param missing_rate_arr missing rate
- * @param start_snp start snp
- * @param num_snp_read the number of readed snp
- * @param index_vec a vector of index to reorder the row (individuals) of snp matrix
- * @param missing string used to define missing values
+ * @brief Read a contiguous block from a feature-by-sample text matrix into a dense matrix.
+ *
+ * Each row stores one feature and each column stores one sample value, with no
+ * header row and no leading feature-name column. Missing values are mean-
+ * imputed feature by feature. When `index_vec` is provided, rows are reordered
+ * and subset to the requested sample order, and summary statistics are computed
+ * on that same sample subset.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
  */
-void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_arr, VectorXd& missing_rate_arr,
-            long long start_snp, long long num_snp_read, vector<long long> index_vec, vector<string> missing_in_geno_vec){
-                
-    // check the boundary
+void GENO::read_fs(const string& in_file, MatrixXd& geno_mat_part, VectorXd& freq_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr,
+            std::int64_t start_snp, std::int64_t num_snp_read, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec){
     if(start_snp < 0 || start_snp + num_snp_read > _num_snp || num_snp_read <= 0){
         spdlog::error("The start SNP or end SNP exceeds the boundary, please check");
         std::exit(1);
     }
 
-    
     ifstream fin;
     fin.open(in_file);
     if (!fin.is_open()) {
@@ -860,87 +743,111 @@ void GENO::read_dgeno(string in_file, MatrixXd& geno_mat_part, VectorXd& freq_ar
     }
 
     string line;
-    vector <string> tmp;
     // Skip lines before start SNP
-    for(long long i = 0; i < start_snp; i++){
+    for(std::int64_t i = 0; i < start_snp; i++){
         getline(fin, line);
     }
 
-    
-    long long num_missing_geno;
-    double freq = 0;
+    const bool use_all_ids = index_vec.empty();
+    const std::int64_t num_used_id = use_all_ids ? _num_id : static_cast<std::int64_t>(index_vec.size());
     freq_arr.setZero(num_snp_read);
     missing_rate_arr.setZero(num_snp_read);
-    geno_mat_part.setZero(_num_id, num_snp_read);
-    // Read
-    long long igeno = 0;
-    VectorXd geno_arr = VectorXd::Zero(_num_id); //SNP array for one individual
-    char *endptr = new char[1000];
-    while(getline(fin, line)){
+    nobs_geno_arr.setZero(num_snp_read);
+    geno_mat_part.resize(num_used_id, num_snp_read);
+
+    std::int64_t igeno = 0;
+    vector<string> tmp;
+    vector<double> parsed_values;
+    vector<std::int64_t> missing_geno_index;
+    while(igeno < num_snp_read && getline(fin, line)){
         process_line(line);
         tmp = split_string(line);
-        if(tmp.size() - _num_id != 1){
+        if(tmp.size() != _num_id){
             spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
             exit(1);
         }
-        // genotypic values
-        freq = 0.0;
-        num_missing_geno = 0;
-        vector<long long> missing_geno_index; // the index for missing genotypes
-        for(long long i = 1; i < tmp.size(); i++){
-            if(!is_nan(tmp[i], missing_in_geno_vec)){
-                freq += string_to_double(tmp[i], endptr);
-                geno_arr(i - 1) = string_to_double(tmp[i], endptr);
-            }else{
-                num_missing_geno++;
-                missing_geno_index.push_back(i - 1);
+
+        missing_geno_index.clear();
+        double* output_col = geno_mat_part.data() + igeno * num_used_id;
+        double observed_sum = 0.0;
+        std::int64_t num_missing_geno = 0;
+        parse_feature_row_or_throw(tmp, missing_in_geno_vec, parsed_values, observed_sum, num_missing_geno);
+
+        double selected_sum = 0.0;
+        std::int64_t selected_missing = 0;
+        if(use_all_ids){
+            selected_sum = observed_sum;
+            selected_missing = num_missing_geno;
+        }else{
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                const double geno_value = parsed_values[index_vec[i]];
+                if(is_missing_genotype(geno_value)){
+                    selected_missing++;
+                }else{
+                    selected_sum += geno_value;
+                }
             }
         }
-        // frequence values and set missing genotypes as mean
-        if(num_missing_geno == _num_id){
-            freq = 0;
+
+        const std::int64_t nobs_geno = num_used_id - selected_missing;
+        const double feature_mean = (nobs_geno == 0) ? 0.0 : selected_sum / nobs_geno;
+
+        if(use_all_ids){
+            // Fast path: decode directly into the output matrix and remember
+            // which entries need to be mean-imputed after the row mean is known.
+            for(std::int64_t i = 0; i < _num_id; i++){
+                if(is_missing_genotype(parsed_values[i])){
+                    missing_geno_index.push_back(i);
+                }else{
+                    output_col[i] = parsed_values[i];
+                }
+            }
+        }
+
+        if(use_all_ids){
+            for(std::int64_t idx : missing_geno_index){
+                output_col[idx] = feature_mean;
+            }
+            freq_arr(igeno) = feature_mean;
         }else{
-            freq /= 2*_num_id - 2*num_missing_geno;
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                const double geno_value = parsed_values[index_vec[i]];
+                output_col[i] = is_missing_genotype(geno_value) ? feature_mean : geno_value;
+            }
+            freq_arr(igeno) = feature_mean;
         }
-        for(vector<long long>::iterator it = missing_geno_index.begin(); it != missing_geno_index.end(); it++){ // set missing genotypes as mean values
-            geno_arr(*it) = freq * 2;
-        }
-        geno_mat_part.col(igeno) = geno_arr;
-        freq_arr(igeno) = freq;
-        igeno++; // move to next SNP
-        if(igeno >= num_snp_read)
-            break;
+
+        nobs_geno_arr(igeno) = nobs_geno;
+        missing_rate_arr(igeno) = static_cast<double>(selected_missing) / num_used_id;
+        igeno++;
     }
-    delete[] endptr;
-    // reorder the snp matrix
-    if(!index_vec.empty()){
-        geno_mat_part = geno_mat_part(index_vec, Eigen::all).eval();
-        freq_arr = geno_mat_part.colwise().sum() / (2 * index_vec.size());
+
+    if(igeno < num_snp_read){
+        geno_mat_part.conservativeResize(num_used_id, igeno);
+        freq_arr.conservativeResize(igeno);
+        missing_rate_arr.conservativeResize(igeno);
+        nobs_geno_arr.conservativeResize(igeno);
     }
     fin.close();
 }
 
 
 /**
- * @brief 
- * ! read genotypic matrix using different input formats
- * @param input_geno_fmt input format: 0, bed file; 1, dgeno file; 2, cgeno file
- * @param snp_mat_part 
- * @param maf_arr 
- * @param missing_rate_arr 
- * @param start_snp 
- * @param num_snp_read 
- * @param index_vec 
- * @param missing 
+ * @brief Dispatch contiguous genotype-block reading by input format.
+ *
+ * Supported formats are BED (`0`) and feature-by-sample text input (`1`).
+ *
+ * Used in:
+ * - `gmatrix/gmatrix.cpp`
  */
-void GENO::read_geno(int input_geno_fmt, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, 
-            long long start_snp, long long num_snp_read, vector<long long> index_vec, vector<string> missing_in_geno_vec){
+void GENO::read_geno(int input_geno_fmt, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, 
+            std::int64_t start_snp, std::int64_t num_snp_read, vector<std::int64_t> index_vec, vector<string> missing_in_geno_vec){
     if(input_geno_fmt == 0){
         string in_file = _geno_file + ".bed";
-        GENO::read_bed_omp(in_file, snp_mat_part, maf_arr, missing_rate_arr, start_snp, num_snp_read, index_vec);
+        GENO::read_bed_omp(in_file, snp_mat_part, maf_arr, missing_rate_arr, nobs_geno_arr, start_snp, num_snp_read, index_vec);
     }else if(input_geno_fmt == 1){
-        string in_file = _geno_file + ".fmat"; // feture matrix such as SNP, gene expression, etc
-        GENO::read_dgeno(in_file, snp_mat_part, maf_arr, missing_rate_arr, start_snp, num_snp_read, index_vec, missing_in_geno_vec);
+        string in_file = _geno_file + ".fmat"; // Feature-by-sample matrix, e.g. SNPs or expression.
+        GENO::read_fs(in_file, snp_mat_part, maf_arr, missing_rate_arr, nobs_geno_arr, start_snp, num_snp_read, index_vec, missing_in_geno_vec);
     }else{
         spdlog::error("The input genotypic format is not supported");
         std::exit(1);
@@ -949,109 +856,121 @@ void GENO::read_geno(int input_geno_fmt, MatrixXd& snp_mat_part, VectorXd& maf_a
 
 
 /**
- * @brief 
- * ! Read genotypic matrix with given snp index
- * @param in_file 
- * @param snp_mat_by_snp_index 
- * @param maf_arr 
- * @param missing_rate_arr 
- * @param snp_index_vec 
- * @param index_vec 
+ * @brief Read an arbitrary SNP subset from a BED file.
+ *
+ * The output columns follow `snp_index_vec` exactly, so the caller can request
+ * SNPs in any order. Missing genotypes are imputed SNP by SNP using the allele
+ * mean estimated from the same individuals that are returned in the output.
+ * When `index_vec` is provided, allele frequency, missing rate, and observed
+ * count are all computed on that requested sample subset.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
+ * - `fastgxe/fastgxe.cpp`
+ * - `fastgxe/mmsusie.cpp`
  */
-void GENO::read_bed_by_snp_index(string in_file, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, 
-                vector<long long> snp_index_vec, vector<long long> index_vec){
-    
-    // the number of bytes to store on SNP
-    long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
-    if ( _num_id % 4 != 0) {
-       num_byte_for_one_snp += 1;
-    }
-
-    // read
-    ifstream fin;
-    fin.open(in_file, std::ios::binary); // Read the in binary
-    if (!fin.is_open()) {
+void GENO::read_bed_by_snp_indices(const string& in_file, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, 
+                const vector<std::int64_t>& snp_index_vec, const vector<std::int64_t>& index_vec){
+    const std::int64_t num_byte_for_one_snp = bed_bytes_per_snp(_num_id);
+    FILE* fin = fopen(in_file.c_str(), "rb");
+    if (!fin) {
         spdlog::error("Fail to open the plink bed file: " + in_file);
         exit(1);
     }
-
-
-    double code_val, missing_rate;  // coded value, missing rate
-    double freq = 0.0;  // SNP frequence
-    long long iid = 0, isnp = 0;
-    long long num_missing_geno = 0;
-    vector<long long> missing_geno_index; // the index for missing genotypes
-    
-    char x03 = '3' - 48; // binary 00000011
-    char* bytes_vec = new char[num_byte_for_one_snp]; // store readed btyes for one individual
-    VectorXd snp_arr = VectorXd::Zero(_num_id); //SNP array for one individual
-    long long num_snp_read = snp_index_vec.size();
+    const bool use_all_ids = index_vec.empty();
+    const std::int64_t num_used_id = use_all_ids ? _num_id : static_cast<std::int64_t>(index_vec.size());
+    const std::int64_t num_snp_read = static_cast<std::int64_t>(snp_index_vec.size());
     maf_arr.setZero(num_snp_read);
     missing_rate_arr.setZero(num_snp_read);
-    snp_mat_by_snp_index.setZero(_num_id, num_snp_read);
-    fin.read(bytes_vec, sizeof(char) * 3); // Read the first three bytes
-    for(vector<long long>::iterator it=snp_index_vec.begin(); it != snp_index_vec.end(); it++) { // read the SNP genotypes for one locus
-        fin.clear();
-        iid = 0;
-        num_missing_geno = 0;
-        missing_geno_index.clear();
-        isnp = distance(snp_index_vec.begin(), it); // snp index
-        // seek the position to read
-        fin.seekg(*it*num_byte_for_one_snp + 3, std::ios::beg);
-        fin.read(bytes_vec, sizeof(char) * num_byte_for_one_snp);
-        for (long long i = 0; i < num_byte_for_one_snp; i++) {
-            for (long long j = 0; j < 4; j++) {
-                code_val = (bytes_vec[i] >> (2 * j))& x03; // move two bits from left to right; two bits contain a SNP
-                code_val = (code_val * code_val + code_val) / 6.0;
-                if (std::fabs(code_val - 2.0 / 6.0) < 0.00001) { // set missing genotype as 2
+    nobs_geno_arr.setZero(num_snp_read);
+    snp_mat_by_snp_index.resize(num_used_id, num_snp_read);
+    vector<char> snp_bytes(num_byte_for_one_snp);
+
+    for(std::int64_t isnp = 0; isnp < num_snp_read; isnp++) {
+        const std::int64_t snp_idx = snp_index_vec[isnp];
+        if(snp_idx < 0 || snp_idx >= _num_snp){
+            fclose(fin);
+            spdlog::error("The requested SNP index {} exceeds the BED boundary", snp_idx);
+            exit(1);
+        }
+
+        if(fseek(fin, snp_idx * num_byte_for_one_snp + 3, SEEK_SET) != 0){
+            fclose(fin);
+            spdlog::error("Fail to seek the predefined position");
+            exit(1);
+        }
+        const size_t read_count = fread(snp_bytes.data(), sizeof(char), num_byte_for_one_snp, fin);
+        if(read_count != static_cast<size_t>(num_byte_for_one_snp) || ferror(fin)){
+            fclose(fin);
+            spdlog::error("Failed to read the requested SNP block from: " + in_file);
+            exit(1);
+        }
+
+        double* output_col = snp_mat_by_snp_index.data() + isnp * num_used_id;
+        double dosage_sum = 0.0;
+        std::int64_t num_missing_geno = 0;
+        double code_val;
+
+        if(use_all_ids){
+            for(std::int64_t i = 0; i < _num_id; i++){
+                code_val = decode_bed_sample(snp_bytes.data(), i);
+                if(is_missing_genotype(code_val)){
                     num_missing_geno++;
-                    missing_geno_index.push_back(iid);
-                    code_val = 2;
+                }else{
+                    dosage_sum += code_val;
                 }
-                snp_arr(iid) = 2 - code_val;  // missing genotype is translated into 0, not affect mean
-                iid++; // move to next individual
-                if(iid >= _num_id) break;
+                output_col[i] = code_val;
+            }
+        }else{
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes.data(), index_vec[i]);
+                if(is_missing_genotype(code_val)){
+                    num_missing_geno++;
+                }else{
+                    dosage_sum += code_val;
+                }
             }
         }
-        // missing rate, allele mean
-        missing_rate = num_missing_geno / _num_id;
+
+        const double missing_rate = static_cast<double>(num_missing_geno) / num_used_id;
         missing_rate_arr(isnp) = missing_rate;
-        if(missing_rate >= 0.99999){
-            freq = 0;
+        nobs_geno_arr(isnp) = num_used_id - num_missing_geno;
+        const double freq = (num_missing_geno == num_used_id) ? 0.0 : dosage_sum / (2 * (num_used_id - num_missing_geno));
+
+        const double imputed_value = 2 * freq;
+        if(use_all_ids){
+            for(std::int64_t i = 0; i < _num_id; i++){
+                if(is_missing_genotype(output_col[i])){
+                    output_col[i] = imputed_value;
+                }
+            }
+            maf_arr(isnp) = freq;
         }else{
-            freq = snp_arr.sum() / (2 * _num_id - 2 * num_missing_geno);  // delete the missing allele
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                code_val = decode_bed_sample(snp_bytes.data(), index_vec[i]);
+                output_col[i] = is_missing_genotype(code_val) ? imputed_value : code_val;
+            }
+            maf_arr(isnp) = freq;
         }
-        // set missing values as allele mean
-        for(vector<long long>::iterator it2 = missing_geno_index.begin(); it2 != missing_geno_index.end(); it2++){ // set missing genotypes as mean values
-            snp_arr(*it2) = 2 * freq; // mean = 2 * p
-        }
-        maf_arr(isnp) = freq;
-        snp_mat_by_snp_index.col(isnp) = snp_arr;
     }
-    fin.close();
-    delete [] bytes_vec;
-    if(!index_vec.empty()){
-        snp_mat_by_snp_index = (snp_mat_by_snp_index(index_vec, Eigen::all)).eval();
-        maf_arr = snp_mat_by_snp_index.colwise().sum() / (2 * index_vec.size());
-    }
+    fclose(fin);
 }
 
 
 /**
- * @brief 
- * ! Read genotypic matrix with given snp index
- * @param in_file 
- * @param snp_mat_by_snp_index 
- * @param maf_arr 
- * @param missing_rate_arr 
- * @param snp_index_vec 
- * @param index_vec 
- * @param missing missing values
+ * @brief Read an arbitrary feature subset from a feature-by-sample text matrix.
+ *
+ * The matrix has no header row and no leading feature-name column. Output
+ * columns follow `feature_index_vec` exactly, including repeated feature
+ * indices. Missing values are imputed feature by feature using the row mean.
+ * When `index_vec` is provided, the row mean, missing rate, and observed count
+ * are all computed on the requested sample subset.
+ *
+ * Used in:
+ * - `utils/geno.cpp`
  */
-void GENO::read_dgeno_by_geno_index(string in_file, MatrixXd& geno_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, 
-                vector<long long> geno_index_vec, vector<long long> index_vec, vector<string> missing_in_geno_vec){
-    
-    // open
+void GENO::read_fs_by_feature_indices(const string& in_file, MatrixXd& geno_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, 
+                const vector<std::int64_t>& feature_index_vec, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec){
     ifstream fin;
     fin.open(in_file);
     if (!fin.is_open()) {
@@ -1059,171 +978,132 @@ void GENO::read_dgeno_by_geno_index(string in_file, MatrixXd& geno_mat_by_snp_in
         exit(1);
     }
 
-
     string line;
-    vector <string> tmp;
-    long long num_missing_geno;
-    double freq = 0;
-    long long num_geno_read = geno_index_vec.size();
+    const bool use_all_ids = index_vec.empty();
+    const std::int64_t num_used_id = use_all_ids ? _num_id : static_cast<std::int64_t>(index_vec.size());
+    const std::int64_t num_geno_read = static_cast<std::int64_t>(feature_index_vec.size());
     maf_arr.setZero(num_geno_read);
     missing_rate_arr.setZero(num_geno_read);
-    geno_mat_by_snp_index.setZero(_num_id, num_geno_read);
+    nobs_geno_arr.setZero(num_geno_read);
+    geno_mat_by_snp_index.setZero(num_used_id, num_geno_read);
 
-    // Read
-    long long igeno = 0;
-    char *endptr = new char[1000];
-    VectorXd geno_arr = VectorXd::Zero(_num_id); //genotype array for one individual
-    vector<long long>::iterator it;
-    long long finded_position;
+    std::unordered_map<std::int64_t, vector<std::int64_t>> feature_positions;
+    feature_positions.reserve(feature_index_vec.size());
+    for(std::int64_t pos = 0; pos < num_geno_read; pos++){
+        feature_positions[feature_index_vec[pos]].push_back(pos);
+    }
+
+    vector<string> tmp;
+    vector<double> parsed_values;
+    vector<std::int64_t> missing_geno_index;
+    vector<double> row_values(use_all_ids ? _num_id : 0);
+    vector<double> selected_values(use_all_ids ? 0 : num_used_id);
+    std::int64_t feature_idx = 0;
+    std::int64_t num_features_found = 0;
     while(getline(fin, line)){
-
-        it = find(geno_index_vec.begin(), geno_index_vec.end(), igeno); // locate the needed line
-        if(it == geno_index_vec.end()){
-            igeno++;
+        auto pos_it = feature_positions.find(feature_idx);
+        if(pos_it == feature_positions.end()){
+            feature_idx++;
             continue;
-        }else{
-            finded_position = distance(geno_index_vec.begin(), it);
-            // finded_position = &*it-&snp_index_vec[0];
         }
 
         process_line(line);
         tmp = split_string(line);
-        if(tmp.size() - _num_id != 1){
-            spdlog::error("The number of genotyped individuals for locus " + std::to_string(igeno + 1) + " should be " + std::to_string(_num_id));
+        if(tmp.size() != _num_id){
+            spdlog::error("The number of genotyped individuals for locus " + std::to_string(feature_idx + 1) + " should be " + std::to_string(_num_id));
             exit(1);
         }
 
-        
-        // genotypic values
-        freq = 0.0;
-        num_missing_geno = 0;
-        vector<long long> missing_geno_index; // the index for missing genotypes
-        for(long long i = 1; i < tmp.size(); i++){
-            if(!is_nan(tmp[i], missing_in_geno_vec)){
-                freq += string_to_double(tmp[i], endptr);
-                geno_arr(i - 1) = string_to_double(tmp[i], endptr);
-            }else{
-                num_missing_geno++;
-                missing_geno_index.push_back(i - 1);
+        missing_geno_index.clear();
+        double observed_sum = 0.0;
+        std::int64_t num_missing_geno = 0;
+        parse_feature_row_or_throw(tmp, missing_in_geno_vec, parsed_values, observed_sum, num_missing_geno);
+
+        double selected_sum = 0.0;
+        std::int64_t selected_missing = 0;
+        if(use_all_ids){
+            selected_sum = observed_sum;
+            selected_missing = num_missing_geno;
+        }else{
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                const double geno_value = parsed_values[index_vec[i]];
+                if(is_missing_genotype(geno_value)){
+                    selected_missing++;
+                }else{
+                    selected_sum += geno_value;
+                }
             }
         }
 
-        // freq
-        if(num_missing_geno == _num_id){
-            freq  = 0;
+        const std::int64_t nobs_geno = num_used_id - selected_missing;
+        const double feature_mean = (nobs_geno == 0) ? 0.0 : selected_sum / nobs_geno;
+
+        if(use_all_ids){
+            for(std::int64_t i = 0; i < _num_id; i++){
+                if(is_missing_genotype(parsed_values[i])){
+                    missing_geno_index.push_back(i);
+                }else{
+                    row_values[i] = parsed_values[i];
+                }
+            }
+        }
+
+        const double missing_rate = static_cast<double>(selected_missing) / num_used_id;
+        const vector<std::int64_t>& output_positions = pos_it->second;
+
+        if(use_all_ids){
+            for(std::int64_t idx : missing_geno_index){
+                row_values[idx] = feature_mean;
+            }
+            for(std::int64_t output_pos : output_positions){
+                double* output_col = geno_mat_by_snp_index.data() + output_pos * num_used_id;
+                std::copy(row_values.begin(), row_values.end(), output_col);
+                maf_arr(output_pos) = feature_mean;
+                missing_rate_arr(output_pos) = missing_rate;
+                nobs_geno_arr(output_pos) = nobs_geno;
+            }
         }else{
-            freq /= 2 * _num_id - 2 * num_missing_geno;
+            for(std::int64_t i = 0; i < num_used_id; i++){
+                const double geno_value = parsed_values[index_vec[i]];
+                selected_values[i] = is_missing_genotype(geno_value) ? feature_mean : geno_value;
+            }
+            for(std::int64_t output_pos : output_positions){
+                double* output_col = geno_mat_by_snp_index.data() + output_pos * num_used_id;
+                std::copy(selected_values.begin(), selected_values.end(), output_col);
+                maf_arr(output_pos) = feature_mean;
+                missing_rate_arr(output_pos) = missing_rate;
+                nobs_geno_arr(output_pos) = nobs_geno;
+            }
         }
-        maf_arr(finded_position) = freq;
 
-
-        // set missing genotypes as mean values
-        for(vector<long long>::iterator it = missing_geno_index.begin(); it != missing_geno_index.end(); it++){ 
-            geno_arr(*it) = 2 * freq;
+        num_features_found += output_positions.size();
+        if(num_features_found >= num_geno_read){
+            break;
         }
-        
-        //Snp matrix
-        geno_mat_by_snp_index.col(finded_position) = geno_arr;
-        igeno++; // move to next SNP
+        feature_idx++;
     }
-    delete[] endptr;
     fin.close();
-    if(!index_vec.empty()){
-        geno_mat_by_snp_index = geno_mat_by_snp_index(index_vec, Eigen::all).eval();
-        maf_arr = geno_mat_by_snp_index.colwise().sum() / (2 * index_vec.size());
-    }
 }
 
 
 /**
- * @brief 
- * ! Read genotypic matrix with given snp index from different input genotypic formats
- * @param input_geno_fmt 
- * @param snp_mat_by_snp_index 
- * @param maf_arr 
- * @param missing_rate_arr 
- * @param snp_index_vec 
- * @param index_vec 
- * @param missing 
+ * @brief Dispatch arbitrary-index genotype reading by input format.
+ *
+ * Used in:
+ * - currently no in-tree call sites were found
  */
-void GENO::read_geno_by_index(int input_geno_fmt, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, 
-                vector<long long> snp_index_vec, vector<long long> index_vec, vector<string> missing_in_geno_vec){
+void GENO::read_geno_by_index(int input_geno_fmt, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr, 
+                vector<std::int64_t> snp_index_vec, vector<std::int64_t> index_vec, vector<string> missing_in_geno_vec){
     if(input_geno_fmt == 0){
         string in_file = _geno_file + ".bed";
-        GENO::read_bed_by_snp_index(in_file, snp_mat_by_snp_index, maf_arr, missing_rate_arr, 
+        GENO::read_bed_by_snp_indices(in_file, snp_mat_by_snp_index, maf_arr, missing_rate_arr, nobs_geno_arr,
                 snp_index_vec, index_vec);
     }else if(input_geno_fmt == 1){
-        string in_file = _geno_file + ".dgeno";
-        GENO::read_dgeno_by_geno_index(in_file, snp_mat_by_snp_index, maf_arr, missing_rate_arr, 
+        string in_file = _geno_file + ".fmat";
+        GENO::read_fs_by_feature_indices(in_file, snp_mat_by_snp_index, maf_arr, missing_rate_arr, nobs_geno_arr,
                 snp_index_vec, index_vec, missing_in_geno_vec);
     }else{
-        string in_file = _geno_file + ".cgeno";
-        GENO::read_dgeno_by_geno_index(in_file, snp_mat_by_snp_index, maf_arr, missing_rate_arr, 
-                snp_index_vec, index_vec, missing_in_geno_vec);
+        spdlog::error("The input genotypic format is not supported");
+        std::exit(1);
     }
-}
-
-
-/**
- * @brief
- * ! Read bed file with start SNP index and iid index
- * @param snp_mat_part snp matrix
- * @param start_snp 
- * @param num_snp_read 
- * @param start_id 
- * @param num_id_read 
- */
-void GENO::read_bed_2Dpart(MatrixXd& snp_mat_part, long long start_snp, long long num_snp_read, 
-        long long start_id, long long num_id_read){
-    // the number of bytes to store on SNP
-    long long num_byte_for_one_snp = _num_id / 4; //One byte can store 4 SNPs
-    if ( _num_id % 4 != 0) {
-       num_byte_for_one_snp += 1;
-    }
-    string in_file = _geno_file + ".bed";
-    ifstream fin;
-    fin.open(in_file, std::ios::binary); // Read the in binary
-    if (!fin.is_open()) {
-        spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit(1);
-    }
-    char* bytes_mat = new char[num_byte_for_one_snp * num_snp_read]; // store readed btyes for all individuals
-    double code_val, mean_allele;  // coded value for SNP genotype
-    long long iid = 0, isnp = 0;
-    long long num_missing_allele = 0;
-    char x03 = '3' - 48; // binary 00000011
-    VectorXd snp_arr = VectorXd::Zero(_num_id); //SNP array for one individual, ordered same as fam file
-    fin.read(bytes_mat, sizeof(char) * 3); // Read the first three bytes
-    fin.seekg(start_snp*num_byte_for_one_snp, std::ios::cur); // move to the position for the start SNP
-    fin.read(bytes_mat, sizeof(char) * num_byte_for_one_snp * num_snp_read);
-    snp_mat_part.setZero(num_id_read, num_snp_read);
-    for(long long k = 0; k < num_snp_read; k++) { // read the SNP genotypes for all individuals
-        vector<long long> missing_geno_index; // the index for missing genotypes
-        for (long long i = 0; i < num_byte_for_one_snp; i++) {
-            for (long long j = 0; j < 4; j++) {
-                code_val = (bytes_mat[k * num_byte_for_one_snp + i] >> (2 * j))& x03; // move two bits from left to right; two bits contain a SNP
-                code_val = (code_val * code_val + code_val) / 6.0;
-                if (std::fabs(code_val - 2.0 / 6.0) < 0.00001) { // missing genotype set as 2
-                    num_missing_allele += 2;
-                    missing_geno_index.push_back(iid);
-                    code_val = 2;
-                }
-                snp_arr(iid++) = 2 - code_val;  // missing genotype is translated into 0, not affect mean
-                if(iid >= _num_id) break;
-            }
-        }
-        if(num_missing_allele == 2 * _num_id){
-            mean_allele = 0;
-        }else{
-            mean_allele = snp_arr.sum() / (_num_id - num_missing_allele/2);  // delete the missing allele
-        }
-        // set missing genotypes as mean values
-        for(vector<long long>::iterator it = missing_geno_index.begin(); it != missing_geno_index.end(); it++){ 
-            snp_arr(*it) = mean_allele;
-        }
-        snp_mat_part.col(k) = snp_arr.segment(start_id, num_id_read);
-        iid = 0;
-    }
-    delete [] bytes_mat;
-    fin.close();
 }

@@ -5,6 +5,8 @@
  * @LastEditTime: 2025-02-01 21:41:38
  * @LastEditors: Chao Ning
  */
+#include <cstdint>
+
 #pragma once
 
 #include "fastgxe.hpp"
@@ -18,9 +20,9 @@ public:
         void pre_data_GxE(bool standardize_env, int phen_correct);
         Eigen::MatrixXd pre_data_mmsusie(string bed_file, vector<string> snp_vec, int phen_correct);
 
-        void mmsusiefun(MatrixXd X, long long L, long long maxiter, double tol, 
+        void mmsusiefun(MatrixXd X, std::int64_t L, std::int64_t maxiter, double tol, 
                         double coverage, double min_abs_corr, bool estimate_sigma);
-        void mmsusiefun2(MatrixXd X, VectorXd y, long long L, long long maxiter, double tol, 
+        void mmsusiefun2(MatrixXd X, VectorXd y, std::int64_t L, std::int64_t maxiter, double tol, 
                    double coverage, double min_abs_corr, bool estimate_sigma);
 
         void getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& claimed_coverage, Eigen::MatrixXd& X, double& min_abs_corr);

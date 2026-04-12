@@ -1,3 +1,5 @@
+#include <cstdint>
+
 
 /*
  * @Descripttion: 
@@ -5,180 +7,64 @@
  * @Author: Chao Ning
  * @Date: 2022-06-22 21:08:46
  * @LastEditors: Chao Ning
- * @LastEditTime: 2025-02-18 11:08:04
+ * @LastEditTime: 2026-03-31 11:54:26
  */
 #pragma once
-#include <iostream>
 #include <vector>
-#include <Eigen/Core>
-#include <Eigen/Eigen>
 #include <Eigen/Dense>
-#include <Eigen/KroneckerProduct>
 #include "mkl.h"
 
 
-// Calcualte the correlation of columns
+/**
+ * @brief Compute the column-wise correlation matrix.
+ * @param mat Input matrix, with rows as samples and columns as variables.
+ * @return Pearson correlation matrix between columns.
+ */
 Eigen::MatrixXd computeCorrelationMatrix(const Eigen::MatrixXd& mat);
 
-void remove_col(Eigen::MatrixXd& mat, std::vector<long long> col_to_remove);
+/**
+ * @brief Remove a set of columns from a matrix in place.
+ * @param mat Matrix to modify.
+ * @param col_to_remove Zero-based column indices to remove.
+ */
+void remove_col(Eigen::MatrixXd& mat, std::vector<std::int64_t> col_to_remove);
 
-void mat_col_elementwise_dot_vec(Eigen::MatrixXd& mat, const Eigen::VectorXd& vec);
-
-void mat_row_elementwise_dot_vec(Eigen::MatrixXd& mat, const Eigen::VectorXd& vec);
+/**
+ * @brief Scale matrix columns in place.
+ * @param mat Matrix to scale.
+ * @param vec Vector of column-wise scaling factors.
+ */
+void scale_cols_inplace(Eigen::MatrixXd& mat, const Eigen::VectorXd& vec);
 
 
 /**
- * @brief perform LLT decomposition, log-transformed determinant, solve, inverse
+ * @brief MKL/LAPACK-based LLT factorization helper for dense SPD matrices.
  * 
  */
 class CustomLLT {
 
 public:
-    
-    void compute(Eigen::MatrixXd &A);
-    
+    /**
+     * @brief Factorize a dense symmetric positive-definite matrix.
+     * @param A Input matrix.
+     */
+    void compute(const Eigen::MatrixXd &A);
+
+    /**
+     * @brief Return the log-determinant of the factored matrix.
+     */
     double logDeterminant();
 
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> solve(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b);
-
+    /**
+     * @brief Return the dense inverse from the stored factorization.
+     */
     Eigen::MatrixXd inverse();
 
-    void pdelete();
-
 private:
+    /// Internal factorization buffer.
     Eigen::MatrixXd A_tmp;
-    long long ncols;
-    lapack_int info_computer, info_inverse, info_solve;
-    Eigen::VectorXd diag;
+    /// Matrix dimension used by LAPACK.
+    std::int64_t ncols;
+    /// LAPACK status codes.
+    lapack_int info_computer, info_inverse;
 };
-
-
-/**
- * @brief perform LDLT decomposition, log-transformed determinant, solve, inverse
- * 
- */
-class CustomLDLT {
-
-public:
-    
-    void compute(Eigen::MatrixXd &A);
-    
-    double logDeterminant();
-
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> solve(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b);
-
-    Eigen::MatrixXd inverse();
-
-    void pdelete();
-
-private:
-    Eigen::MatrixXd A_tmp;
-    long long ncols;
-    lapack_int info_computer, info_inverse, info_solve;
-    Eigen::VectorXd diag;
-    lapack_int *ipiv;
-};
-
-
-
-/*********************/
-
-
-class CustomPardisoLDLT{
-public:
-    CustomPardisoLDLT();
-
-    ~CustomPardisoLDLT();
-
-    void analyze(Eigen::SparseMatrix<double> &A, MKL_INT *_ia, MKL_INT *_ja);
-
-
-    void factorize(Eigen::SparseMatrix<double> &A, MKL_INT *_ia, MKL_INT *_ja);
-
-
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> solve(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b, MKL_INT *_ia, MKL_INT *_ja);
-
-
-    Eigen::VectorXd getdiag();
-
-
-
-    Eigen::VectorXd getdiag2();
-
-    void pdelete(MKL_INT *_ia, MKL_INT *_ja);
-
-
-private:
-    mutable void *pt[64];
-    MKL_INT maxfct;
-    MKL_INT mnum;
-    MKL_INT mtype;
-    MKL_INT phase;
-    MKL_INT n;
-    Eigen::SparseMatrix<double> A_tmp;
-    MKL_INT idum;
-    MKL_INT nrhs;
-    Eigen::VectorXi m_iparm;
-    MKL_INT msglvl;
-    double ddum;
-    MKL_INT error;
-    MKL_INT info_analyze, info_factorize, info_solve, info_getdiag, info_pdelete;
-};
-
-
-/*********************/
-
-
-class CustomPardisoLLT{
-public:
-    CustomPardisoLLT();
-
-    ~CustomPardisoLLT();
-
-    void analyze(Eigen::SparseMatrix<double> &A);
-
-
-    void factorize(Eigen::SparseMatrix<double> &A);
-
-
-    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> solve(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> b);
-
-
-    Eigen::VectorXd getdiag();
-
-
-    void pdelete();
-
-
-private:
-    mutable void *pt[64];
-    MKL_INT maxfct;
-    MKL_INT mnum;
-    MKL_INT mtype;
-    MKL_INT phase;
-    MKL_INT n;
-    Eigen::SparseMatrix<double> A_tmp;
-    MKL_INT idum;
-    MKL_INT nrhs;
-    Eigen::VectorXi m_iparm;
-    MKL_INT msglvl;
-    double ddum;
-    MKL_INT error;
-    MKL_INT info_analyze, info_factorize, info_solve, info_getdiag, info_pdelete;
-};
-
-
-Eigen::MatrixXd custom_eigen_kron(Eigen::MatrixXd& A, Eigen::MatrixXd& B);
-
-
-Eigen::SparseMatrix<double> custom_eigen_kron(Eigen::MatrixXd& A, Eigen::SparseMatrix<double>& B);
-
-
-Eigen::SparseMatrix<double> custom_eigen_kron(Eigen::SparseMatrix<double>& A, Eigen::SparseMatrix<double>& B);
-
-
-Eigen::SparseMatrix<double> custom_eigen_kron(Eigen::SparseMatrix<double>& A, Eigen::MatrixXd& B);
-
-
-
-Eigen::MatrixXd custom_matrix_dot(Eigen::MatrixXd& A, Eigen::MatrixXd& B);
