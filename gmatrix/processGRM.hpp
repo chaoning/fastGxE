@@ -14,9 +14,8 @@
 #include <vector>
 #include <string>
 #include <map>
-#include <Eigen/Eigen>
-#include <Eigen/Core>
-#include <Eigen/SparseCore>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
 
 class ProcessGRM{
 
@@ -36,7 +35,7 @@ public:
     void read_grm_sp_bin(const std::string& grm_sparse_file, const std::map<std::string, std::int64_t>& grm_id_map, Eigen::SparseMatrix<double>& mat, double val = 0);
 
 
-    void merge_grm(const std::string& grm_file, int npart, const std::string& out_file);
+    void merge_grm(const std::string& grm_file, int npart);
     void merge_file(const std::vector<std::string>& file_vec, const std::string& out_file, bool bin);
     
 

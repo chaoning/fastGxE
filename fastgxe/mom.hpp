@@ -14,9 +14,8 @@
 #include <vector>
 #include <fstream>
 
-#include <Eigen/Core>
 #include <Eigen/Dense>
-#include <Eigen/Eigen>
+#include <Eigen/Sparse>
 
 using std::string;
 using std::vector;

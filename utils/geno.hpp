@@ -73,7 +73,7 @@ public:
                  std::int64_t start_snp, std::int64_t num_snp_read, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec);
 
     void read_geno(int input_geno_fmt, MatrixXd& snp_mat_part, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr,
-                   std::int64_t start_snp, std::int64_t num_snp_read, vector<std::int64_t> index_vec, vector<string> missing_in_geno_vec);
+                   std::int64_t start_snp, std::int64_t num_snp_read, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec);
 
     void read_bed_by_snp_indices(const string& in_file, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr,
                                  const vector<std::int64_t>& snp_index_vec, const vector<std::int64_t>& index_vec);
@@ -82,7 +82,7 @@ public:
                                     const vector<std::int64_t>& feature_index_vec, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec);
 
     void read_geno_by_index(int input_geno_fmt, MatrixXd& snp_mat_by_snp_index, VectorXd& maf_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr,
-                            vector<std::int64_t> snp_index_vec, vector<std::int64_t> index_vec, vector<string> missing_in_geno_vec);
+                            const vector<std::int64_t>& snp_index_vec, const vector<std::int64_t>& index_vec, const vector<string>& missing_in_geno_vec);
 
 };
 

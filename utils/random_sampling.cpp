@@ -14,6 +14,7 @@
 #include <random>
 
 #include "random_sampling.hpp"
+#include "fatal_error.hpp"
 
 using std::cout;
 using std::endl;
@@ -31,8 +32,7 @@ using std::vector;
 vector<std::int64_t> sample_unique_integers(std::int64_t min, std::int64_t max, std::int64_t num)
 {
     if (num > max - min) {
-        cout << num << " exceeds the upper limit" << endl;
-        exit(1);
+        fatal_error(" exceeds the upper limit");
     }
 
     vector<std::int64_t> sampled_values(static_cast<size_t>(max - min));

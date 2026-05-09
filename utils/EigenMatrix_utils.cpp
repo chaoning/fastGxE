@@ -87,11 +87,12 @@ Eigen::MatrixXd computeCorrelationMatrix(const Eigen::MatrixXd& mat) {
  * - `utils/phen.cpp` when dropping covariate columns flagged for removal
  * - `test/eigenmatrix_utils_example.cpp` as a small runnable example
  */
-void remove_col(MatrixXd& mat, vector<std::int64_t> col_to_remove){
-    if (col_to_remove.empty()) {
+void remove_col(MatrixXd& mat, const vector<std::int64_t>& col_to_remove_in){
+    if (col_to_remove_in.empty()) {
         return;
     }
 
+    vector<std::int64_t> col_to_remove = col_to_remove_in;
     std::sort(col_to_remove.begin(), col_to_remove.end());
     col_to_remove.erase(std::unique(col_to_remove.begin(), col_to_remove.end()), col_to_remove.end());
 
@@ -196,7 +197,7 @@ Eigen::MatrixXd CustomLLT::inverse(){
         // Invert from the stored Cholesky factor.
         info_inverse = LAPACKE_dpotri(LAPACK_COL_MAJOR, 'L', ncols, A_tmp.data(), ncols);
         eigen_assert(info_inverse == 0 && "Fail to inverser");
-        // Mirror the stored triangle to recover the full symmetric matrix.
+        // dpotri fills only the lower triangle; copy to upper to recover the full symmetric inverse.
         A_tmp.triangularView<Eigen::Upper>() = A_tmp.transpose();
         return A_tmp;
 }

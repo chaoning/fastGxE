@@ -15,9 +15,7 @@
 #include <fstream>
 #include <unordered_map>
 
-#include <Eigen/Core>
 #include <Eigen/Dense>
-#include <Eigen/Eigen>
 #include <Eigen/Sparse>
 
 
@@ -40,6 +38,7 @@ protected:
     std::int64_t m_num_id;
 
     vector<string>  m_id_in_data_vec;
+    vector<string>  m_trait_name_vec;
 
     // Phenotype, fixed-effect design and interacting environments.
     MatrixXd m_y, m_xmat, m_bye_mat;
@@ -47,6 +46,12 @@ protected:
     VectorXd m_enviW_Vec;
     MatrixXd m_y_trans, m_xmat_trans;
     VectorXd m_varcom_null;
+    VectorXd m_binary_mu;
+    VectorXd m_binary_eta;
+    VectorXd m_binary_working_response;
+    VectorXd m_joint_binary_mu;
+    VectorXd m_joint_binary_eta;
+    VectorXd m_joint_working_response;
 
     // GRM blocks and the sparse/full representations derived from them.
     vector<MatrixXd> m_grm_mat_group_vec;
@@ -123,10 +128,28 @@ public:
 
     // Null-model fitting and genome-wide scans for SNP main effects.
     VectorXd varcom_main(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
+    VectorXd varcom_main_binary(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
+    VectorXd varcom_main_binary_continuous(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
+    VectorXd varcom_main_multitrait_continuous(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
     void test_main(const string& bed_file,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
                 int speed, std::int64_t num_random_snp,
                 double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut, 
+                int maxiter, double cc_par, double cc_gra);
+    void test_main_binary(const string& bed_file,
+                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
+                int speed, std::int64_t num_random_snp,
+                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
+                int maxiter, double cc_par, double cc_gra);
+    void test_main_binary_continuous(const string& bed_file,
+                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
+                int speed, std::int64_t num_random_snp,
+                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
+                int maxiter, double cc_par, double cc_gra);
+    void test_main_multitrait_continuous(const string& bed_file,
+                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
+                int speed, std::int64_t num_random_snp,
+                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
                 int maxiter, double cc_par, double cc_gra);
     void output(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
                 const double* eff_arr, const double* se_arr, const VectorXd& p_arr,

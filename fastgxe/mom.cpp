@@ -20,6 +20,7 @@
 
 
 #include "mom.hpp"
+#include "../utils/fatal_error.hpp"
 #include "../utils/geno.hpp"
 #include "../utils/phen.hpp"
 #include "../utils/iterator_utils.hpp"
@@ -48,7 +49,7 @@ MoM::~MoM() {
 }
 
 
-double cal_std(Eigen::VectorXd data) {
+double cal_std(const Eigen::VectorXd& data) {
     double mean = data.mean();
     double variance = (data.array() - mean).square().sum() / (data.size() - 1);
     double stddev = std::sqrt(variance);
@@ -67,10 +68,8 @@ void read_data(const string &data_file, const vector<std::int64_t> &covariate_ar
     phenoA.get_given_column(0, id_in_data_vec);
     set<string> id_in_data_st = set<string>(id_in_data_vec.begin(), id_in_data_vec.end());
 
-    if (id_in_data_vec.size() > id_in_data_st.size()) {
-        spdlog::error("Duplicated sample IDs exist in the data file!");
-        exit(1);
-    }
+    if (id_in_data_vec.size() > id_in_data_st.size())
+        fatal_error("Duplicated sample IDs exist in the data file!");
 }
 
 
@@ -107,10 +106,8 @@ MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<std::int64_t> &cova
     xmat.rightCols(bye_mat.cols()) = bye_mat;
     ColPivHouseholderQR<MatrixXd> qr(xmat);
 
-    if (qr.rank() < xmat.cols()) {
-        spdlog::error("There are dependent columns between interaction environment covariates and other covariates!");
-        exit(1);
-    }
+    if (qr.rank() < xmat.cols())
+        fatal_error("There are dependent columns between interaction environment covariates and other covariates!");
 
     y = (y - xmat * ((xmat.transpose() * xmat).inverse() * (xmat.transpose() * y))).eval();
 
@@ -118,32 +115,30 @@ MatrixXd adjust_for_fixed_effects(PHEN &phenoA, const vector<std::int64_t> &cova
 }
 
 void read_plink_bed(const string &bed_file, std::int64_t start_snp, std::int64_t num_snp_read,
-                    std::int64_t num_iid_bed, char* &bytes_vec) {
+                    std::int64_t num_iid_bed, std::vector<char>& bytes_vec) {
     string in_file = bed_file + ".bed";
     FILE* fin = fopen(in_file.c_str(), "rb");
-    if (!fin) {
-        spdlog::error("Fail to open the plink bed file: " + in_file);
-        exit(1);
-    }
+    if (!fin)
+        fatal_error("Fail to open the plink bed file: {}", in_file);
 
+    // BED format packs 4 samples per byte (2 bits each); ceiling division handles a partial final byte.
     std::int64_t num_byte_for_one_snp = (num_iid_bed + 3) / 4;
     std::streamoff startPos = start_snp * num_byte_for_one_snp + 3;
     if (fseek(fin, startPos, SEEK_SET) != 0) {
-        spdlog::error("Fail to seek the predefined position");
-        exit(1);
+        fclose(fin);
+        fatal_error("Fail to seek the predefined position in: {}", in_file);
     }
 
-    bytes_vec = new char[num_byte_for_one_snp * num_snp_read];
-    std::int64_t read_count = fread(bytes_vec, sizeof(char), num_byte_for_one_snp * num_snp_read, fin);
+    bytes_vec.resize(static_cast<std::size_t>(num_byte_for_one_snp * num_snp_read));
+    std::int64_t read_count = static_cast<std::int64_t>(
+        fread(bytes_vec.data(), sizeof(char), bytes_vec.size(), fin));
     if (read_count != num_byte_for_one_snp * num_snp_read) {
-        delete[] bytes_vec;
-        spdlog::error("fread failed to read the expected amount");
-        exit(1);
+        fclose(fin);
+        fatal_error("fread failed to read the expected amount from: {}", in_file);
     }
     if (ferror(fin)) {
-        delete[] bytes_vec;
-        spdlog::error("Failed to read from file: " + in_file);
-        exit(1);
+        fclose(fin);
+        fatal_error("Failed to read from file: {}", in_file);
     }
     fclose(fin);
 }
@@ -219,6 +214,7 @@ void MoM::process_snps(std::int64_t num_snp_read, std::int64_t num_iid_bed, std:
         Eigen::MatrixXd snpByeE = bye_mat.array().colwise() * snp_used_Vec.array();
         Eigen::MatrixXd local_VB = snpByeE * (snpByeE.transpose() * B) / (num_snp_read * bye_mat.cols());
 
+        // Matrix += is not atomically composable; serialize to prevent data races across threads.
         #pragma omp critical
         {
             GB += local_GB;
@@ -409,7 +405,7 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
     MatrixXd bye_mat = adjust_for_fixed_effects(phenoA, covariate_arr, class_arr, bye_arr, trait, y);
 
     spdlog::info("Read the plink bed file");
-    char* bytes_vec = nullptr;
+    std::vector<char> bytes_vec;
     read_plink_bed(bed_file, start_snp, num_snp_read, num_iid_bed, bytes_vec);
 
     spdlog::info("Random Bs");
@@ -422,7 +418,7 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
     MatrixXd VB = MatrixXd::Zero(num_used_id, num_randomB + 1);
     VectorXd nxe_vec = bye_mat.rowwise().squaredNorm() / bye_mat.cols(); // nxe for each individual
 
-    process_snps(num_snp_read, num_iid_bed, num_used_id, num_randomB, bytes_vec, index_vec, GB, VB, B, bye_mat);
+    process_snps(num_snp_read, num_iid_bed, num_used_id, num_randomB, bytes_vec.data(), index_vec, GB, VB, B, bye_mat);
 
     VectorXd varcom;
     if(no_noisebye){
@@ -431,18 +427,14 @@ void MoM::MoMV(bool no_noisebye, const string &out_file, const string &data_file
         varcom = calculate_variance_components_withNxE(GB, VB, nxe_vec, B, y);
     }
 
-    delete[] bytes_vec;
-
     for (auto val : varcom) {
         spdlog::info(std::to_string(val), 0, 0, " ");
     }
     spdlog::info("");
 
     ofstream fout(out_file + ".var");
-    if(!fout.is_open()){
-        spdlog::error("Fail to open the output file");
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open the output file: {}.var", out_file);
     for (auto val : varcom) {
         fout << val << std::endl;
     }
@@ -482,7 +474,7 @@ void MoM::MoMMV(const string &out_file, const string &data_file, const vector<st
     MatrixXd bye_mat = adjust_for_fixed_effects(phenoA, covariate_arr, class_arr, bye_arr, trait, y);
 
     spdlog::info("Read the plink bed file");
-    char* bytes_vec = nullptr;
+    std::vector<char> bytes_vec;
     read_plink_bed(bed_file, start_snp, num_snp_read, num_iid_bed, bytes_vec);
 
     spdlog::info("Random Bs");
@@ -496,11 +488,9 @@ void MoM::MoMMV(const string &out_file, const string &data_file, const vector<st
         VB_vec.push_back(MatrixXd::Zero(num_used_id, num_randomB + 1));
     }
 
-    process_snps_MV(num_snp_read, num_iid_bed, num_used_id, num_randomB, bytes_vec, index_vec,VB_vec, B, bye_mat);
+    process_snps_MV(num_snp_read, num_iid_bed, num_used_id, num_randomB, bytes_vec.data(), index_vec,VB_vec, B, bye_mat);
 
     VectorXd varcom = calculate_multi_variance_components(VB_vec, B, y);
-
-    delete[] bytes_vec;
 
     for (auto val : varcom) {
         spdlog::info(std::to_string(val));
@@ -596,41 +586,33 @@ int MoM::run(int argc, char* argv[]) {
 
     // Obtain head row
     std::ifstream fin(data_file);
-    if (!fin.is_open()) {
-        spdlog::error("Failed to open data file: {}", data_file);
-        exit(1);  // Ensure early exit to prevent further errors
-    }
+    if (!fin.is_open())
+        fatal_error("Failed to open data file: {}", data_file);
 
     std::string line;
     if (std::getline(fin, line)) {
         process_line(line);
-        if (line.empty()) {
-            spdlog::error("Head line is empty or starts with #");
-            exit(1);
-        }
+        if (line.empty())
+            fatal_error("Head line is empty or starts with #");
     } else {
-        spdlog::error("Failed to read the head line from file: {}", data_file);
-        exit(1);
+        fatal_error("Failed to read the head line from file: {}", data_file);
     }
 
     std::vector<std::string> head_vec = split_string(line);
     fin.close();
 
     // Trait index
-    
     std::vector<std::string> strNoFound_vec;
     std::vector<std::int64_t> trait_index_vec = find_index(head_vec, trait, strNoFound_vec);
 
-    if (!strNoFound_vec.empty()) {
-        spdlog::error("Trait names not found in the header: {}", join_string(strNoFound_vec));
-        exit(1);
-    }
+    if (!strNoFound_vec.empty())
+        fatal_error("Trait names not found in the header: {}", join_string(strNoFound_vec));
     strNoFound_vec.clear();
 
     // covariate index
     covariate_vec = expand_variable_ranges(covariate_vec, head_vec);
     if(!covariate_vec.empty()){
-        spdlog::info("Number of covariates: {}, Covariates: {}", 
+        spdlog::info("Number of covariates: {}, Covariates: {}",
              covariate_vec.size(), join_string(covariate_vec, ", "));
     }
     vector <std::int64_t> covariate_index_vec = find_index(head_vec, covariate_vec, strNoFound_vec);
@@ -639,7 +621,7 @@ int MoM::run(int argc, char* argv[]) {
     // class index
     class_vec = expand_variable_ranges(class_vec, head_vec);
     if(!class_vec.empty()){
-        spdlog::info("Number of class variables: {}, class variables: {}", 
+        spdlog::info("Number of class variables: {}, class variables: {}",
              class_vec.size(), join_string(class_vec, ", "));
     }
     vector <std::int64_t> class_index_vec = find_index(head_vec, class_vec, strNoFound_vec);
@@ -647,23 +629,18 @@ int MoM::run(int argc, char* argv[]) {
 
     // interacting environment
     bye_vec = expand_variable_ranges(bye_vec, head_vec);
-    spdlog::info("Number of interacting environmental covariates: {}, Interacting environmental covariates: {}", 
+    spdlog::info("Number of interacting environmental covariates: {}, Interacting environmental covariates: {}",
              bye_vec.size(), join_string(bye_vec, ", "));
     vector <std::int64_t> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
-    if(strNoFound_vec.size() != 0){
-        spdlog::error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
-        exit(1);
-    }
+    if(!strNoFound_vec.empty())
+        fatal_error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
     strNoFound_vec.clear();
-    
+
     if (!bye_index_vec.empty()) {
         std::vector<std::int64_t> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
         std::vector<std::int64_t> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
-        
-        if (!tmp1.empty() || !tmp2.empty()) {
-            spdlog::error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
-            exit(1);
-        }
+        if (!tmp1.empty() || !tmp2.empty())
+            fatal_error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
     }
     strNoFound_vec.clear();
 
@@ -673,10 +650,8 @@ int MoM::run(int argc, char* argv[]) {
     std::int64_t start_pos = 0, num_snp_read = num_sid_bed;
 
     if (!block_vec.empty()) {
-        if (block_vec[0] < block_vec[1] || block_vec[1] <= 0) {
-            spdlog::error("Invalid block parameters: second number must be >0 and <= first number");
-            exit(1);
-        }
+        if (block_vec[0] < block_vec[1] || block_vec[1] <= 0)
+            fatal_error("Invalid block parameters: second number must be >0 and <= first number");
         std::int64_t num_snp_part = num_sid_bed / block_vec[0];
         start_pos = num_snp_part * (block_vec[1] - 1);
         std::int64_t end_pos = num_snp_part * block_vec[1];

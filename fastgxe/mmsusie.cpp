@@ -30,6 +30,7 @@
 #include "../utils/chi2score.hpp"
 #include "../utils/string_utils.hpp"
 #include "../utils/iterator_utils.hpp"
+#include "../utils/fatal_error.hpp"
 
 
 using std::set;
@@ -124,10 +125,10 @@ private:
 public:
     optimize_sigma(int n_) : n(n_) {}
 
-    void set_value(VectorXd& y_, MatrixXd& X_, SparseMatrix < double >& gxe_rm_, SparseMatrix < double >& grm_mat_,
-        VectorXd& Xr_Vec_, MatrixXd& alpha_Mat_, MatrixXd& mu_Mat_, MatrixXd& mu2_Mat_,
+    void set_value(const VectorXd& y_, const MatrixXd& X_, SparseMatrix<double>& gxe_rm_, SparseMatrix<double>& grm_mat_,
+        const VectorXd& Xr_Vec_, const MatrixXd& alpha_Mat_, const MatrixXd& mu_Mat_, const MatrixXd& mu2_Mat_,
         vector<MatrixXd>& grm_mat_group_vec_, vector<std::int64_t>& grm_index_vec_,
-                    MatrixXd& bye_mat_){
+                    const MatrixXd& bye_mat_){
         y = y_;
         num_id = y.size();
         X = X_;
@@ -289,8 +290,7 @@ void MMSUSIE::pre_data_GxE(bool standardize_env, int phen_correct){
     // rank of bye_mat
     ColPivHouseholderQR<MatrixXd> qr(this->m_bye_mat);
     if(qr.rank() < m_num_bye){
-        spdlog::error("There are dependent columns in the interaction environment covariates!");
-        exit(1);
+        fatal_error("There are dependent columns in the interaction environment covariates!");
     }
 
     if(standardize_env){
@@ -317,16 +317,14 @@ void MMSUSIE::pre_data_GxE(bool standardize_env, int phen_correct){
         this->m_xmat.rightCols(this->m_bye_mat.cols()) = this->m_bye_mat; // interaction covariate
         qr.compute(this->m_xmat);
         if(qr.rank() < m_xmat.cols()){
-            spdlog::error("There are dependent columns between interaction environment covariates and other covariates!");
-            exit(1);
+            fatal_error("There are dependent columns between interaction environment covariates and other covariates!");
         }
 
         this->m_y = (this->m_y - m_xmat * ((m_xmat.transpose() * m_xmat).inverse() * (m_xmat.transpose() * m_y))).eval();
 
         this->m_xmat = MatrixXd::Ones(nrows, 1);
     }else{
-        spdlog::error("--phen-correct must be 1 or 2");
-        exit(1);
+        fatal_error("--phen-correct must be 1 or 2");
     }
 }
 
@@ -337,8 +335,7 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
         if(phen_correct == 1){
             return this->m_bye_mat;
         }else{
-            spdlog::error("For empty SNPs, --phen-correct must be 1");
-            exit(1);
+            fatal_error("For empty SNPs, --phen-correct must be 1");
         }
     }else{
         GENO GenoA(bed_file);
@@ -386,7 +383,7 @@ Eigen::MatrixXd MMSUSIE::pre_data_mmsusie(string bed_file, vector<string> snp_ve
 }
 
 
-void MMSUSIE::mmsusiefun(MatrixXd X, std::int64_t L, std::int64_t maxiter, double tol, 
+void MMSUSIE::mmsusiefun(const MatrixXd& X, std::int64_t L, std::int64_t maxiter, double tol,
                double coverage, double min_abs_corr, bool estimate_sigma){
     this->mmsusiefun2(X, this->m_y, L, maxiter, tol, coverage, min_abs_corr, estimate_sigma);
 }
@@ -394,7 +391,7 @@ void MMSUSIE::mmsusiefun(MatrixXd X, std::int64_t L, std::int64_t maxiter, doubl
 /**
  * std::int64_t L: the number of pre-defined casual variables
 */
-void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, std::int64_t L, std::int64_t maxiter, double tol, 
+void MMSUSIE::mmsusiefun2(const MatrixXd& X, const VectorXd& y, std::int64_t L, std::int64_t maxiter, double tol,
                double coverage, double min_abs_corr, bool estimate_sigma){
     std::int64_t p = X.cols(), n = X.rows();
     if(p < L) L = p;
@@ -544,29 +541,23 @@ void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, std::int64_t L, std::int64_t m
 
     // alpha
     ofstream fout(this->m_out_file + ".alpha");
-    if(!fout.is_open()) {
-        spdlog::error("Fail to open {}.alpha", this->m_out_file);
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open {}.alpha", this->m_out_file);
     fout << alpha_Mat << std::endl;
     fout.close();
 
     // mu
     fout.open(this->m_out_file + ".mu");
-    if(!fout.is_open()) {
-        spdlog::error("Fail to open {}.mu", this->m_out_file);
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open {}.mu", this->m_out_file);
     fout << mu_Mat << std::endl;
     fout.close();
 
     // get PIP
     Eigen::VectorXd pipVec = getPIP(alpha_Mat);
     fout.open(this->m_out_file + ".PIP");
-    if(!fout.is_open()) {
-        spdlog::error("Fail to open {}.PIP", this->m_out_file);
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open {}.PIP", this->m_out_file);
     for(auto val:pipVec){
         fout << val << std::endl;
     }
@@ -583,20 +574,16 @@ void MMSUSIE::mmsusiefun2(MatrixXd X, VectorXd y, std::int64_t L, std::int64_t m
     getCSpurity(cs_purity_vec, claimed_coverage_purity, X, min_abs_corr);
 
     fout.open(this->m_out_file + ".claimed_coverage");
-    if(!fout.is_open()) {
-        spdlog::error("Fail to open {}.claimed_coverage", this->m_out_file);
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open {}.claimed_coverage", this->m_out_file);
     for(auto val:claimed_coverage_purity){
         fout << val << std::endl;
     }
     fout.close();
 
     fout.open(this->m_out_file + ".CS");
-    if(!fout.is_open()) {
-        spdlog::error("Fail to open {}.CS", this->m_out_file);
-        exit(1);
-    }
+    if(!fout.is_open())
+        fatal_error("Fail to open {}.CS", this->m_out_file);
     for(auto vec:cs_purity_vec){
         for(auto x:vec){
             fout << x << " ";
@@ -641,7 +628,7 @@ Eigen::VectorXi MMSUSIE::in_CS_x(const Eigen::VectorXd& x, double coverage) {
 }
 
 
-Eigen::MatrixXi MMSUSIE::in_CS(Eigen::MatrixXd& alpha, double coverage) {
+Eigen::MatrixXi MMSUSIE::in_CS(const Eigen::MatrixXd& alpha, double coverage) {
     Eigen::MatrixXi status(alpha.rows(), alpha.cols());
     for (std::int64_t i = 0; i < alpha.rows(); i++) {
         Eigen::VectorXd x = alpha.row(i);
@@ -710,7 +697,7 @@ double MMSUSIE::computeMinCorrelation(const Eigen::MatrixXd& matrix) {
 }
 
 
-void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& claimed_coverage, Eigen::MatrixXd& X, double& min_abs_corr){
+void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& claimed_coverage, const Eigen::MatrixXd& X, double& min_abs_corr){
     std::int64_t numCS = cs.size();
     std::vector<int> isPurity;
     for(std::int64_t i = 0; i < numCS; i++){
@@ -736,7 +723,7 @@ void MMSUSIE::getCSpurity(std::vector<std::vector<int>>& cs, Eigen::VectorXd& cl
     claimed_coverage = claimed_coveragePurity;
 }
 
-Eigen::VectorXd MMSUSIE::getPIP(Eigen::MatrixXd& alpha_Mat){
+Eigen::VectorXd MMSUSIE::getPIP(const Eigen::MatrixXd& alpha_Mat){
     Eigen::MatrixXd alpha_Mat_tmp = 1 - alpha_Mat.array();
     Eigen::VectorXd pipVec(alpha_Mat_tmp.cols());
     for(std::int64_t j = 0; j < alpha_Mat_tmp.cols(); j++){
@@ -907,21 +894,16 @@ int MMSUSIE::run(int argc, char *argv[]) {
 
     // Obtain head row
     std::ifstream fin(data_file);
-    if (!fin.is_open()) {
-        spdlog::error("Failed to open data file: {}", data_file);
-        exit(1);  // Ensure early exit to prevent further errors
-    }
+    if (!fin.is_open())
+        fatal_error("Failed to open data file: {}", data_file);
 
     std::string line;
     if (std::getline(fin, line)) {
         process_line(line);
-        if (line.empty()) {
-            spdlog::error("Head line is empty or starts with #");
-            exit(1);
-        }
+        if (line.empty())
+            fatal_error("Head line is empty or starts with #");
     } else {
-        spdlog::error("Failed to read the head line from file: {}", data_file);
-        exit(1);
+        fatal_error("Failed to read the head line from file: {}", data_file);
     }
 
     std::vector<std::string> head_vec = split_string(line);
@@ -932,10 +914,8 @@ int MMSUSIE::run(int argc, char *argv[]) {
     std::vector<std::string> strNoFound_vec;
     std::vector<std::int64_t> trait_index_vec = find_index(head_vec, trait_vec, strNoFound_vec);
 
-    if (!strNoFound_vec.empty()) {
-        spdlog::error("Trait names not found in the header: {}", join_string(strNoFound_vec));
-        exit(1);
-    }
+    if (!strNoFound_vec.empty())
+        fatal_error("Trait names not found in the header: {}", join_string(strNoFound_vec));
     strNoFound_vec.clear();
 
     // covariate index
@@ -962,20 +942,16 @@ int MMSUSIE::run(int argc, char *argv[]) {
     spdlog::info("Number of interacting environmental covariates: {}, Interacting environmental covariates: {}", 
              bye_vec.size(), join_string(bye_vec, ", "));
     vector <std::int64_t> bye_index_vec = find_index(head_vec, bye_vec, strNoFound_vec);
-    if(strNoFound_vec.size() != 0){
-        spdlog::error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
-        exit(1);
-    }
+    if(!strNoFound_vec.empty())
+        fatal_error("Interacting environments not found in the header: {}", join_string(strNoFound_vec));
     strNoFound_vec.clear();
     
     if (!bye_index_vec.empty()) {
         std::vector<std::int64_t> tmp1 = find_index(covariate_vec, bye_vec, strNoFound_vec);
         std::vector<std::int64_t> tmp2 = find_index(class_vec, bye_vec, strNoFound_vec);
         
-        if (!tmp1.empty() || !tmp2.empty()) {
-            spdlog::error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
-            exit(1);
-        }
+        if (!tmp1.empty() || !tmp2.empty())
+            fatal_error("Interacting environments should not be included in --covar or --class. They are treated as covariates by default.");
     }
     strNoFound_vec.clear();
 

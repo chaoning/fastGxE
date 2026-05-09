@@ -7,6 +7,6 @@
  */
 #pragma once
 
-#include <Eigen/Core>
+#include <Eigen/Dense>
 
 double saddle(double x, const Eigen::VectorXd& lambda);

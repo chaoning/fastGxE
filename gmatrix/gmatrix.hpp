@@ -15,7 +15,6 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <Eigen/Core>
 #include <Eigen/Dense>
 
 using std::vector;
