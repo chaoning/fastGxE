@@ -15,6 +15,7 @@
 #include <charconv>
 #include <algorithm>
 #include <cmath>
+#include "fatal_error.hpp"
 
 using std::string;
 using std::vector;

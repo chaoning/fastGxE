@@ -15,6 +15,7 @@
 #include <spdlog/spdlog.h>
 
 #include "iterator_utils.hpp"
+#include "fatal_error.hpp"
 
 using std::vector;
 using std::string;
@@ -192,25 +193,21 @@ std::vector<std::string> expand_variable_ranges(const std::vector<std::string>& 
                 for (std::size_t i = start_it->second; i <= end_it->second; ++i) {
                     const auto& expanded = all_vars[i];
                     if (!seen_vars.insert(expanded).second) {
-                        spdlog::error("Duplicate variable detected: {}", expanded);
-                        exit(1);
+                        fatal_error("Duplicate variable detected: {}", expanded);
                     }
                     expanded_vars.push_back(expanded);
                 }
             } else {
-                spdlog::error("Invalid range: {}", var);
-                exit(1);
+                fatal_error("Invalid range: {}", var);
             }
         } else {
             if (all_var_index.find(var) != all_var_index.end()) {
                 if (!seen_vars.insert(var).second) {
-                    spdlog::error("Duplicate variable detected: {}", var);
-                    exit(1);
+                    fatal_error("Duplicate variable detected: {}", var);
                 }
                 expanded_vars.push_back(var);
             } else {
-                spdlog::error("Invalid variable: {}", var);
-                exit(1);
+                fatal_error("Invalid variable: {}", var);
             }
         }
     }

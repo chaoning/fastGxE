@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include <Eigen/Core>
-#include <Eigen/Eigen>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
 
 using std::string;
 using std::vector;

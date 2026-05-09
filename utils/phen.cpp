@@ -17,6 +17,7 @@
 #include "iterator_utils.hpp"
 #include "phen.hpp"
 #include "string_utils.hpp"
+#include "fatal_error.hpp"
 
 using std::ifstream;
 using std::vector;
@@ -44,9 +45,8 @@ size_t count_remaining_lines(ifstream& fin) {
 const vector<string>& get_checked_column_or_exit(const vector<vector<string>>& data_vec,
                                                  std::int64_t column_no) {
     if (column_no < 0 || static_cast<size_t>(column_no) >= data_vec.size()) {
-        spdlog::error("Phenotype column index {} is out of range for data with {} columns",
+        fatal_error("Phenotype column index {} is out of range for data with {} columns",
                       column_no, data_vec.size());
-        exit(1);
     }
 
     return data_vec[static_cast<size_t>(column_no)];
@@ -55,9 +55,8 @@ const vector<string>& get_checked_column_or_exit(const vector<vector<string>>& d
 const string& get_checked_header_name_or_exit(const vector<string>& header_vec,
                                               std::int64_t column_no) {
     if (column_no < 0 || static_cast<size_t>(column_no) >= header_vec.size()) {
-        spdlog::error("Phenotype header index {} is out of range for {} stored headers",
+        fatal_error("Phenotype header index {} is out of range for {} stored headers",
                       column_no, header_vec.size());
-        exit(1);
     }
 
     return header_vec[static_cast<size_t>(column_no)];
@@ -78,8 +77,7 @@ const string& get_checked_header_name_or_exit(const vector<string>& header_vec,
 void PHEN::read_all_columns_raw(const string& pheno_file, vector<vector<string>>& data_vec){
     ifstream fin(pheno_file);
     if (!fin) {
-        spdlog::error("Fail to open the phenotypic file");
-        exit(1);
+        fatal_error("Fail to open the phenotypic file");
     }
 
     string line;
@@ -105,8 +103,7 @@ void PHEN::read_all_columns_raw(const string& pheno_file, vector<vector<string>>
         auto fields = split_string(line);
 
         if (fields.size() != num_col) {
-            spdlog::error("Column mismatch at row {}: {}", row_id, line);
-            exit(1);
+            fatal_error("Column mismatch at row {}: {}", row_id, line);
         }
 
         // Move strings directly into column storage (no copy)
@@ -134,8 +131,7 @@ void PHEN::read_selected_columns_raw(const string& pheno_file,
     // Open phenotype file
     ifstream fin(pheno_file);
     if (!fin) {
-        spdlog::error("Fail to open the phenotypic file");
-        exit(1);
+        fatal_error("Fail to open the phenotypic file");
     }
 
     string line;
@@ -150,8 +146,7 @@ void PHEN::read_selected_columns_raw(const string& pheno_file,
     selected_indices.reserve(target_cols.size());
     for (auto c : target_cols) {
         if (c < 0 || static_cast<size_t>(c) >= num_col) {
-            spdlog::error("Requested column {} out of range (0..{})", c, num_col - 1);
-            exit(1);
+            fatal_error("Requested column {} out of range (0..{})", c, num_col - 1);
         }
         selected_indices.push_back(static_cast<size_t>(c));
     }
@@ -175,8 +170,7 @@ void PHEN::read_selected_columns_raw(const string& pheno_file,
 
         // Check column consistency
         if (fields.size() != num_col) {
-            spdlog::error("Column mismatch at row {}: {}", row_id, line);
-            exit(1);
+            fatal_error("Column mismatch at row {}: {}", row_id, line);
         }
 
         // Move only the requested columns into the output buffer.
@@ -205,17 +199,15 @@ void PHEN::read_selected_columns_raw(const string& pheno_file,
 void PHEN::update_keep_indices_by_grm_ids(const vector<std::int64_t>& random_grm_vec,
                                           const vector<vector<string>>& grm_id_used_vec_vec){
     if (random_grm_vec.size() != grm_id_used_vec_vec.size()) {
-        spdlog::error("random_grm_vec size ({}) does not match grm_id_used_vec_vec size ({})",
+        fatal_error("random_grm_vec size ({}) does not match grm_id_used_vec_vec size ({})",
                       random_grm_vec.size(), grm_id_used_vec_vec.size());
-        exit(1);
     }
 
     for (size_t i = 0; i < random_grm_vec.size(); ++i) {
         const std::int64_t column_index = random_grm_vec[i];
         if (column_index < 0 || static_cast<size_t>(column_index) >= m_data_vec.size()) {
-            spdlog::error("GRM ID column index {} is out of range for phenotype data with {} columns",
+            fatal_error("GRM ID column index {} is out of range for phenotype data with {} columns",
                           column_index, m_data_vec.size());
-            exit(1);
         }
 
         const std::unordered_set<string> grm_id_set(grm_id_used_vec_vec[i].begin(),
@@ -258,9 +250,8 @@ void PHEN::update_keep_indices_by_non_missing_values(const vector<std::int64_t>&
 
     for (std::int64_t col : col_used_vec) {
         if (col < 0 || static_cast<size_t>(col) >= m_data_vec.size()) {
-            spdlog::error("Phenotype column index {} is out of range for data with {} columns",
+            fatal_error("Phenotype column index {} is out of range for data with {} columns",
                           col, m_data_vec.size());
-            exit(1);
         }
 
         const auto& column = m_data_vec[static_cast<size_t>(col)];
@@ -310,9 +301,8 @@ void PHEN::apply_keep_indices_to_data(){
     for (size_t i = 0; i < kept_count; ++i) {
         const std::int64_t row_index_zero_based = m_index_keep_vec[i];
         if (row_index_zero_based < 0 || static_cast<size_t>(row_index_zero_based) >= num_rows) {
-            spdlog::error("Keep index {} is out of range for phenotype data with {} rows",
+            fatal_error("Keep index {} is out of range for phenotype data with {} rows",
                           row_index_zero_based, num_rows);
-            exit(1);
         }
 
         keep_indices_zero_based[i] = static_cast<size_t>(row_index_zero_based);
@@ -363,14 +353,12 @@ void PHEN::read_and_filter(const string& pheno_file,
     PHEN::read_all_columns_raw(pheno_file, m_data_vec);
 
     if (m_data_vec.empty()) {
-        spdlog::error("No phenotype columns were loaded from {}", pheno_file);
-        exit(1);
+        fatal_error("No phenotype columns were loaded from {}", pheno_file);
     }
 
     const size_t num_raw_records = m_data_vec[0].size();
     if (num_raw_records == 0) {
-        spdlog::error("No phenotype records were found in {}", pheno_file);
-        exit(1);
+        fatal_error("No phenotype records were found in {}", pheno_file);
     }
 
     spdlog::info("Loaded {} phenotype records", num_raw_records);
@@ -388,8 +376,7 @@ void PHEN::read_and_filter(const string& pheno_file,
     const double ratio = static_cast<double>(num_records_kept) /
                          static_cast<double>(num_raw_records);
     if (num_records_kept == 0) {
-        spdlog::error("No records remain after phenotype filtering.");
-        exit(1);
+        fatal_error("No records remain after phenotype filtering.");
     }
     if (ratio < 0.05) {
         spdlog::warn("{} records remain after phenotype filtering ({:.2f}% of {}).",
@@ -412,8 +399,7 @@ void PHEN::read_and_filter(const string& pheno_file,
 void PHEN::reorder_records_by_sample_id_order(const vector<string>& sample_id_order_vec){
     if (m_data_vec.empty()) {
         if (!sample_id_order_vec.empty()) {
-            spdlog::error("Cannot reorder phenotype records: no phenotype data are loaded.");
-            exit(1);
+            fatal_error("Cannot reorder phenotype records: no phenotype data are loaded.");
         }
         return;
     }
@@ -421,9 +407,8 @@ void PHEN::reorder_records_by_sample_id_order(const vector<string>& sample_id_or
     const auto& current_sample_ids = m_data_vec[0];
     const size_t num_records = current_sample_ids.size();
     if (sample_id_order_vec.size() != num_records) {
-        spdlog::error("Sample-ID order size ({}) does not match the number of retained records ({})",
+        fatal_error("Sample-ID order size ({}) does not match the number of retained records ({})",
                       sample_id_order_vec.size(), num_records);
-        exit(1);
     }
 
     std::unordered_map<string, size_t> sample_id_to_index;
@@ -431,9 +416,8 @@ void PHEN::reorder_records_by_sample_id_order(const vector<string>& sample_id_or
     for (size_t row = 0; row < num_records; ++row) {
         const auto [it, inserted] = sample_id_to_index.emplace(current_sample_ids[row], row);
         if (!inserted) {
-            spdlog::error("Duplicate sample ID '{}' found in phenotype data while reordering.",
+            fatal_error("Duplicate sample ID '{}' found in phenotype data while reordering.",
                           current_sample_ids[row]);
-            exit(1);
         }
     }
 
@@ -446,16 +430,14 @@ void PHEN::reorder_records_by_sample_id_order(const vector<string>& sample_id_or
         const auto& sample_id = sample_id_order_vec[target_row];
         const auto it = sample_id_to_index.find(sample_id);
         if (it == sample_id_to_index.end()) {
-            spdlog::error("Sample ID '{}' was requested for reordering but is absent from phenotype data.",
+            fatal_error("Sample ID '{}' was requested for reordering but is absent from phenotype data.",
                           sample_id);
-            exit(1);
         }
 
         const size_t source_row = it->second;
         if (used_index[source_row]) {
-            spdlog::error("Sample ID '{}' appears multiple times in the requested sample-ID order.",
+            fatal_error("Sample ID '{}' appears multiple times in the requested sample-ID order.",
                           sample_id);
-            exit(1);
         }
 
         used_index[source_row] = 1;
@@ -532,8 +514,7 @@ void PHEN::get_given_column(std::int64_t column_index, VectorXd& values) const{
  */
 void PHEN::get_columns_as_matrix(const vector<std::int64_t>& column_indices, MatrixXd& matrix) const{
     if (m_data_vec.empty()) {
-        spdlog::error("Cannot access phenotype columns: no phenotype data are loaded.");
-        exit(1);
+        fatal_error("Cannot access phenotype columns: no phenotype data are loaded.");
     }
 
     const Eigen::Index num_rows = static_cast<Eigen::Index>(m_data_vec[0].size());
@@ -572,8 +553,7 @@ MatrixXd PHEN::build_fixed_effect_design_matrix(const vector<std::int64_t>& cova
                                                 const vector<std::int64_t>& trait_columns,
                                                 MatrixXd& response_matrix) const{
     if (m_data_vec.empty()) {
-        spdlog::error("Cannot build a fixed-effect design matrix: no phenotype data are loaded.");
-        exit(1);
+        fatal_error("Cannot build a fixed-effect design matrix: no phenotype data are loaded.");
     }
 
     const Eigen::Index num_rows = static_cast<Eigen::Index>(m_data_vec[0].size());
@@ -669,9 +649,8 @@ MatrixXd PHEN::build_design_block_for_class(std::int64_t effect_column,
         const auto [it, inserted] =
             class_level_to_column.emplace(class_levels[static_cast<size_t>(level_index)], level_index);
         if (!inserted) {
-            spdlog::error("Duplicated class level '{}' is not allowed for fixed-effect design construction.",
+            fatal_error("Duplicated class level '{}' is not allowed for fixed-effect design construction.",
                           class_levels[static_cast<size_t>(level_index)]);
-            exit(1);
         }
     }
 
@@ -680,9 +659,8 @@ MatrixXd PHEN::build_design_block_for_class(std::int64_t effect_column,
     for (Eigen::Index row_index = 0; row_index < num_rows; ++row_index) {
         const auto it = class_level_to_column.find(class_values[static_cast<size_t>(row_index)]);
         if (it == class_level_to_column.end()) {
-            spdlog::error("Categorical level '{}' in column {} is missing from the provided class level set.",
+            fatal_error("Categorical level '{}' in column {} is missing from the provided class level set.",
                           class_values[static_cast<size_t>(row_index)], effect_column);
-            exit(1);
         }
 
         design_block(row_index, it->second) = 1.0;
@@ -719,9 +697,8 @@ void PHEN::append_random_effect_design_triplets(std::int64_t effect_column,
         const auto [it, inserted] = class_level_to_index.emplace(class_levels[static_cast<size_t>(level_index)],
                                                                  level_index);
         if (!inserted) {
-            spdlog::error("Duplicated class level '{}' is not allowed for random-effect design construction.",
+            fatal_error("Duplicated class level '{}' is not allowed for random-effect design construction.",
                           class_levels[static_cast<size_t>(level_index)]);
-            exit(1);
         }
     }
 
@@ -791,9 +768,8 @@ void PHEN::remove_dependent_design_columns(MatrixXd& design_matrix,
 
     for (std::int64_t removed_column : removed_column_indices) {
         if (removed_column < 0 || static_cast<size_t>(removed_column) >= fixed_effect_names.size()) {
-            spdlog::error("Removed design-matrix column {} is out of range for {} fixed-effect labels.",
+            fatal_error("Removed design-matrix column {} is out of range for {} fixed-effect labels.",
                           removed_column, fixed_effect_names.size());
-            exit(1);
         }
         fixed_effect_names[static_cast<size_t>(removed_column)] += " 0 0";
     }

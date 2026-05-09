@@ -17,6 +17,7 @@
 #include "EigenMatrix_utils.hpp"
 #include "partitionLowerTriangle.hpp"
 #include "geno.hpp"
+#include "../utils/fatal_error.hpp"
 
 
 using Eigen::VectorXd;
@@ -192,8 +193,7 @@ void Gmatrix::out_num_snp_used() {
 MatrixXd Gmatrix::agmatrix(std::int64_t npart_snp, double maf, double missing_rate_cut, int code_type) {
     spdlog::info("Computing Additive Relationship Matrix");
     if (npart_snp <= 0) {
-        spdlog::error("--npart-snp must be a positive integer");
-        std::exit(1);
+        fatal_error("--npart-snp must be a positive integer");
     }
 
     // The output stores the current row block against all preceding columns.
@@ -288,8 +288,7 @@ MatrixXd Gmatrix::agmatrix(std::int64_t npart_snp, double maf, double missing_ra
         m_scale = m_num_snp_used;
     }
     if (m_scale <= 0.0) {
-        spdlog::error("No SNPs/features remain after filtering; cannot scale the GRM");
-        std::exit(1);
+        fatal_error("No SNPs/features remain after filtering; cannot scale the GRM");
     }
 
     spdlog::info("Number of used SNPs: {}", m_num_snp_used);
@@ -314,12 +313,10 @@ MatrixXd Gmatrix::agmatrix(std::int64_t npart_snp, double maf, double missing_ra
 MatrixXd Gmatrix::dgmatrix_as(std::int64_t npart_snp, double maf, double missing_rate_cut, int code_type){
     spdlog::info("Biological genotypic dominance relationship matrix");
     if(m_input_geno_fmt != 0){
-        spdlog::error("Input genotype file must be plink bed file given by --bfile");
-        exit(1);
+        fatal_error("Input genotype file must be plink bed file given by --bfile");
     }
     if (npart_snp <= 0) {
-        spdlog::error("--npart-snp must be a positive integer");
-        std::exit(1);
+        fatal_error("--npart-snp must be a positive integer");
     }
 
     MatrixXd mat = MatrixXd::Zero(m_num_id_read, m_start_id + m_num_id_read);
@@ -403,8 +400,7 @@ MatrixXd Gmatrix::dgmatrix_as(std::int64_t npart_snp, double maf, double missing
         m_scale = m_num_snp_used;
     }
     if (m_scale <= 0.0) {
-        spdlog::error("No SNPs remain after filtering; cannot scale the GRM");
-        std::exit(1);
+        fatal_error("No SNPs remain after filtering; cannot scale the GRM");
     }
     spdlog::info("Number of used SNPs: {}", m_num_snp_used);
     spdlog::info("Scale factor of GRM: {}", m_scale);
@@ -426,12 +422,10 @@ MatrixXd Gmatrix::dgmatrix_as(std::int64_t npart_snp, double maf, double missing
 MatrixXd Gmatrix::dgmatrix_gs(std::int64_t npart_snp, double maf, double missing_rate_cut, int code_type){
     spdlog::info("Statistical breeding dominance relationship matrix");
     if(m_input_geno_fmt != 0){
-        spdlog::error("Input genotype file must be plink bed file given by --bfile");
-        exit(1);
+        fatal_error("Input genotype file must be plink bed file given by --bfile");
     }
     if (npart_snp <= 0) {
-        spdlog::error("--npart-snp must be a positive integer");
-        std::exit(1);
+        fatal_error("--npart-snp must be a positive integer");
     }
 
     MatrixXd mat = MatrixXd::Zero(m_num_id_read, m_start_id + m_num_id_read);
@@ -518,8 +512,7 @@ MatrixXd Gmatrix::dgmatrix_gs(std::int64_t npart_snp, double maf, double missing
         m_scale = m_num_snp_used;
     }
     if (m_scale <= 0.0) {
-        spdlog::error("No SNPs remain after filtering; cannot scale the GRM");
-        std::exit(1);
+        fatal_error("No SNPs remain after filtering; cannot scale the GRM");
     }
 
     spdlog::info("Number of used SNPs: {}", m_num_snp_used);

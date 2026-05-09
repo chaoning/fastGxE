@@ -27,7 +27,7 @@ Eigen::MatrixXd computeCorrelationMatrix(const Eigen::MatrixXd& mat);
  * @param mat Matrix to modify.
  * @param col_to_remove Zero-based column indices to remove.
  */
-void remove_col(Eigen::MatrixXd& mat, std::vector<std::int64_t> col_to_remove);
+void remove_col(Eigen::MatrixXd& mat, const std::vector<std::int64_t>& col_to_remove);
 
 /**
  * @brief Scale matrix columns in place.
