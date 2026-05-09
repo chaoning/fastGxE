@@ -2,6 +2,7 @@
 layout: page
 title: Tutorial
 description:
+order: 3
 ---
 
 This tutorial walks through the example data bundled with `fastGxE` and follows the current command-line workflow implemented in the codebase.

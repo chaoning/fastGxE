@@ -2,6 +2,7 @@
 layout: page
 title: Installation
 description: ~
+order: 2
 ---
 
 `fastGxE` is a C++ command-line tool for genome-wide genotype-by-environment analysis. This page describes two installation paths:

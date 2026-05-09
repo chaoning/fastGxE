@@ -23,15 +23,13 @@ collections:
 # Navigation menu
 nav:
   - title: "About"
-    url: /documentation/
+    url: /documentation/01_About/
   - title: "Installation"
-    url: /documentation/
-  - title: "Data Input"
-    url: /documentation/
+    url: /documentation/02_installation/
   - title: "Tutorial"
-    url: /documentation/
+    url: /documentation/03_Tutorial/
   - title: "Experiments"
-    url: /documentation/
+    url: /documentation/04_Experiments/
 
 
 # Navigation links
@@ -91,8 +89,8 @@ social:
     enabled: false  # Set to false to disable Facebook integration
 
 # Website analytics
-analytics:
-  google: "UA-123456-1"  # Replace with your actual Google Analytics tracking ID
+# analytics:
+#   google: ""  # Add your Google Analytics tracking ID here if needed
 
 # Markdown parser
 markdown: kramdown
