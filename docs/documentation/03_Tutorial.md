@@ -284,9 +284,9 @@ from mmsusie import MMSuSiESp
 model = MMSuSiESp()
 
 # Input files (run from the example/ directory)
-bed_file = "test"                        # PLINK genotype prefix
-grm_file = "output/test"                 # sparse GRM prefix from --process-grm --reformat
-pheno_file = "test_simu_pheno.txt"       # phenotype/covariate table
+bed_file = "test"                           # PLINK genotype prefix
+grm_file = "output/test"                    # sparse GRM prefix from --process-grm --reformat
+pheno_file = "test_simu_pheno.txt"          # phenotype/covariate table
 env_int = [f"E{i}" for i in range(1, 41)]  # environment columns to fine-map
 
 # Step 1: LD-prune significant GxE hits to obtain one lead SNP per locus.
@@ -308,7 +308,7 @@ trait = "pheno"                        # phenotype column in pheno_file
 varcom_file = "output/test_gxe.var"   # variance components estimated by fastGxE
 out_file = "output/test_mmsusie"      # output file prefix
 
-res_dct = model.run(
+res_dct = model.mmsusie_lead_gxe(
     pheno_file,
     trait,
     env_int,
@@ -317,15 +317,19 @@ res_dct = model.run(
     snp_id,
     varcom_file,
     out_file,
-    L=10,             # maximum number of causal environments
-    maxiter=100,      # maximum ELBO iterations
-    tol=1e-3,         # convergence tolerance on ELBO
-    coverage=0.95,    # credible set coverage level
-    min_abs_corr=0.5, # minimum purity for a credible set to be reported
+    L=10,                # maximum number of causal environments
+    maxiter=100,         # maximum ELBO iterations
+    tol=1e-3,            # convergence tolerance on ELBO
+    coverage=0.95,       # credible set coverage level
+    min_abs_corr=0.5,    # minimum purity for a credible set to be reported
+    estimate_sigma=True, # re-estimate prior variance during fitting
 )
 
-# res_dct["cs"]  — credible sets: each set contains environments with cumulative PIP >= coverage
-# res_dct["pip"] — per-environment posterior inclusion probabilities
+# res_dct["cs"]             — credible sets: environments with cumulative PIP >= coverage
+# res_dct["pip"]            — per-environment posterior inclusion probabilities (DataFrame)
+# res_dct["alpha"]          — L x p posterior assignment probabilities per component
+# res_dct["mu"]             — L x p posterior mean effects per component
+# res_dct["elbo"]           — ELBO values across iterations (convergence diagnostic)
 print(res_dct["cs"])
 df_pip = res_dct["pip"]
 print(df_pip)
@@ -334,7 +338,7 @@ print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of inter
 
 ### Output files
 
-`model.run()` writes four result files under the given `out_file` prefix:
+`model.mmsusie_lead_gxe()` writes four result files under the given `out_file` prefix:
 
 | File | Contents |
 | --- | --- |
