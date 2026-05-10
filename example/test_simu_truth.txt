@@ -1,0 +1,9 @@
+effect_type	snp_index0	snp_id	env	target_variance	beta
+focused_gxe_snp	182396.0	rs10849216	E13,E20	0.4	
+focused_gxe_env	182396.0	rs10849216	E13	0.4	0.40445953850709476
+focused_gxe_env	182396.0	rs10849216	E20	0.4	-0.1323534406764069
+h2_env				0.01	
+h2_g				0.3	
+h2_gxe_background				0.09999999999999998	
+h2_gxe_focus				0.4	
+resid_var				0.18999999999999995	
