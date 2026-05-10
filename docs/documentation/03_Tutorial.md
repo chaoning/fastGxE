@@ -323,7 +323,7 @@ res_dct = model.mmsusie_lead_gxe(
     tol=1e-3,            # convergence tolerance on ELBO
     coverage=0.95,       # credible set coverage level
     min_abs_corr=0.5,    # minimum purity for a credible set to be reported
-    estimate_sigma=True, # re-estimate prior variance during fitting
+    estimate_sigma=False, # use fixed prior variance during fitting
 )
 
 # res_dct["cs"]             — credible sets: environments with cumulative PIP >= coverage
