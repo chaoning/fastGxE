@@ -132,19 +132,19 @@
 /* ---------- Brand accents (split by color scheme) ------------------------ */
 @media (prefers-color-scheme: light) {
     .scope-markdown blockquote {
-        border-left-color: #d32f2f;
+        border-left-color: #0277bd;
     }
     .scope-markdown h1 {
-        border-bottom-color: #d32f2f;
+        border-bottom-color: #0277bd;
     }
 }
 
 @media (prefers-color-scheme: dark) {
     .scope-markdown blockquote {
-        border-left-color: #00ceff;
+        border-left-color: #38c6ff;
     }
     .scope-markdown h1 {
-        border-bottom-color: #00ceff;
+        border-bottom-color: #38c6ff;
     }
     /* Slightly stronger overlays read better on dark backgrounds. */
     .scope-markdown :not(pre) > code {
@@ -160,3 +160,18 @@
         box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
     }
 }
+
+/* ---------- Navbar polish (theme-wide, not scoped to content) ------------ */
+.navbar-custom {
+    box-shadow: 0 1px 0 rgba(136, 136, 136, 0.18);
+}
+
+.navbar-custom .navbar-brand {
+    font-weight: 800;
+    letter-spacing: -0.02em;
+}
+
+.navbar-custom .nav-link {
+    font-weight: 600;
+}
+

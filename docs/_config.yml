@@ -57,19 +57,19 @@ links:
 ui:
   mode: 'auto'  # Options: 'auto', 'dark', 'light'
   brand:
-    dark: "#00ceff"
-    light: "#d32f2f"  # Adjusted to a softer red
+    dark: "#38c6ff"   # cyan brand for dark mode
+    light: "#0277bd"  # scientific blue brand for light mode
   border_color:
     dark: "#5f5f5f"
-    light: "#dee2e6"
+    light: "#dbe4ea"  # slightly cool border to match the blue scheme
   header:
     trianglify: true
     dark:
-      color1: "#0a1f33"  # Adjusted for a more cohesive color scheme
-      color2: "#2c4964"
+      color1: "#0a1f33"  # deep navy
+      color2: "#2c6f97"  # steel blue
     light:
-      color1: "#1b0530"
-      color2: "#88435c"
+      color1: "#0a2540"  # deep navy
+      color2: "#2a6f97"  # steel blue
   masthead:
     color:
       dark: "#ffffff"
