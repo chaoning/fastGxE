@@ -12,8 +12,8 @@ project:
 
 # License information
 license:
-  software: MIT
-  software_url: https://mit-license.org/
+  software: GPL-3.0
+  software_url: https://www.gnu.org/licenses/gpl-3.0.html
 
 collections:
   documentation:
