@@ -135,26 +135,31 @@ fastgxe --test-main \
   --out output/test_main
 ```
 
-Main outputs are:
+All result files are tab-separated. The main outputs are:
 
-- `output/test_main.var`
-- `output/test_main.random.res`
-- `output/test_main.res`
+- `output/test_main.assoc` — genome-wide association results
+- `output/test_main.var` — estimated variance components with standard errors
+- `output/test_main.h2` — heritability decomposition (`G`, `residual`, `total`)
+- `output/test_main.gamma` — random-SNP calibration summary
 
-`test_main.res` contains one row per SNP with the columns:
+`test_main.assoc` contains one row per SNP with the columns:
 
-- `order chrom SNP cm base allele1 allele2 af missing beta se p`
+- `order chrom SNP base allele1 allele2 af N beta se p`
+
+Here `af` is the allele frequency and `N` is the number of non-missing genotypes for that SNP.
 
 ### Useful options
 
 - `--covar` adds continuous covariates.
 - `--class` adds categorical covariates.
-- `--p-cut` filters the final output by p-value. The default `2` keeps all SNPs.
-- `--num-random-snp` controls the number of random SNPs used in calibration.
+- `--num-random-snp` controls the number of random SNPs used for calibration (default `1000`).
+- `--log-transform` applies a natural-log transform to the raw phenotype (all values must be positive).
+- `--inv-normal` applies a rank-based inverse-normal transform to the phenotype.
+- `--keep-random` additionally writes the per-SNP calibration file `output/test_main.random.assoc` (off by default; the scalar calibration factor is always written to `*.gamma`).
 
 ### Variance components only
 
-If you omit `--bfile`, the command still fits the variance components and writes `*.var`, then stops before the genome-wide SNP scan.
+If you omit `--bfile`, the command still fits the variance components and writes `*.var` and `*.h2`, then stops before the genome-wide SNP scan.
 
 ## 4. Test GxE interactions
 
@@ -172,19 +177,27 @@ fastgxe --test-gxe \
 
 This command treats `E1` through `E40` as the interacting environments.
 
-Main outputs are:
+All result files are tab-separated. The main outputs are:
 
-- `output/test_gxe.var`
-- `output/test_gxe.main.random.res`
-- `output/test_gxe.GxEnoMain.random.res`
-- `output/test_gxe.GxE.random.res`
-- `output/test_gxe.res`
+- `output/test_gxe.assoc` — main results: SNP main effect and combined GxE p-values
+- `output/test_gxe.perE.assoc` — single-environment interaction tests (one triplet per environment)
+- `output/test_gxe.var` — estimated variance components with standard errors
+- `output/test_gxe.h2` — heritability decomposition (`G`, `GxE`, `NxE`, `residual`, `total`)
+- `output/test_gxe.gamma` — random-SNP calibration summary
 
-The final `test_gxe.res` file contains:
+`test_gxe.assoc` contains, per SNP:
 
+- SNP annotation: `order chrom SNP base allele1 allele2 af N`
 - SNP main-effect estimates: `beta_main`, `se_main`, `p_main`
-- one `beta`, `se`, `p` triplet for each interacting environment
 - combined GxE summary columns: `p_single`, `p_multi`, `p_gxe`
+
+`test_gxe.perE.assoc` contains the same SNP annotation, followed by a `beta_<env>`, `se_<env>`, `p_<env>` triplet for **each** interacting environment (columns are named after the environment, e.g. `beta_E1 se_E1 p_E1`).
+
+### Useful options
+
+- `--exact-cut` sets the adaptive exact-refit threshold (default `1e-5`): a promising SNP whose fast approximate p-value falls below this is recomputed exactly, so top hits get exact p-values while the genome-wide scan stays fast. Set to `0` for pure approximation or `1` to always refit exactly.
+- `--log-transform` / `--inv-normal` transform the phenotype. For `--test-gxe` the inverse-normal transform is applied to the residual **after** covariate/environment correction.
+- `--keep-random` also writes the per-SNP calibration files (`*.main.random.assoc`, `*.GxEnoMain.random.assoc`, `*.GxE.random.assoc`); off by default.
 
 ### Important defaults
 
@@ -292,7 +305,7 @@ env_int = [f"E{i}" for i in range(1, 41)]  # environment columns to fine-map
 
 # Step 1: LD-prune significant GxE hits to obtain one lead SNP per locus.
 # ld_pure keeps the most significant SNP in each LD block (r² < ld_r2).
-assoc_file = "output/test_gxe.res"
+assoc_file = "output/test_gxe.assoc"
 df_leading = model.ld_pure(
     assoc_file,
     bed_file,

@@ -22,6 +22,14 @@ namespace {
 constexpr double kMissingGenotypeValue = -9.0;
 constexpr unsigned char kBedGenotypeMask = 0x03;
 
+// Returns a .bim annotation line with the genetic-distance (cM) field removed,
+// i.e. "chrom SNP cm base allele1 allele2" -> "chrom SNP base allele1 allele2".
+inline std::string bim_line_without_cm(const std::string& bim_line) {
+    std::vector<std::string> f = split_string(bim_line);
+    if (f.size() >= 6) f.erase(f.begin() + 2);
+    return join_string(f, " ");
+}
+
 inline std::int64_t bed_bytes_per_snp(std::int64_t num_id) {
     return (num_id + 3) / 4;
 }
@@ -253,7 +261,7 @@ vector<string> GENO::snp_anno(std::int64_t start_snp, std::int64_t num_snp_read)
                           num_snp_read, start_snp, bim_file);
         }
         process_line(one_line);
-        snp_anno_vec.push_back(one_line);
+        snp_anno_vec.push_back(bim_line_without_cm(one_line));
     }
     return snp_anno_vec;
 }
@@ -298,11 +306,12 @@ vector<string> GENO::snp_anno_by_snp_index(const vector<std::int64_t>& snp_index
             ++current_snp_index;
         }
         process_line(one_line);
-        snp_anno_vec[requested_indices[request_idx].second] = one_line;
+        const string anno = bim_line_without_cm(one_line);
+        snp_anno_vec[requested_indices[request_idx].second] = anno;
         while (request_idx + 1 < requested_indices.size() &&
                requested_indices[request_idx + 1].first == target_snp_index) {
             ++request_idx;
-            snp_anno_vec[requested_indices[request_idx].second] = one_line;
+            snp_anno_vec[requested_indices[request_idx].second] = anno;
         }
     }
     return snp_anno_vec;

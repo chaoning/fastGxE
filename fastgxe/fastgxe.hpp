@@ -39,6 +39,7 @@ protected:
 
     vector<string>  m_id_in_data_vec;
     vector<string>  m_trait_name_vec;
+    vector<string>  m_bye_name_vec;
 
     // Phenotype, fixed-effect design and interacting environments.
     MatrixXd m_y, m_xmat, m_bye_mat;
@@ -46,12 +47,6 @@ protected:
     VectorXd m_enviW_Vec;
     MatrixXd m_y_trans, m_xmat_trans;
     VectorXd m_varcom_null;
-    VectorXd m_binary_mu;
-    VectorXd m_binary_eta;
-    VectorXd m_binary_working_response;
-    VectorXd m_joint_binary_mu;
-    VectorXd m_joint_binary_eta;
-    VectorXd m_joint_working_response;
 
     // GRM blocks and the sparse/full representations derived from them.
     vector<MatrixXd> m_grm_mat_group_vec;
@@ -119,7 +114,7 @@ public:
             const vector<std::int64_t>& bye_arr, const vector<std::int64_t>& trait,
             const vector<string>& missing_in_data_vec);
     void process_grm(bool use_eigen);
-    void pre_data_GxE(bool standardize_env, bool phen_correct);
+    void pre_data_GxE(bool standardize_env, bool phen_correct, bool inv_normal);
 
     // Utility helpers reused by different scan modes.
     void reset_output_prefix(const string& out_file, std::int64_t first, std::int64_t second);
@@ -128,48 +123,32 @@ public:
 
     // Null-model fitting and genome-wide scans for SNP main effects.
     VectorXd varcom_main(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
-    VectorXd varcom_main_binary(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
-    VectorXd varcom_main_binary_continuous(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
-    VectorXd varcom_main_multitrait_continuous(VectorXd& init_varcom, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
     void test_main(const string& bed_file,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut, 
-                int maxiter, double cc_par, double cc_gra);
-    void test_main_binary(const string& bed_file,
-                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra);
-    void test_main_binary_continuous(const string& bed_file,
-                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra);
-    void test_main_multitrait_continuous(const string& bed_file,
-                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra);
-    void output(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
+                bool keep_random,
+                std::int64_t num_random_snp,
+                double maf_cut, double missing_rate_cut);
+    void output(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
                 const double* eff_arr, const double* se_arr, const VectorXd& p_arr,
-                std::int64_t start_snp, std::int64_t num_snp_read, double p_cut);
+                std::int64_t start_snp, std::int64_t num_snp_read);
 
     // Null-model fitting and genome-wide scans for SNP-by-environment effects.
     VectorXd varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0);
 
     void test_GxE_multi(const string& bed_file, std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut);
+                bool exact, std::int64_t num_random_snp,
+                double p_approx_cut, double maf_cut, double missing_rate_cut);
     void output_GxE_multi(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
             const VectorXd& beta_main_Vec, const VectorXd& se_main_Vec, const VectorXd& p_main_Vec,
             const VectorXd& score_Vec, const VectorXd& p_Vec, std::int64_t start_snp, std::int64_t num_snp_read);
 
     void test_GxE(const string& bed_file,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut);
-    void output_GxE(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
+                bool keep_random,
+                double exact_cut, std::int64_t num_random_snp,
+                double p_approx_cut, double maf_cut, double missing_rate_cut);
+    void output_GxE(std::ofstream& fout, std::ofstream& fout_single,
+            const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
             const MatrixXd& beta_mat, const MatrixXd& se_mat, const MatrixXd& p_mat, const MatrixXd& p_combined_Mat,
             std::int64_t start_snp, std::int64_t num_snp_read);
 

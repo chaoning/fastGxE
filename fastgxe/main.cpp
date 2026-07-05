@@ -4,184 +4,190 @@
  * @Date: 2025-01-30
  * LastEditors: Chao Ning
  * LastEditTime: 2026-04-12 22:40:00
+ *
+ * What this file does
+ * -------------------
+ * fastGxE is one executable that contains several independent sub-tools. This
+ * file is just the "front desk": it looks at the command line, decides which
+ * sub-tool the user wants, and forwards the original arguments to that tool.
+ * It does NOT parse the detailed options (each sub-tool does that itself).
+ *
+ * The sub-tools and the flag that selects each one:
+ *
+ *     --make-grm      ->  Gmatrix      build a genomic relationship matrix (GRM)
+ *     --process-grm   ->  ProcessGRM   post-process an existing GRM
+ *     --test-main     ->  fastGxE      SNP main-effect association scan
+ *     --test-gxe      ->  fastGxE      SNP-by-environment (GxE) association scan
+ *     --mom           ->  MoM          Method-of-Moments GxE heritability
+ *
+ * --test-main and --test-gxe both run the fastGxE class, so here they count as
+ * the SAME choice (Tool::Association); fastGxE::run() tells them apart later.
+ *
+ * The rule enforced here: the user must pick exactly one tool.
  */
 
-#include <cstdlib>
-#include <iostream>
-#include <string_view>
+#include <cstdlib>      // std::strtol
+#include <iostream>     // std::cout
+#include <string_view>  // std::string_view (cheap string comparisons, no copies)
 
-#include <spdlog/spdlog.h>
+#include <spdlog/spdlog.h>  // logging for error messages
 
-#include "fastgxe.hpp"
-#include "gmatrix.hpp"
-#include "mom.hpp"
-#include "processGRM.hpp"
+#include "fastgxe.hpp"     // fastGxE     (--test-main / --test-gxe)
+#include "gmatrix.hpp"     // Gmatrix     (--make-grm)
+#include "mom.hpp"         // MoM         (--mom)
+#include "processGRM.hpp"  // ProcessGRM  (--process-grm)
 
-namespace {
+namespace {  // everything below is private to this file
 
-enum class DispatchTarget {
-    none,
-    grm,
-    process_grm,
-    association,
-    mom
+// ---------------------------------------------------------------------------
+// Which sub-tool to run
+// ---------------------------------------------------------------------------
+
+// The five possible choices. `None` means "no tool was requested".
+enum class Tool {
+    None,
+    MakeGrm,
+    ProcessGrm,
+    Association,  // shared by --test-main and --test-gxe
+    Mom
 };
 
-struct DispatchSelection {
-    DispatchTarget target = DispatchTarget::none;
-    bool conflict = false;
-};
-
-bool matches_option(std::string_view arg, std::string_view short_opt, std::string_view long_opt) {
-    return arg == short_opt || arg == long_opt;
+// Looks at ONE command-line word and returns the tool it selects (or None if
+// the word is not a tool flag, e.g. a file name or a value).
+Tool tool_for_flag(std::string_view arg) {
+    if (arg == "-m" || arg == "--make-grm")     return Tool::MakeGrm;
+    if (arg == "-d" || arg == "--process-grm")  return Tool::ProcessGrm;
+    if (arg == "-g" || arg == "--test-main" ||
+        arg == "-x" || arg == "--test-gxe")     return Tool::Association;
+    if (arg == "-o" || arg == "--mom")          return Tool::Mom;
+    return Tool::None;
 }
 
+// Outcome of scanning the whole command line for a tool flag.
+struct ToolChoice {
+    Tool tool = Tool::None;
+    bool conflict = false;  // true if two DIFFERENT tools were both requested
+};
+
+// Walks every argument and decides which single tool was asked for.
+//   - words that are not tool flags are ignored
+//   - the first tool flag wins
+//   - a second, DIFFERENT tool flag is an error (conflict = true)
+//   - repeating the same tool flag is fine
+ToolChoice choose_tool(int argc, char* argv[]) {
+    ToolChoice choice;
+    for (int i = 1; i < argc; ++i) {  // start at 1: argv[0] is the program name
+        const Tool t = tool_for_flag(argv[i]);
+        if (t == Tool::None) continue;          // not a tool flag
+
+        if (choice.tool == Tool::None) {
+            choice.tool = t;                    // remember the first tool
+        } else if (choice.tool != t) {
+            choice.conflict = true;             // a different tool -> conflict
+            return choice;
+        }
+    }
+    return choice;
+}
+
+// Creates the requested tool object, runs it with the ORIGINAL command line,
+// and returns its exit code. Each tool parses its own options inside run().
+int run_tool(Tool tool, int argc, char* argv[]) {
+    switch (tool) {
+        case Tool::MakeGrm:     return Gmatrix{}.run(argc, argv);
+        case Tool::ProcessGrm:  return ProcessGRM{}.run(argc, argv);
+        case Tool::Association: return fastGxE{}.run(argc, argv);
+        case Tool::Mom:         return MoM{}.run(argc, argv);
+        case Tool::None:        return 1;  // should never happen; fail safely
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Help handling
+// ---------------------------------------------------------------------------
+
+// What kind of help (if any) the user asked for.
+//   asked == false           -> no -h/--help on the command line
+//   asked == true,  topic 0  -> general help (bare "-h", or "-h" + non-number)
+//   asked == true,  topic >0 -> help for a specific numbered topic ("-h 3")
+struct HelpRequest {
+    bool asked = false;
+    int topic = 0;
+};
+
+// True for "-h" or "--help".
 bool is_help_flag(std::string_view arg) {
     return arg == "-h" || arg == "--help";
 }
 
-DispatchTarget target_for_argument(std::string_view arg) {
-    if (matches_option(arg, "-m", "--make-grm")) {
-        return DispatchTarget::grm;
-    }
-    if (matches_option(arg, "-d", "--process-grm")) {
-        return DispatchTarget::process_grm;
-    }
-    if (arg == "-g" || arg == "-x" ||
-            arg == "--test-main" || arg == "--test-main-binary" ||
-            arg == "--test-main-binary-continuous" ||
-            arg == "--test-main-multitrait-continuous" ||
-            arg == "--test-gxe") {
-        return DispatchTarget::association;
-    }
-    if (matches_option(arg, "-o", "--mom")) {
-        return DispatchTarget::mom;
-    }
-    return DispatchTarget::none;
-}
-
-DispatchSelection resolve_dispatch_target(int argc, char* argv[]) {
-    DispatchSelection selection;
-    for (int i = 1; i < argc; ++i) {
-        const DispatchTarget arg_target = target_for_argument(argv[i]);
-        if (arg_target == DispatchTarget::none) {
-            continue;
-        }
-
-        if (selection.target == DispatchTarget::none) {
-            selection.target = arg_target;
-            continue;
-        }
-
-        if (selection.target != arg_target) {
-            selection.conflict = true;
-            return selection;
-        }
-    }
-    return selection;
-}
-
-int dispatch_to_target(DispatchTarget target, int argc, char* argv[]) {
-    switch (target) {
-        case DispatchTarget::grm: {
-            Gmatrix grm_runner;
-            return grm_runner.run(argc, argv);
-        }
-        case DispatchTarget::process_grm: {
-            ProcessGRM process_grm_runner;
-            return process_grm_runner.run(argc, argv);
-        }
-        case DispatchTarget::association: {
-            fastGxE association_runner;
-            return association_runner.run(argc, argv);
-        }
-        case DispatchTarget::mom: {
-            MoM mom_runner;
-            return mom_runner.run(argc, argv);
-        }
-        case DispatchTarget::none:
-            return 1;
-    }
-
-    return 1;
-}
-
-int dispatch_help_to_target(DispatchTarget target, const char* program_name) {
-    char help_flag[] = "--help";
-    char* help_argv[] = {const_cast<char*>(program_name), help_flag, nullptr};
-    return dispatch_to_target(target, 2, help_argv);
-}
-
-DispatchTarget help_topic_to_target(int help_topic) {
-    switch (help_topic) {
-        case 1:
-            return DispatchTarget::grm;
-        case 2:
-            return DispatchTarget::process_grm;
-        case 3:
-        case 4:
-        case 6:
-            return DispatchTarget::association;
-        case 5:
-            return DispatchTarget::mom;
-        default:
-            return DispatchTarget::none;
-    }
-}
-
-bool parse_help_topic(std::string_view arg, int& help_topic) {
-    if (arg.empty()) {
-        return false;
-    }
-
-    char* parse_end = nullptr;
-    const long parsed_value = std::strtol(std::string(arg).c_str(), &parse_end, 10);
-    if (parse_end == nullptr || *parse_end != '\0') {
-        return false;
-    }
-
-    help_topic = static_cast<int>(parsed_value);
+// Tries to read `arg` as a whole base-10 integer (e.g. the "3" in "-h 3").
+// Succeeds only if the ENTIRE word is a number ("3" yes, "3x" no, "abc" no).
+bool try_parse_int(std::string_view arg, int& out) {
+    if (arg.empty()) return false;
+    char* end = nullptr;
+    const long value = std::strtol(std::string(arg).c_str(), &end, 10);
+    if (end == nullptr || *end != '\0') return false;  // leftover characters -> not a pure int
+    out = static_cast<int>(value);
     return true;
 }
 
-int resolve_help_topic(int argc, char* argv[]) {
+// Scans the command line for the first help flag and, if present, the numeric
+// topic that follows it. See HelpRequest above for the meaning of the fields.
+//
+// Note (kept identical to the original tool): a help flag followed by a number
+// <= 0 (e.g. "-h 0" or "-h -3") is treated as general help.
+HelpRequest scan_help(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
-        if (!is_help_flag(argv[i])) {
-            continue;
-        }
+        if (!is_help_flag(argv[i])) continue;
 
-        if (i + 1 < argc) {
-            int help_topic = 0;
-            if (parse_help_topic(argv[i + 1], help_topic)) {
-                return help_topic;
-            }
+        HelpRequest help;
+        help.asked = true;
+
+        // If the next word is a positive number, treat it as a topic.
+        int topic = 0;
+        if (i + 1 < argc && try_parse_int(argv[i + 1], topic) && topic > 0) {
+            help.topic = topic;
         }
-        return 0;
+        return help;  // only the first help flag matters
     }
-
-    return -1;
+    return HelpRequest{};  // asked == false
 }
 
-void show_help_general() {
+// Maps a numeric help topic to the tool whose help should be shown.
+// Topics 3, 4 and 6 all refer to the association module. Unknown topics
+// return Tool::None so the caller can report an error.
+Tool tool_for_help_topic(int topic) {
+    switch (topic) {
+        case 1:            return Tool::MakeGrm;
+        case 2:            return Tool::ProcessGrm;
+        case 3: case 4: case 6: return Tool::Association;
+        case 5:            return Tool::Mom;
+        default:           return Tool::None;
+    }
+}
+
+// Prints a tool's OWN detailed help by running it with a synthetic "--help"
+// command line, so each tool formats its own help text.
+int print_tool_help(Tool tool, const char* program_name) {
+    char help_flag[] = "--help";
+    char* help_argv[] = {const_cast<char*>(program_name), help_flag, nullptr};
+    return run_tool(tool, 2, help_argv);
+}
+
+// Prints the program-wide usage banner (the list of tools and a few examples).
+void print_general_help() {
     std::cout
         << "Usage:\n"
         << "  fastgxe --make-grm [options]\n"
         << "  fastgxe --process-grm [options]\n"
         << "  fastgxe --test-main [options]\n"
-        << "  fastgxe --test-main-binary [options]\n"
-        << "  fastgxe --test-main-binary-continuous [options]\n"
-        << "  fastgxe --test-main-multitrait-continuous [options]\n"
         << "  fastgxe --test-gxe [options]\n"
         << "  fastgxe --mom [options]\n\n"
         << "Top-Level Modes:\n"
         << "  -m, --make-grm           Compute the genomic relationship matrix (GRM)\n"
         << "  -d, --process-grm        Post-process an existing GRM\n"
         << "  -g, --test-main          Run the association module for SNP main effects\n"
-        << "      --test-main-binary   Run the association module for binary traits\n"
-        << "      --test-main-binary-continuous\n"
-        << "                           Run the joint binary + continuous association module\n"
-        << "      --test-main-multitrait-continuous\n"
-        << "                           Run the multitrait continuous association module\n"
         << "  -x, --test-gxe           Run the association module for GxE testing\n"
         << "  -o, --mom                Estimate GxE heritability with Method of Moments\n\n"
         << "Help:\n"
@@ -194,55 +200,62 @@ void show_help_general() {
         << "  fastgxe --make-grm --bfile data --out data_grm\n"
         << "  fastgxe --process-grm --grm data_grm --out data_grm_processed\n"
         << "  fastgxe --test-main --grm data_grm --bfile data --data pheno.txt --trait BMI --out test_main\n"
-        << "  fastgxe --test-main-binary --grm data_grm --bfile data --data pheno.txt --trait disease --out test_main_binary\n"
-        << "  fastgxe --test-main-binary-continuous --grm data_grm --bfile data --data pheno.txt --trait disease BMI --out test_main_binary_continuous\n"
-        << "  fastgxe --test-main-multitrait-continuous --grm data_grm --bfile data --data pheno.txt --trait trait1 trait2 trait3 --out test_main_multitrait_continuous\n"
         << "  fastgxe --test-gxe --grm data_grm --bfile data --data pheno.txt --trait BMI --env-int age smoking --out test_gxe\n"
         << "  fastgxe --mom --grm data_grm --data pheno.txt --trait BMI --env-int age smoking --out test_mom\n";
 }
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Entry point: a straight sequence of guard clauses, top to bottom.
+// ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+    // 1. No arguments at all -> show help and report misuse.
     if (argc == 1) {
-        show_help_general();
+        print_general_help();
         return 1;
     }
 
-    const DispatchSelection selection = resolve_dispatch_target(argc, argv);
-    if (selection.conflict) {
+    // 2. Decide which tool was requested; reject mixing two tools.
+    const ToolChoice choice = choose_tool(argc, argv);
+    if (choice.conflict) {
         spdlog::error(
             "Choose only one top-level mode among --make-grm, --process-grm, "
-            "--test-main/--test-main-binary/--test-main-binary-continuous/"
-            "--test-main-multitrait-continuous/--test-gxe, and --mom.");
-        show_help_general();
+            "--test-main/--test-gxe, and --mom.");
+        print_general_help();
         return 1;
     }
 
-    const int help_topic = resolve_help_topic(argc, argv);
-    if (help_topic >= 0) {
-        if (help_topic == 0) {
-            if (selection.target != DispatchTarget::none) {
-                return dispatch_to_target(selection.target, argc, argv);
+    // 3. Help requested? Handle it and stop here.
+    const HelpRequest help = scan_help(argc, argv);
+    if (help.asked) {
+        if (help.topic > 0) {
+            // "-h N": show that topic's tool-specific help.
+            const Tool help_tool = tool_for_help_topic(help.topic);
+            if (help_tool == Tool::None) {
+                spdlog::error("Invalid argument for -h/--help: {}", help.topic);
+                print_general_help();
+                return 1;
             }
-            show_help_general();
-            return 0;
+            return print_tool_help(help_tool, argv[0]);
         }
 
-        const DispatchTarget help_target = help_topic_to_target(help_topic);
-        if (help_target == DispatchTarget::none) {
-            spdlog::error("Invalid argument for -h/--help: {}", help_topic);
-            show_help_general();
-            return 1;
+        // Bare "--help": if a tool was also named (e.g. "--test-gxe --help"),
+        // let that tool print its own help; otherwise show the general help.
+        if (choice.tool != Tool::None) {
+            return run_tool(choice.tool, argc, argv);
         }
-        return dispatch_help_to_target(help_target, argv[0]);
+        print_general_help();
+        return 0;
     }
 
-    if (selection.target == DispatchTarget::none) {
+    // 4. No help and no tool -> nothing to do.
+    if (choice.tool == Tool::None) {
         spdlog::error("No top-level analysis mode was specified.");
-        show_help_general();
+        print_general_help();
         return 1;
     }
 
-    return dispatch_to_target(selection.target, argc, argv);
+    // 5. Normal case: run the chosen tool with the original arguments.
+    return run_tool(choice.tool, argc, argv);
 }

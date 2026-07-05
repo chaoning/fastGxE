@@ -67,22 +67,21 @@ The current project configuration is written for an Intel oneAPI-based environme
 
 ### Configure and compile
 
-Create a separate build directory and compile with CMake:
+First make the Intel oneAPI toolchain available in your shell (this puts `icpx` and the MKL / OpenMP runtime on the environment). Then configure and build:
 
 ```bash
-mkdir -p build
-cd build
-cmake ..
-cmake --build . -j
+source /path/to/intel/oneapi/setvars.sh
+cmake -S . -B build
+cmake --build build -j
 ```
 
-The main executable will be generated as:
+`fastGxE` is C++ only, and the CMake project selects the Intel `icpx` compiler by default (it is set before `project()`), so a plain `cmake -S . -B build` is enough once the oneAPI environment is sourced. To use a different compiler, override it explicitly:
 
 ```bash
-./fastgxe
+cmake -S . -B build -DCMAKE_CXX_COMPILER=/path/to/your/compiler
 ```
 
-If you are in the repository root instead of the `build/` directory, run:
+The main executable is generated at `build/fastgxe`:
 
 ```bash
 ./build/fastgxe -h

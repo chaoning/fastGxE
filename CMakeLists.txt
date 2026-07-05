@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
-project(fastgxeProject)
+
+# The compiler must be set BEFORE project() or CMake will have already detected
+# a default compiler. This project is C++ only (icpx is a C++ compiler), so the
+# language is restricted to CXX to avoid requiring a separate C compiler.
+# NOTE: source the oneAPI environment first so icpx is usable:
+#   source /home/chaoning/intel/oneapi/setvars.sh
+if(NOT CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER "/home/chaoning/intel/oneapi/compiler/2025.2/bin/icpx")
+endif()
+
+project(fastgxeProject LANGUAGES CXX)
 
 option(FASTGXE_FULL_STATIC_LINK "Link executables as fully static binaries when static runtimes are available" ON)
-
-set(CMAKE_CXX_COMPILER "/home/chaoning/intel/oneapi/compiler/2025.2/bin/icpx")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)

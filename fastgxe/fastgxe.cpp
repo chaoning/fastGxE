@@ -7,6 +7,50 @@
  * LastEditTime: 2026-04-11 20:42:12
  */
 
+// ============================================================================
+// fastGxE - Scalable genome-wide GxE / SNP main-effect association via LMM
+// ----------------------------------------------------------------------------
+// This file implements the `fastGxE` class together with a set of stateless
+// helper functions in an anonymous namespace. fastGxE is a statistical-genetics
+// tool that runs genome-wide association scans under a linear mixed model (LMM).
+//
+// Two mutually exclusive analysis modes are supported:
+//   --test-main : a SNP main-effect association scan (one variance component
+//                 for the polygenic genetic effect plus residual noise).
+//   --test-gxe  : a scalable and effective genome-wide multi-environment GxE method.
+//
+// High-level pipeline (see fastGxE::run):
+//   1. Parse CLI options (configure_run_cli / validate_run_options) and resolve
+//      requested column names against the data-file header (resolve_input_columns).
+//   2. pre_data: load phenotypes, restrict to samples present in the GRM, then
+//      REORDER individuals by their relatedness group. After reordering the GRM
+//      is block-diagonal and stored sparsely:
+//        - block 0 = unrelated singletons, stored as a diagonal (N x 1 vector);
+//        - blocks 1.. = dense small within-family kinship blocks.
+//   3. process_grm: assemble the sparse GRM. For main-effect mode it also
+//      eigen-decomposes the GRM (block-wise) so the null model becomes diagonal
+//      algebra in the GRM eigenbasis.
+//   4. Fit null-model variance components by AI-REML:
+//        - varcom_main  : 2 components via the eigendecomposition.
+//        - varcom_GxE   : up to 4 components (genetic / GxE-relationship /
+//                         noise-by-environment / residual).
+//      Cache V^{-1} (m_Vi0), the null log-likelihood (m_logL_null) and the
+//      estimated components (m_varcom_null).
+//   5. Per-SNP fast score tests reading the PLINK .bed in chunks
+//      (test_main, test_GxE, test_GxE_multi). The GxE scans calibrate
+//      approximate test statistics using a random panel of SNPs ("gamma"
+//      calibration), and combine per-environment GxE p-values with ACAT.
+//
+// Recurring numerical helpers (anonymous namespace):
+//   build_inverse_covariance_matrix - builds block-diagonal V^{-1} and log|V|.
+//   build_projection_cache/apply_projection - evaluate the fixed-effect
+//      projection P = V^{-1} - V^{-1}X (X'V^{-1}X)^{-1} X'V^{-1} without ever
+//      forming the dense n x n matrix P.
+//   find_positive_variance_update - AI/EM blended REML step that stays in the
+//      positive-variance region.
+//   build_gxe_relationship_data - environment-weighted GRM for the GxE model.
+// ============================================================================
+
 #include <cstdint>
 
 #define EIGEN_USE_MKL_ALL  // must be before include Eigen
@@ -53,18 +97,19 @@ using std::endl;
 using Eigen::HouseholderQR;
 using Eigen::ColPivHouseholderQR;
 
+// ===== Anonymous-namespace helpers (CLI, linear algebra, GRM, REML, scan) =====
 namespace {
 
 // Numerical constants for internal algorithms.
 // These are intentionally not CLI-configurable: changing them would require
 // re-validation of statistical calibration.
-constexpr double kMinVarianceComponent   = 1e-6;  // smallest allowed variance component
-constexpr double kBinaryTraitTolerance   = 1e-8;  // 0/1 phenotype rounding threshold
-constexpr double kAiEmFloor              = 1e-12; // minimum AI/EM information diagonal
-constexpr double kEmStabilityNudge       = 1e-10; // regularizer added to EM info blocks
 constexpr double kCorrMatrixNudge        = 0.001; // ridge added to environment correlation matrix
-constexpr double kProbabilityWeightFloor = 1e-6;  // minimum logistic weight to avoid division by zero
 
+// ===== CLI / option handling and header parsing =====
+
+// Reads only the first (header) line of the data file and splits it into column
+// names. Aborts via fatal_error if the file cannot be opened or the header is
+// empty. Returns the vector of column-name tokens.
 std::vector<std::string> read_header_columns(const std::string& data_file) {
     std::ifstream fin(data_file);
     if (!fin.is_open()) {
@@ -84,31 +129,24 @@ std::vector<std::string> read_header_columns(const std::string& data_file) {
     return split_string(line);
 }
 
+// Joins a list of strings with `delimiter`, or returns the literal "None" when
+// the list is empty. Used purely for human-readable logging of options.
 std::string join_or_none(const std::vector<std::string>& values,
                          const char* delimiter = ", ") {
     return values.empty() ? "None" : join_string(values, delimiter);
 }
 
-std::string sanitize_output_label(const std::string& raw_label) {
-    std::string sanitized = raw_label;
-    for (char& ch : sanitized) {
-        const unsigned char uch = static_cast<unsigned char>(ch);
-        if (!(std::isalnum(uch) || ch == '_')) {
-            ch = '_';
-        }
-    }
-    return sanitized.empty() ? "trait" : sanitized;
-}
-
+// All command-line options parsed from argv, with their default values. A single
+// instance is filled by configure_run_cli and then validated/logged.
 struct RunOptions {
     int threads = 10;
     bool test_main = false;
-    bool test_main_binary = false;
-    bool test_main_binary_continuous = false;
-    bool test_main_multitrait_continuous = false;
     bool test_gxe = false;
     bool standardize_env = true;
     bool no_noisebye = false;
+    bool log_transform = false;
+    bool inv_normal = false;
+    bool keep_random = false;
 
     std::string data_file;
     std::string agrm_file;
@@ -125,12 +163,11 @@ struct RunOptions {
     };
     std::vector<std::int64_t> split_task_vec;
 
-    std::int64_t num_random_snp = 2000;
+    std::int64_t num_random_snp = 1000;
     int npart_snp = 20;
-    int speed = 2;
+    double exact_cut = 1.0e-5;  // GxE: exact-refit when approximate p < this (0=off, 1=all)
     int maxiter = 100;
     double p_approx_cut = 1.0e-3;
-    double p_cut = 2;
     double maf_cut = 0.01;
     double missing_rate_cut = 0.05;
     double cc_par = 1.0e-7;
@@ -138,6 +175,10 @@ struct RunOptions {
     double cc_logL = 5.0e-5;
 };
 
+// ===== Internal data structures (option resolution and numerical caches) =====
+
+// Column indices (into the data-file header) resolved from the user-supplied
+// trait / covariate / class / interacting-environment names.
 struct ResolvedInputColumns {
     std::vector<std::int64_t> trait_index_vec;
     std::vector<std::int64_t> covariate_index_vec;
@@ -145,141 +186,54 @@ struct ResolvedInputColumns {
     std::vector<std::int64_t> bye_index_vec;
 };
 
+// The environment-weighted ("GxE") relationship matrix, held both as per-group
+// dense blocks and as the assembled sparse block-diagonal matrix.
 struct GxeRelationshipData {
     std::vector<MatrixXd> group_blocks;
     SparseMatrix<double> sparse_matrix;
 };
 
+// Result of inverting the block-diagonal covariance V: the sparse inverse and
+// the accumulated log-determinant log|V|.
 struct InverseCovarianceResult {
     SparseMatrix<double> inverse_matrix;
     double logdet = 0.0;
 };
 
-struct BinaryWorkingLmmState {
-    VectorXd mu;
-    VectorXd weight;
-    VectorXd residual_diag;
-    VectorXd working_response;
-};
-
+// Precomputed quantities for the fixed-effect projection with a matrix design X:
+//   inverse_times_design = V^{-1} X
+//   design_cross_inverse = (X' V^{-1} X)^{-1}
+//   design_logdet        = log|X' V^{-1} X| (optional).
 struct ProjectionCache {
     MatrixXd inverse_times_design;
     MatrixXd design_cross_inverse;
     double design_logdet = 0.0;
 };
 
+// Same projection cache but specialized to a single (vector) design column, so
+// the cross term X'V^{-1}X is just a scalar.
 struct ScalarProjectionCache {
     VectorXd inverse_times_design;
     double design_cross_inverse = 0.0;
 };
 
-struct BinaryProjectionState {
-    InverseCovarianceResult inverse_result;
-    ProjectionCache fixed_effect_projection;
-    VectorXd projected_response;
-    VectorXd genetic_times_projected_response;
-    VectorXd projected_genetic_response;
-    double trace_pg = 0.0;
-};
-
-struct ScalarVarianceUpdateState {
-    double score = 0.0;
-    double ai = 0.0;
-    double em = 0.0;
-    double gamma = 1.0;
-    double blended_information = 0.0;
-    double delta = 0.0;
-    double updated_variance = 0.0;
-};
-
-struct BinaryVarianceFitState {
-    double genetic_var = 0.0;
-    double neg2_reml = 0.0;
-    double score = 0.0;
-    double ai = 0.0;
-    double em = 0.0;
-    double gamma = 1.0;
-    bool converged = false;
-    BinaryProjectionState projection_state;
-};
-
-struct JointMainWorkingState {
-    VectorXd binary_mu;
-    VectorXd binary_weight;
-    VectorXd binary_residual_diag;
-    VectorXd binary_working_response;
-    VectorXd stacked_response;
-};
-
-struct JointInverseCovarianceResult {
-    SparseMatrix<double> inverse_matrix;
-    VectorXd trace_vi_components = VectorXd::Zero(4);
-    double logdet = 0.0;
-};
-
-struct JointProjectionState {
-    JointInverseCovarianceResult inverse_result;
-    ProjectionCache fixed_effect_projection;
-    VectorXd projected_response;
-    VectorXd projected_random_response;
-    double neg2_reml = 0.0;
-};
-
-struct JointVarianceFitState {
-    VectorXd varcom = VectorXd::Zero(4);
-    VectorXd score = VectorXd::Zero(4);
-    MatrixXd ai = MatrixXd::Zero(4, 4);
-    MatrixXd em = MatrixXd::Zero(4, 4);
-    double neg2_reml = 0.0;
-    bool converged = false;
-    JointProjectionState projection_state;
-};
-
-struct JointCovarianceFitState {
-    VectorXd varcom = VectorXd::Zero(4);
-    double score = 0.0;
-    double ai = 0.0;
-    double em = 0.0;
-    double gamma = 1.0;
-    double neg2_reml = 0.0;
-    bool converged = false;
-    JointProjectionState projection_state;
-};
-
-struct MultitraitContinuousInverseCovarianceResult {
-    SparseMatrix<double> inverse_matrix;
-    VectorXd trace_vi_components;
-    double logdet = 0.0;
-};
-
-struct MultitraitContinuousProjectionState {
-    MultitraitContinuousInverseCovarianceResult inverse_result;
-    ProjectionCache fixed_effect_projection;
-    VectorXd projected_response;
-    double neg2_reml = 0.0;
-};
-
-struct MultitraitContinuousVarianceFitState {
-    VectorXd varcom;
-    VectorXd score;
-    MatrixXd ai;
-    MatrixXd em;
-    double neg2_reml = 0.0;
-    bool converged = false;
-    MultitraitContinuousProjectionState projection_state;
-};
-
+// Result of one REML variance-component update: the step `delta` and the
+// resulting `updated_varcom = varcom + delta`.
 struct VarianceUpdateResult {
     VectorXd delta;
     VectorXd updated_varcom;
 };
 
+// Per-iteration REML quantities for the 2-component main-effect model:
+// the -2 log-likelihood, the score vector (fd_mat) and the AI matrix.
 struct MainModelIterationState {
     double logL = 0.0;
     VectorXd fd_mat = VectorXd::Zero(2);
     MatrixXd ai_mat = MatrixXd::Zero(2, 2);
 };
 
+// Cached metadata for scanning a PLINK .bed file: the mapping from analysis
+// samples to .fam rows, and the counts of used samples and SNPs.
 struct BedScanContext {
     std::vector<std::int64_t> id_index_in_bed_vec;
     std::int64_t num_id_used = 0;
@@ -287,13 +241,14 @@ struct BedScanContext {
     std::int64_t num_id_in_bed = 0;
 };
 
+// A logical slice of the SNP range to read in one streaming chunk: the starting
+// SNP index and how many SNPs to read.
 struct SnpPartition {
     std::int64_t start_snp = 0;
     std::int64_t num_snp_read = 0;
 };
 
-// Work buffers for scalar (single-trait) SNP scans. Shared by test_main and
-// test_main_binary to avoid duplicating the same resize logic.
+// Work buffers for scalar (single-trait) SNP scans used by test_main.
 struct SnpScalarScanBuffers {
     std::vector<double> snp_mat;
     std::vector<double> geno_var;
@@ -318,37 +273,12 @@ struct SnpScalarScanBuffers {
     }
 };
 
-struct SnpMatrixScanBuffers {
-    std::vector<double> snp_mat;
-    MatrixXd beta_mat;
-    MatrixXd se_mat;
-    MatrixXd p_mat;
-
-    void resize(std::int64_t num_snp, std::int64_t num_id,
-                std::int64_t num_eff_cols, std::int64_t num_p_cols) {
-        snp_mat.resize(static_cast<std::size_t>(num_snp) * static_cast<std::size_t>(num_id));
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        beta_mat = MatrixXd::Constant(num_snp, num_eff_cols, nan);
-        se_mat   = MatrixXd::Constant(num_snp, num_eff_cols, nan);
-        p_mat    = MatrixXd::Constant(num_snp, num_p_cols,   nan);
-    }
-
-    bool needs_resize(std::int64_t num_snp) const {
-        return num_snp != beta_mat.rows();
-    }
-
-    void reset_values() {
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        beta_mat.setConstant(nan);
-        se_mat.setConstant(nan);
-        p_mat.setConstant(nan);
-    }
-};
-
 using GrmTriplet = Eigen::Triplet<double>;
 
-bool is_binary_trait_matrix(const MatrixXd& y, double tolerance);
+// ===== GRM construction (block-diagonal sparse assembly) =====
 
+// Computes the global row/column start offset of each GRM block (a prefix sum of
+// block row counts). offsets[k] is where block k begins; offsets.back() == N.
 std::vector<std::int64_t> build_grm_block_offsets(const std::vector<MatrixXd>& grm_blocks) {
     std::vector<std::int64_t> offsets;
     offsets.reserve(grm_blocks.size() + 1);
@@ -361,6 +291,9 @@ std::vector<std::int64_t> build_grm_block_offsets(const std::vector<MatrixXd>& g
     return offsets;
 }
 
+// Counts how many sparse triplets the block-diagonal GRM produces, so callers can
+// reserve() once. Block 0 (singletons) contributes only its diagonal; every other
+// block contributes its full dense entries.
 std::size_t count_grm_triplets(const std::vector<MatrixXd>& grm_blocks) {
     std::size_t triplet_count = 0;
     for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
@@ -375,6 +308,10 @@ std::size_t count_grm_triplets(const std::vector<MatrixXd>& grm_blocks) {
     return triplet_count;
 }
 
+// Appends the diagonal triplets for the singleton block (block 0), which is stored
+// as an N x 1 column vector. With use_identity=true the diagonal is forced to 1
+// (used to build the orthonormal rotation for unrelated samples in the eigenbasis);
+// otherwise the stored value is used.
 void append_singleton_block_triplets(const MatrixXd& singleton_block, std::int64_t start_index,
         std::vector<GrmTriplet>& triplets, bool use_identity) {
     const std::int64_t block_size = singleton_block.rows();
@@ -384,6 +321,8 @@ void append_singleton_block_triplets(const MatrixXd& singleton_block, std::int64
     }
 }
 
+// Appends every entry of a dense within-group block as a sparse triplet, shifted
+// to its global position by start_index.
 void append_dense_block_triplets(const MatrixXd& dense_block, std::int64_t start_index,
         std::vector<GrmTriplet>& triplets) {
     const std::int64_t block_size = dense_block.rows();
@@ -397,6 +336,9 @@ void append_dense_block_triplets(const MatrixXd& dense_block, std::int64_t start
     }
 }
 
+// For the singleton (unrelated) block, the GRM is already diagonal, so its
+// "eigenvalues" are simply the diagonal entries; copy them into the global
+// eigenvalue vector at the block offset.
 void load_singleton_block_eigenvalues(const MatrixXd& singleton_block, std::int64_t start_index,
         VectorXd& eigenvalues) {
     const std::int64_t block_size = singleton_block.rows();
@@ -405,6 +347,9 @@ void load_singleton_block_eigenvalues(const MatrixXd& singleton_block, std::int6
     }
 }
 
+// Eigen-decomposes one dense within-group GRM block. Writes the block's
+// eigenvalues into the global eigenvalue vector, and appends its eigenvectors as
+// sparse triplets so they assemble into the global block-diagonal rotation Q.
 void append_dense_block_eigendecomposition(const MatrixXd& dense_block, std::int64_t start_index,
         VectorXd& eigenvalues, std::vector<GrmTriplet>& triplets) {
     Eigen::SelfAdjointEigenSolver<MatrixXd> eigensolver(dense_block);
@@ -427,6 +372,11 @@ void append_dense_block_eigendecomposition(const MatrixXd& dense_block, std::int
     }
 }
 
+// ===== Numerical / linear-algebra helpers =====
+
+// Computes a column-pivoting QR of `design_matrix` and aborts (fatal_error with
+// `error_message`) if its rank is below `expected_rank`, i.e. if the design has
+// linearly dependent columns. Returns the QR factorization for reuse.
 ColPivHouseholderQR<MatrixXd> require_full_column_rank(
         const MatrixXd& design_matrix,
         std::int64_t expected_rank,
@@ -438,6 +388,8 @@ ColPivHouseholderQR<MatrixXd> require_full_column_rank(
     return qr;
 }
 
+// Standardizes each column of the environment matrix in place to mean 0 and
+// (population) standard deviation 1.
 void standardize_environment_matrix(MatrixXd& environment_matrix) {
     const VectorXd mean_vector = environment_matrix.colwise().mean();
     MatrixXd centered_matrix = environment_matrix.rowwise() - mean_vector.transpose();
@@ -446,12 +398,77 @@ void standardize_environment_matrix(MatrixXd& environment_matrix) {
     environment_matrix = centered_matrix.array().rowwise() * (1.0 / std_vector.transpose().array());
 }
 
+// Natural-log transform of the phenotype matrix in place (applied per column).
+// Requires strictly positive values; aborts otherwise so the user is forced to
+// fix or shift the trait rather than silently producing NaN/-inf.
+void apply_log_transform(MatrixXd& phenotype) {
+    if ((phenotype.array() <= 0.0).any()) {
+        fatal_error("--log-transform requires all phenotype values to be strictly positive; "
+                    "found a value <= 0. Shift the trait or drop non-positive samples first.");
+    }
+    phenotype = phenotype.array().log().matrix();
+}
+
+// Rank-based inverse-normal transform of a single vector. Ties get the average
+// (mid) rank; the Blom offset c = 3/8 is used, i.e.
+//   transformed_i = Phi^{-1}( (rank_i - 3/8) / (n + 1/4) ),
+// which maps the values onto standard-normal quantiles while preserving order.
+VectorXd rank_based_inverse_normal(const VectorXd& values) {
+    const std::int64_t n = values.size();
+    if (n == 0) {
+        return values;
+    }
+
+    // Order indices by value so ties can be detected as equal-valued runs.
+    std::vector<std::int64_t> order(static_cast<std::size_t>(n));
+    for (std::int64_t i = 0; i < n; ++i) {
+        order[static_cast<std::size_t>(i)] = i;
+    }
+    std::sort(order.begin(), order.end(),
+              [&values](std::int64_t a, std::int64_t b) { return values(a) < values(b); });
+
+    // Assign 1-based ranks, averaging within each tie group.
+    VectorXd ranks(n);
+    std::int64_t i = 0;
+    while (i < n) {
+        std::int64_t j = i;
+        while (j + 1 < n && values(order[static_cast<std::size_t>(j + 1)]) ==
+                            values(order[static_cast<std::size_t>(i)])) {
+            ++j;
+        }
+        const double average_rank = (static_cast<double>(i) + static_cast<double>(j)) / 2.0 + 1.0;
+        for (std::int64_t k = i; k <= j; ++k) {
+            ranks(order[static_cast<std::size_t>(k)]) = average_rank;
+        }
+        i = j + 1;
+    }
+
+    const double c = 3.0 / 8.0;  // Blom offset
+    VectorXd transformed(n);
+    for (std::int64_t k = 0; k < n; ++k) {
+        const double quantile = (ranks(k) - c) / (static_cast<double>(n) - 2.0 * c + 1.0);
+        transformed(k) = gsl_cdf_ugaussian_Pinv(quantile);
+    }
+    return transformed;
+}
+
+// Applies the rank-based inverse-normal transform to each column of the
+// phenotype matrix in place.
+void apply_inverse_normal_transform(MatrixXd& phenotype) {
+    for (std::int64_t col = 0; col < phenotype.cols(); ++col) {
+        phenotype.col(col) = rank_based_inverse_normal(phenotype.col(col));
+    }
+}
+
+// Appends `extra_columns` to the right of `design_matrix` in place, growing the
+// column count while preserving the existing columns.
 void append_columns(MatrixXd& design_matrix, const MatrixXd& extra_columns) {
     const std::int64_t original_col_count = design_matrix.cols();
     design_matrix.conservativeResize(design_matrix.rows(), original_col_count + extra_columns.cols());
     design_matrix.rightCols(extra_columns.cols()) = extra_columns;
 }
 
+// Formats a vector as a single space-separated line for compact logging.
 std::string format_vector_for_log(const VectorXd& values) {
     const Eigen::IOFormat fmt(Eigen::StreamPrecision, Eigen::DontAlignCols, " ", "", "", "", "", "");
     std::ostringstream oss;
@@ -459,6 +476,8 @@ std::string format_vector_for_log(const VectorXd& values) {
     return oss.str();
 }
 
+// Returns a valid starting point for REML: the caller's initial_values if they
+// have the right length and are all strictly positive, otherwise a vector of ones.
 VectorXd initialize_variance_components(const VectorXd& initial_values, std::int64_t expected_size) {
     if (initial_values.size() == expected_size && initial_values.minCoeff() > 0) {
         return initial_values;
@@ -466,159 +485,9 @@ VectorXd initialize_variance_components(const VectorXd& initial_values, std::int
     return VectorXd::Ones(expected_size);
 }
 
-std::int64_t num_lower_triangle_elements(std::int64_t matrix_size) {
-    return matrix_size * (matrix_size + 1) / 2;
-}
-
-std::pair<std::int64_t, std::int64_t> lower_triangle_pair_from_index(
-        std::int64_t packed_index, std::int64_t matrix_size) {
-    std::int64_t current_index = 0;
-    for (std::int64_t row = 0; row < matrix_size; ++row) {
-        for (std::int64_t col = 0; col <= row; ++col) {
-            if (current_index == packed_index) {
-                return {row, col};
-            }
-            ++current_index;
-        }
-    }
-
-    fatal_error("Packed covariance index {} is out of range for matrix size {}.",
-        packed_index, matrix_size);
-}
-
-MatrixXd unpack_lower_triangle_to_symmetric_matrix(
-        const VectorXd& packed_values, std::int64_t matrix_size, std::int64_t offset = 0) {
-    MatrixXd covariance_matrix = MatrixXd::Zero(matrix_size, matrix_size);
-    std::int64_t packed_index = offset;
-    for (std::int64_t row = 0; row < matrix_size; ++row) {
-        for (std::int64_t col = 0; col <= row; ++col) {
-            covariance_matrix(row, col) = packed_values(packed_index);
-            covariance_matrix(col, row) = packed_values(packed_index);
-            ++packed_index;
-        }
-    }
-    return covariance_matrix;
-}
-
-VectorXd pack_symmetric_matrix_lower_triangle(const MatrixXd& symmetric_matrix) {
-    const std::int64_t matrix_size = symmetric_matrix.rows();
-    VectorXd packed_values(num_lower_triangle_elements(matrix_size));
-    std::int64_t packed_index = 0;
-    for (std::int64_t row = 0; row < matrix_size; ++row) {
-        for (std::int64_t col = 0; col <= row; ++col) {
-            packed_values(packed_index) = symmetric_matrix(row, col);
-            ++packed_index;
-        }
-    }
-    return packed_values;
-}
-
-MatrixXd build_repeated_fixed_effect_design(const MatrixXd& xmat, std::int64_t num_traits) {
-    MatrixXd repeated_design = MatrixXd::Zero(xmat.rows() * num_traits, xmat.cols() * num_traits);
-    for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-        repeated_design.block(
-            trait_index * xmat.rows(),
-            trait_index * xmat.cols(),
-            xmat.rows(),
-            xmat.cols()) = xmat;
-    }
-    return repeated_design;
-}
-
-VectorXd stack_trait_matrix_rows(const MatrixXd& trait_matrix) {
-    VectorXd stacked_response(trait_matrix.rows() * trait_matrix.cols());
-    for (std::int64_t trait_index = 0; trait_index < trait_matrix.cols(); ++trait_index) {
-        stacked_response.segment(
-            trait_index * trait_matrix.rows(),
-            trait_matrix.rows()) = trait_matrix.col(trait_index);
-    }
-    return stacked_response;
-}
-
-VectorXd fit_linear_fixed_effects(const MatrixXd& xmat, const VectorXd& y) {
-    const ColPivHouseholderQR<MatrixXd> qr = require_full_column_rank(
-        xmat,
-        xmat.cols(),
-        "Failed to initialize the continuous-trait fixed-effect model.");
-    return qr.solve(y);
-}
-
-bool is_valid_joint_main_variance_components(const VectorXd& varcom,
-        double min_variance = 1e-6, double min_det = 1e-8) {
-    if (varcom.size() != 4) {
-        return false;
-    }
-    if (varcom(0) <= min_variance || varcom(2) <= min_variance || varcom(3) <= min_variance) {
-        return false;
-    }
-    const double det_sigma_g = varcom(0) * varcom(2) - varcom(1) * varcom(1);
-    return det_sigma_g > min_det;
-}
-
-bool is_valid_multitrait_continuous_variance_components(const VectorXd& varcom,
-        std::int64_t num_traits,
-        double min_variance = 1e-6,
-        double min_eigenvalue = 1e-8) {
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    if (varcom.size() != 2 * num_covariance_terms) {
-        return false;
-    }
-
-    const MatrixXd genetic_covariance = unpack_lower_triangle_to_symmetric_matrix(
-        varcom, num_traits, 0);
-    const MatrixXd residual_covariance = unpack_lower_triangle_to_symmetric_matrix(
-        varcom, num_traits, num_covariance_terms);
-
-    if ((genetic_covariance.diagonal().array() <= min_variance).any() ||
-            (residual_covariance.diagonal().array() <= min_variance).any()) {
-        return false;
-    }
-
-    Eigen::LDLT<MatrixXd> genetic_ldlt(genetic_covariance);
-    Eigen::LDLT<MatrixXd> residual_ldlt(residual_covariance);
-    if (genetic_ldlt.info() != Eigen::Success || residual_ldlt.info() != Eigen::Success) {
-        return false;
-    }
-
-    return genetic_ldlt.vectorD().minCoeff() > min_eigenvalue &&
-           residual_ldlt.vectorD().minCoeff() > min_eigenvalue;
-}
-
-void require_binary_continuous_trait_matrix(const MatrixXd& y) {
-    if (y.cols() != 2 || y.rows() == 0) {
-        fatal_error("The binary-continuous joint model requires exactly two traits: one binary and one continuous.");
-    }
-    if (!is_binary_trait_matrix(MatrixXd(y.leftCols(1)), 1e-8)) {
-        fatal_error("The first trait in the binary-continuous joint model must be coded as 0/1.");
-    }
-    const VectorXd y_binary = y.col(0);
-    if (y_binary.mean() <= 0.0 || y_binary.mean() >= 1.0) {
-        fatal_error("The binary trait in the binary-continuous joint model requires both cases and controls.");
-    }
-    const VectorXd y_continuous = y.col(1);
-    const double centered_norm =
-        (y_continuous.array() - y_continuous.mean()).matrix().squaredNorm();
-    if (!(centered_norm > 0.0)) {
-        fatal_error("The second trait in the binary-continuous joint model must vary across samples.");
-    }
-}
-
-void require_multitrait_continuous_trait_matrix(const MatrixXd& y) {
-    if (y.cols() < 2 || y.rows() == 0) {
-        fatal_error("The multitrait continuous model requires at least two continuous traits.");
-    }
-
-    for (int trait_index = 0; trait_index < y.cols(); ++trait_index) {
-        const VectorXd trait = y.col(trait_index);
-        const double centered_norm =
-            (trait.array() - trait.mean()).matrix().squaredNorm();
-        if (!(centered_norm > 0.0)) {
-            fatal_error("Trait {} in the multitrait continuous model must vary across samples.",
-                trait_index + 1);
-        }
-    }
-}
-
+// Builds one block of the GxE relationship matrix: the elementwise product of the
+// GRM block with the environment Gram matrix E E'/num_bye. For the singleton block
+// only the diagonal (row-wise squared norm of E / num_bye) is needed.
 MatrixXd build_gxe_relationship_block(const MatrixXd& grm_block, const MatrixXd& bye_block, std::int64_t num_bye,
         bool is_singleton_block) {
     if (is_singleton_block) {
@@ -630,6 +499,10 @@ MatrixXd build_gxe_relationship_block(const MatrixXd& grm_block, const MatrixXd&
     return gxe_block.cwiseProduct(grm_block);
 }
 
+// Builds the full GxE relationship matrix (the "environment-weighted GRM") used
+// as a random-effect covariance in the GxE model. Returns both the per-group
+// dense blocks and the assembled sparse block-diagonal matrix. Empty blocks are
+// passed through unchanged.
 GxeRelationshipData build_gxe_relationship_data(const std::vector<MatrixXd>& grm_blocks,
         const std::vector<std::int64_t>& block_offsets, const MatrixXd& bye_mat,
         std::int64_t num_bye, std::int64_t num_id) {
@@ -648,11 +521,14 @@ GxeRelationshipData build_gxe_relationship_data(const std::vector<MatrixXd>& grm
             continue;
         }
 
+        // Slice the rows of the environment matrix belonging to this group, then
+        // form its environment-weighted GRM block.
         const MatrixXd bye_block = bye_mat.middleRows(start_index, block_size);
         const MatrixXd gxe_block = build_gxe_relationship_block(
             grm_block, bye_block, num_bye, block_idx == 0);
         relationship_data.group_blocks[block_idx] = gxe_block;
 
+        // Block 0 is diagonal (singletons); all later blocks are dense.
         if (block_idx == 0) {
             append_singleton_block_triplets(gxe_block, start_index, triplets, false);
         } else {
@@ -665,10 +541,14 @@ GxeRelationshipData build_gxe_relationship_data(const std::vector<MatrixXd>& grm
     return relationship_data;
 }
 
+// Builds the diagonal of the noise-by-environment covariance: for each sample,
+// the mean squared environment value (||E_i||^2 / num_env). This scales the
+// heteroscedastic residual variance component in the GxE model.
 VectorXd build_noise_by_environment_vector(const MatrixXd& bye_mat) {
     return bye_mat.rowwise().squaredNorm() / bye_mat.cols();
 }
 
+// Wraps a vector as an Eigen sparse diagonal matrix.
 SparseMatrix<double> build_sparse_diagonal_matrix(const VectorXd& diagonal_values) {
     SparseMatrix<double> diagonal_matrix(diagonal_values.size(), diagonal_values.size());
     diagonal_matrix.reserve(Eigen::VectorXi::Constant(diagonal_values.size(), 1));
@@ -679,6 +559,11 @@ SparseMatrix<double> build_sparse_diagonal_matrix(const VectorXd& diagonal_value
     return diagonal_matrix;
 }
 
+// Precomputes the pieces of the fixed-effect projection
+//   P = V^{-1} - V^{-1}X (X'V^{-1}X)^{-1} X'V^{-1}
+// for a sparse V^{-1}. Stores V^{-1}X and (X'V^{-1}X)^{-1}, factorized via LDLT
+// (aborting if X'V^{-1}X is not factorizable), and optionally log|X'V^{-1}X|
+// which contributes to the REML log-likelihood.
 ProjectionCache build_projection_cache(const SparseMatrix<double>& inverse_matrix,
         const MatrixXd& design_matrix, bool compute_logdet = false) {
     ProjectionCache projection_cache;
@@ -699,6 +584,9 @@ ProjectionCache build_projection_cache(const SparseMatrix<double>& inverse_matri
     return projection_cache;
 }
 
+// Overload of build_projection_cache for a diagonal V^{-1} (the GRM eigenbasis
+// case): the same projection pieces, but V^{-1}X reduces to a column-wise scaling
+// and the cross product uses a Cholesky (CustomLLT) factorization.
 ProjectionCache build_projection_cache(const VectorXd& inverse_diagonal,
         const MatrixXd& design_matrix, bool compute_logdet = false) {
     ProjectionCache projection_cache;
@@ -716,6 +604,9 @@ ProjectionCache build_projection_cache(const VectorXd& inverse_diagonal,
     return projection_cache;
 }
 
+// Scalar version of build_projection_cache for a single design column x:
+// stores V^{-1}x and the scalar (x'V^{-1}x)^{-1}. Used when projecting out a
+// single SNP main effect.
 ScalarProjectionCache build_scalar_projection_cache(const SparseMatrix<double>& inverse_matrix,
         const VectorXd& design_vector) {
     ScalarProjectionCache projection_cache;
@@ -725,6 +616,11 @@ ScalarProjectionCache build_scalar_projection_cache(const SparseMatrix<double>& 
     return projection_cache;
 }
 
+// The apply_projection family all evaluate P*rhs using the cached projection
+// pieces (V^{-1}X and (X'V^{-1}X)^{-1}) without ever forming the n x n matrix P.
+// The overloads cover combinations of: sparse vs diagonal V^{-1}, matrix vs
+// scalar fixed-effect cross-inverse, and vector vs matrix right-hand side.
+
 // Evaluates P·rhs = V⁻¹rhs - V⁻¹X(X'V⁻¹X)⁻¹X'V⁻¹rhs without forming the n×n projection matrix P.
 VectorXd apply_projection(const SparseMatrix<double>& inverse_matrix,
         const MatrixXd& inverse_times_design, const MatrixXd& design_cross_inverse, const VectorXd& rhs) {
@@ -732,30 +628,35 @@ VectorXd apply_projection(const SparseMatrix<double>& inverse_matrix,
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Same projection P·rhs with a matrix right-hand side (columns projected jointly).
 MatrixXd apply_projection(const SparseMatrix<double>& inverse_matrix,
         const MatrixXd& inverse_times_design, const MatrixXd& design_cross_inverse, const MatrixXd& rhs) {
     return inverse_matrix * rhs -
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Scalar-design variant: a single fixed-effect column x with scalar (x'V^{-1}x)^{-1}.
 VectorXd apply_projection(const SparseMatrix<double>& inverse_matrix,
         const VectorXd& inverse_times_design, double design_cross_inverse, const VectorXd& rhs) {
     return inverse_matrix * rhs -
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Scalar-design variant with a matrix right-hand side.
 MatrixXd apply_projection(const SparseMatrix<double>& inverse_matrix,
         const VectorXd& inverse_times_design, double design_cross_inverse, const MatrixXd& rhs) {
     return inverse_matrix * rhs -
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Diagonal-V^{-1} variant (GRM eigenbasis): V^{-1}rhs is an elementwise product.
 VectorXd apply_projection(const VectorXd& inverse_diagonal,
         const MatrixXd& inverse_times_design, const MatrixXd& design_cross_inverse, const VectorXd& rhs) {
     return inverse_diagonal.cwiseProduct(rhs) -
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Diagonal-V^{-1} variant with a matrix right-hand side.
 MatrixXd apply_projection(const VectorXd& inverse_diagonal,
         const MatrixXd& inverse_times_design, const MatrixXd& design_cross_inverse, const MatrixXd& rhs) {
     MatrixXd projected_rhs = rhs.array().colwise() * inverse_diagonal.array();
@@ -763,6 +664,12 @@ MatrixXd apply_projection(const VectorXd& inverse_diagonal,
             inverse_times_design * (design_cross_inverse * (inverse_times_design.transpose() * rhs));
 }
 
+// Inverts the singleton (diagonal) part of V for the GxE model. The diagonal of V
+// for each unrelated sample is
+//   var = grm*σ²_g + gxe*σ²_gxe (+ nxe*σ²_noise) + σ²_resid,
+// where the variance components are taken from `varcom` (last entry = residual).
+// Appends 1/var as diagonal triplets of V^{-1} and returns sum(log var), the
+// block's contribution to log|V|.
 double append_inverse_singleton_block(const MatrixXd& grm_block, const MatrixXd& gxe_block,
         const VectorXd& nxe_block, const VectorXd& varcom, bool no_noisebye,
         std::int64_t start_index, std::vector<GrmTriplet>& triplets) {
@@ -782,6 +689,10 @@ double append_inverse_singleton_block(const MatrixXd& grm_block, const MatrixXd&
     return logdet;
 }
 
+// Inverts one dense within-group block of V for the GxE model. Forms the block
+//   V_g = σ²_g*GRM + σ²_gxe*GxE (+ σ²_noise*diag(nxe)) + σ²_resid*I,
+// factorizes it with LDLT, appends the dense inverse as triplets of V^{-1}, and
+// returns the block's log-determinant contribution.
 double append_inverse_dense_block(const MatrixXd& grm_block, const MatrixXd& gxe_block,
         const VectorXd& nxe_block, const VectorXd& varcom, bool no_noisebye,
         std::int64_t start_index, std::vector<GrmTriplet>& triplets) {
@@ -803,6 +714,10 @@ double append_inverse_dense_block(const MatrixXd& grm_block, const MatrixXd& gxe
     return logdet;
 }
 
+// Assembles the full inverse covariance V^{-1} for the GxE model under the given
+// variance components. Because V is block-diagonal, it is inverted block by block
+// (singleton diagonal block + dense within-group blocks) and the log-determinants
+// summed. Returns the sparse V^{-1} and log|V|.
 InverseCovarianceResult build_inverse_covariance_matrix(const std::vector<MatrixXd>& grm_blocks,
         const std::vector<MatrixXd>& gxe_blocks, const std::vector<std::int64_t>& block_offsets,
         const VectorXd& nxe_vec, const VectorXd& varcom, bool no_noisebye, std::int64_t num_id) {
@@ -831,1606 +746,14 @@ InverseCovarianceResult build_inverse_covariance_matrix(const std::vector<Matrix
     return result;
 }
 
-bool is_binary_trait_matrix(const MatrixXd& y, double tolerance = 1e-8) {
-    if (y.cols() != 1 || y.rows() == 0) {
-        return false;
-    }
-
-    for (std::int64_t i = 0; i < y.rows(); ++i) {
-        const double value = y(i, 0);
-        if (std::abs(value) <= tolerance || std::abs(value - 1.0) <= tolerance) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-void require_binary_trait_matrix(const MatrixXd& y) {
-    if (!is_binary_trait_matrix(y)) {
-        fatal_error("Binary-trait logistic mixed model requires a single 0/1 phenotype column.");
-    }
-}
-
-double logistic_scalar(double eta) {
-    // Two-branch form avoids overflow: exp(-eta) stays finite when eta>=0; exp(eta) when eta<0.
-    if (eta >= 0.0) {
-        const double exp_neg_eta = std::exp(-eta);
-        return 1.0 / (1.0 + exp_neg_eta);
-    }
-    const double exp_eta = std::exp(eta);
-    return exp_eta / (1.0 + exp_eta);
-}
-
-VectorXd logistic_mean(const VectorXd& eta) {
-    return eta.unaryExpr([](double value) { return logistic_scalar(value); });
-}
-
-VectorXd clamp_probability_vector(const VectorXd& mu, double epsilon = 1e-6) {
-    return mu.array().min(1.0 - epsilon).max(epsilon).matrix();
-}
-
-double bernoulli_loglikelihood(const VectorXd& y, const VectorXd& mu) {
-    return (y.array() * mu.array().log() +
-            (1.0 - y.array()) * (1.0 - mu.array()).log()).sum();
-}
-
-VectorXd fit_logistic_fixed_effects(const MatrixXd& xmat, const VectorXd& y,
-        int max_iter = 50, double tolerance = 1e-8) {
-    VectorXd beta = VectorXd::Zero(xmat.cols());
-    if (xmat.cols() > 0) {
-        const double mean_y = y.mean();
-        if (mean_y > 0.0 && mean_y < 1.0) {
-            beta(0) = std::log(mean_y / (1.0 - mean_y));
-        }
-    }
-
-    for (int iter = 0; iter < max_iter; ++iter) {
-        const VectorXd eta = xmat * beta;
-        const VectorXd mu = clamp_probability_vector(logistic_mean(eta));
-        const VectorXd weight = mu.array() * (1.0 - mu.array());
-        const VectorXd working_response =
-            eta.array() + (y.array() - mu.array()) / weight.array();
-
-        MatrixXd weighted_x = xmat.array().colwise() * weight.array();
-        MatrixXd xtwx = xmat.transpose() * weighted_x;
-        VectorXd xtwz = xmat.transpose() * (weight.array() * working_response.array()).matrix();
-
-        Eigen::LDLT<MatrixXd> ldlt(xtwx);
-        if (ldlt.info() != Eigen::Success) {
-            fatal_error("Failed to initialize the logistic fixed-effect model.");
-        }
-
-        const VectorXd beta_new = ldlt.solve(xtwz);
-        if ((beta_new - beta).norm() < tolerance) {
-            beta = beta_new;
-            break;
-        }
-        beta = beta_new;
-    }
-
-    return beta;
-}
-
-double append_binary_inverse_singleton_block(const MatrixXd& grm_block, const VectorXd& residual_diag,
-        double genetic_var, std::int64_t start_index, std::vector<GrmTriplet>& triplets) {
-    if (grm_block.size() == 0) {
-        return 0.0;
-    }
-
-    const Eigen::ArrayXd variance_diag =
-        genetic_var * grm_block.col(0).array() + residual_diag.array();
-    const double logdet = variance_diag.log().sum();
-    const MatrixXd inverse_block = (1.0 / variance_diag).matrix();
-    append_singleton_block_triplets(inverse_block, start_index, triplets, false);
-    return logdet;
-}
-
-double append_binary_inverse_dense_block(const MatrixXd& grm_block, const VectorXd& residual_diag,
-        double genetic_var, std::int64_t start_index, std::vector<GrmTriplet>& triplets) {
-    MatrixXd variance_block = grm_block * genetic_var;
-    variance_block.diagonal().array() += residual_diag.array();
-
-    Eigen::LDLT<MatrixXd> ldlt(variance_block);
-    if (ldlt.info() != Eigen::Success) {
-        fatal_error("Failed to factorize binary-trait covariance block starting at index {}.", start_index);
-    }
-
-    const double logdet = ldlt.vectorD().array().log().sum();
-    const MatrixXd inverse_block = ldlt.solve(MatrixXd::Identity(grm_block.rows(), grm_block.rows()));
-    append_dense_block_triplets(inverse_block, start_index, triplets);
-    return logdet;
-}
-
-InverseCovarianceResult build_main_binary_inverse_covariance_matrix(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& residual_diag,
-        double genetic_var,
-        std::int64_t num_id) {
-    InverseCovarianceResult result;
-    std::vector<GrmTriplet> triplets;
-    triplets.reserve(count_grm_triplets(grm_blocks));
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        const VectorXd residual_block = residual_diag.segment(start_index, block_size);
-
-        if (block_idx == 0) {
-            result.logdet += append_binary_inverse_singleton_block(
-                grm_block, residual_block, genetic_var, start_index, triplets);
-        } else {
-            result.logdet += append_binary_inverse_dense_block(
-                grm_block, residual_block, genetic_var, start_index, triplets);
-        }
-    }
-
-    result.inverse_matrix.resize(num_id, num_id);
-    result.inverse_matrix.setFromTriplets(triplets.begin(), triplets.end());
-    return result;
-}
-
-BinaryWorkingLmmState build_binary_working_lmm_state(const VectorXd& y, const VectorXd& eta) {
-    BinaryWorkingLmmState state;
-    state.mu = clamp_probability_vector(logistic_mean(eta));
-    // mu*(1-mu) -> 0 as mu -> {0,1}; floor prevents division by zero in the IRLS weight matrix.
-    state.weight = (state.mu.array() * (1.0 - state.mu.array())).max(kProbabilityWeightFloor).matrix();
-    state.residual_diag = (1.0 / state.weight.array()).matrix();
-    state.working_response =
-        (eta.array() + (y.array() - state.mu.array()) / state.weight.array()).matrix();
-    return state;
-}
-
-BinaryProjectionState evaluate_binary_projection_state(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const SparseMatrix<double>& grm_mat,
-        const MatrixXd& xmat,
-        const VectorXd& working_response,
-        const VectorXd& residual_diag,
-        double genetic_var,
-        std::int64_t num_id) {
-    BinaryProjectionState state;
-    state.inverse_result = build_main_binary_inverse_covariance_matrix(
-        grm_blocks, block_offsets, residual_diag, genetic_var, num_id);
-    state.fixed_effect_projection = build_projection_cache(
-        state.inverse_result.inverse_matrix, xmat, true);
-    state.projected_response = apply_projection(
-        state.inverse_result.inverse_matrix,
-        state.fixed_effect_projection.inverse_times_design,
-        state.fixed_effect_projection.design_cross_inverse,
-        working_response);
-    state.genetic_times_projected_response = grm_mat * state.projected_response;
-
-    const double tr_ViG = (state.inverse_result.inverse_matrix.cwiseProduct(grm_mat)).sum();
-    const MatrixXd design_cross_genetic_design =
-        state.fixed_effect_projection.inverse_times_design.transpose() * grm_mat *
-        state.fixed_effect_projection.inverse_times_design;
-    state.trace_pg = tr_ViG - (state.fixed_effect_projection.design_cross_inverse
-        .cwiseProduct(design_cross_genetic_design)).sum();
-    state.projected_genetic_response = apply_projection(
-        state.inverse_result.inverse_matrix,
-        state.fixed_effect_projection.inverse_times_design,
-        state.fixed_effect_projection.design_cross_inverse,
-        state.genetic_times_projected_response);
-    return state;
-}
-
-ScalarVarianceUpdateState find_positive_scalar_variance_update(
-        double score,
-        double ai,
-        double em,
-        double variance,
-        double min_variance = 1e-6) {
-    ScalarVarianceUpdateState result;
-    result.score = score;
-    result.ai = ai;
-    result.em = em;
-
-    const double safe_ai = (std::isfinite(ai) && ai > kAiEmFloor) ? ai : kAiEmFloor;
-    const double safe_em = (std::isfinite(em) && em > kAiEmFloor) ? em : kAiEmFloor;
-
-    // Blend AI (Newton) toward EM (Fisher) until the variance update stays positive; gamma=0 is pure AI.
-    for (int step = 0; step <= 100; ++step) {
-        const double gamma = step * 0.01;
-        const double blended_information = (1.0 - gamma) * safe_ai + gamma * safe_em;
-        if (!(std::isfinite(blended_information) && blended_information > 0.0)) {
-            continue;
-        }
-
-        const double delta = score / blended_information;
-        const double updated_variance = variance + delta;
-        if (std::isfinite(updated_variance) && updated_variance > min_variance) {
-            result.gamma = gamma;
-            result.blended_information = blended_information;
-            result.delta = delta;
-            result.updated_variance = updated_variance;
-            return result;
-        }
-    }
-
-    result.gamma = 1.0;
-    result.blended_information = safe_em;
-    result.delta = score / safe_em;
-    result.updated_variance = std::max(variance + result.delta, min_variance);
-    return result;
-}
-
-double joint_genetic_covariance_bound(const VectorXd& varcom, double min_det = 1e-8) {
-    const double margin = std::max(varcom(0) * varcom(2) - min_det, 1e-12);
-    return std::sqrt(margin);
-}
-
-ScalarVarianceUpdateState find_bounded_scalar_update(
-        double score,
-        double ai,
-        double em,
-        double value,
-        double lower_bound,
-        double upper_bound) {
-    ScalarVarianceUpdateState result;
-    result.score = score;
-    result.ai = ai;
-    result.em = em;
-
-    const double safe_ai = (std::isfinite(ai) && ai > kAiEmFloor) ? ai : kAiEmFloor;
-    const double safe_em = (std::isfinite(em) && em > kAiEmFloor) ? em : kAiEmFloor;
-
-    for (int step = 0; step <= 100; ++step) {
-        const double gamma = step * 0.01;
-        const double blended_information = (1.0 - gamma) * safe_ai + gamma * safe_em;
-        if (!(std::isfinite(blended_information) && blended_information > 0.0)) {
-            continue;
-        }
-
-        const double delta = score / blended_information;
-        const double updated_value = value + delta;
-        if (std::isfinite(updated_value) &&
-                updated_value > lower_bound &&
-                updated_value < upper_bound) {
-            result.gamma = gamma;
-            result.blended_information = blended_information;
-            result.delta = delta;
-            result.updated_variance = updated_value;
-            return result;
-        }
-    }
-
-    const double full_delta = score / safe_em;
-    for (int shrink_step = 0; shrink_step <= 60; ++shrink_step) {
-        const double shrink = std::pow(0.5, shrink_step);
-        const double updated_value = value + shrink * full_delta;
-        if (std::isfinite(updated_value) &&
-                updated_value > lower_bound &&
-                updated_value < upper_bound) {
-            result.gamma = 1.0;
-            result.blended_information = safe_em;
-            result.delta = shrink * full_delta;
-            result.updated_variance = updated_value;
-            return result;
-        }
-    }
-
-    result.gamma = 1.0;
-    result.blended_information = safe_em;
-    result.delta = 0.0;
-    result.updated_variance = std::min(std::max(value, lower_bound + 1e-10), upper_bound - 1e-10);
-    return result;
-}
-
-double compute_binary_working_neg2_reml(
-        const VectorXd& working_response,
-        const BinaryProjectionState& projection_state) {
-    return projection_state.inverse_result.logdet +
-           projection_state.fixed_effect_projection.design_logdet +
-           working_response.dot(projection_state.projected_response);
-}
-
-BinaryVarianceFitState fit_binary_working_genetic_variance(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const SparseMatrix<double>& grm_mat,
-        const MatrixXd& xmat,
-        const VectorXd& working_response,
-        const VectorXd& residual_diag,
-        double initial_genetic_var,
-        int maxiter,
-        double cc_par,
-        double cc_gra,
-        double cc_logL,
-        std::int64_t num_id,
-        const std::string& log_prefix) {
-    BinaryVarianceFitState result;
-    result.genetic_var = std::max(initial_genetic_var, 1e-6);
-
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    for (int iter = 0; iter < maxiter; ++iter) {
-        spdlog::info("{} variance iteration {}", log_prefix, iter + 1);
-
-        result.projection_state = evaluate_binary_projection_state(
-            grm_blocks,
-            block_offsets,
-            grm_mat,
-            xmat,
-            working_response,
-            residual_diag,
-            result.genetic_var,
-            num_id);
-        result.neg2_reml = compute_binary_working_neg2_reml(working_response, result.projection_state);
-
-        const double quad_pgp = result.projection_state.projected_response.dot(
-            result.projection_state.genetic_times_projected_response);
-        // The note writes the score for the negative objective as
-        // 0.5 * [tr(PG) - y*'PGPy*]. Here we update by maximizing the working
-        // quasi-likelihood, so the equivalent sign-flipped derivative is used.
-        result.score = 0.5 * (quad_pgp - result.projection_state.trace_pg);
-        result.ai = 0.5 * result.projection_state.genetic_times_projected_response.dot(
-            result.projection_state.projected_genetic_response);
-        result.em = num_id / (2.0 * result.genetic_var * result.genetic_var);
-
-        const ScalarVarianceUpdateState update_state = find_positive_scalar_variance_update(
-            result.score, result.ai, result.em, result.genetic_var);
-        const double updated_variance = update_state.updated_variance;
-        const double var_change =
-            std::abs(updated_variance - result.genetic_var) /
-            std::max(1.0, std::abs(result.genetic_var));
-        const double logL_change = std::isfinite(previous_neg2_reml)
-            ? std::abs(result.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-
-        spdlog::info("{} -2 working REML: {}", log_prefix, result.neg2_reml);
-        spdlog::info("{} Score: {}, AI: {}, EM: {}, gamma: {}",
-            log_prefix, result.score, result.ai, result.em, update_state.gamma);
-        spdlog::info("{} Updated genetic variance: {}", log_prefix, updated_variance);
-
-        result.gamma = update_state.gamma;
-        result.converged = (var_change < cc_par) ||
-                           (std::abs(result.score) < cc_gra) ||
-                           (logL_change < cc_logL);
-        result.genetic_var = updated_variance;
-        previous_neg2_reml = result.neg2_reml;
-
-        if (result.converged) {
-            break;
-        }
-    }
-
-    result.projection_state = evaluate_binary_projection_state(
-        grm_blocks,
-        block_offsets,
-        grm_mat,
-        xmat,
-        working_response,
-        residual_diag,
-        result.genetic_var,
-        num_id);
-    result.neg2_reml = compute_binary_working_neg2_reml(working_response, result.projection_state);
-    const double quad_pgp = result.projection_state.projected_response.dot(
-        result.projection_state.genetic_times_projected_response);
-    result.score = 0.5 * (quad_pgp - result.projection_state.trace_pg);
-    result.ai = 0.5 * result.projection_state.genetic_times_projected_response.dot(
-        result.projection_state.projected_genetic_response);
-    result.em = num_id / (2.0 * result.genetic_var * result.genetic_var);
-    return result;
-}
-
-JointMainWorkingState build_joint_main_working_state(const MatrixXd& y, const VectorXd& eta_binary) {
-    require_binary_continuous_trait_matrix(y);
-
-    JointMainWorkingState state;
-    state.binary_mu = clamp_probability_vector(logistic_mean(eta_binary));
-    state.binary_weight = (state.binary_mu.array() * (1.0 - state.binary_mu.array())).max(1e-6).matrix();
-    state.binary_residual_diag = (1.0 / state.binary_weight.array()).matrix();
-    state.binary_working_response =
-        (eta_binary.array() +
-         (y.col(0).array() - state.binary_mu.array()) / state.binary_weight.array()).matrix();
-
-    state.stacked_response.resize(y.rows() * 2);
-    state.stacked_response.head(y.rows()) = state.binary_working_response;
-    state.stacked_response.tail(y.rows()) = y.col(1);
-    return state;
-}
-
-VectorXd apply_joint_variance_component(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& rhs,
-        int component,
-        std::int64_t num_id) {
-    VectorXd result = VectorXd::Zero(rhs.size());
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const VectorXd rhs_binary = rhs.segment(start_index, block_size);
-        const VectorXd rhs_continuous = rhs.segment(num_id + start_index, block_size);
-        VectorXd gx_binary(block_size);
-        VectorXd gx_continuous(block_size);
-
-        if (block_idx == 0) {
-            const VectorXd gdiag = grm_block.col(0);
-            gx_binary = gdiag.cwiseProduct(rhs_binary);
-            gx_continuous = gdiag.cwiseProduct(rhs_continuous);
-        } else {
-            gx_binary = grm_block * rhs_binary;
-            gx_continuous = grm_block * rhs_continuous;
-        }
-
-        if (component == 0) {
-            result.segment(start_index, block_size) = gx_binary;
-        } else if (component == 1) {
-            result.segment(start_index, block_size) = gx_continuous;
-            result.segment(num_id + start_index, block_size) = gx_binary;
-        } else if (component == 2) {
-            result.segment(num_id + start_index, block_size) = gx_continuous;
-        } else if (component == 3) {
-            result.segment(num_id + start_index, block_size) = rhs_continuous;
-        }
-    }
-
-    return result;
-}
-
-MatrixXd apply_joint_variance_component(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& rhs,
-        int component,
-        std::int64_t num_id) {
-    MatrixXd result = MatrixXd::Zero(rhs.rows(), rhs.cols());
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const MatrixXd rhs_binary = rhs.middleRows(start_index, block_size);
-        const MatrixXd rhs_continuous = rhs.middleRows(num_id + start_index, block_size);
-        MatrixXd gx_binary(block_size, rhs.cols());
-        MatrixXd gx_continuous(block_size, rhs.cols());
-
-        if (block_idx == 0) {
-            const VectorXd gdiag = grm_block.col(0);
-            gx_binary = (rhs_binary.array().colwise() * gdiag.array()).matrix();
-            gx_continuous = (rhs_continuous.array().colwise() * gdiag.array()).matrix();
-        } else {
-            gx_binary = grm_block * rhs_binary;
-            gx_continuous = grm_block * rhs_continuous;
-        }
-
-        if (component == 0) {
-            result.middleRows(start_index, block_size) = gx_binary;
-        } else if (component == 1) {
-            result.middleRows(start_index, block_size) = gx_continuous;
-            result.middleRows(num_id + start_index, block_size) = gx_binary;
-        } else if (component == 2) {
-            result.middleRows(num_id + start_index, block_size) = gx_continuous;
-        } else if (component == 3) {
-            result.middleRows(num_id + start_index, block_size) = rhs_continuous;
-        }
-    }
-
-    return result;
-}
-
-VectorXd apply_multitrait_continuous_variance_component(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& rhs,
-        int component,
-        std::int64_t num_id,
-        std::int64_t num_traits) {
-    VectorXd result = VectorXd::Zero(rhs.size());
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const bool is_residual_component = component >= num_covariance_terms;
-    const auto [trait_row, trait_col] = lower_triangle_pair_from_index(
-        component % num_covariance_terms, num_traits);
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const VectorXd rhs_row =
-            rhs.segment(trait_row * num_id + start_index, block_size);
-        const VectorXd rhs_col =
-            rhs.segment(trait_col * num_id + start_index, block_size);
-
-        VectorXd transformed_row(block_size);
-        VectorXd transformed_col(block_size);
-        if (is_residual_component) {
-            transformed_row = rhs_row;
-            transformed_col = rhs_col;
-        } else if (block_idx == 0) {
-            const VectorXd gdiag = grm_block.col(0);
-            transformed_row = gdiag.cwiseProduct(rhs_row);
-            transformed_col = gdiag.cwiseProduct(rhs_col);
-        } else {
-            transformed_row = grm_block * rhs_row;
-            transformed_col = grm_block * rhs_col;
-        }
-
-        if (trait_row == trait_col) {
-            result.segment(trait_row * num_id + start_index, block_size) = transformed_row;
-        } else {
-            result.segment(trait_row * num_id + start_index, block_size) = transformed_col;
-            result.segment(trait_col * num_id + start_index, block_size) = transformed_row;
-        }
-    }
-
-    return result;
-}
-
-MatrixXd apply_multitrait_continuous_variance_component(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& rhs,
-        int component,
-        std::int64_t num_id,
-        std::int64_t num_traits) {
-    MatrixXd result = MatrixXd::Zero(rhs.rows(), rhs.cols());
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const bool is_residual_component = component >= num_covariance_terms;
-    const auto [trait_row, trait_col] = lower_triangle_pair_from_index(
-        component % num_covariance_terms, num_traits);
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const MatrixXd rhs_row =
-            rhs.middleRows(trait_row * num_id + start_index, block_size);
-        const MatrixXd rhs_col =
-            rhs.middleRows(trait_col * num_id + start_index, block_size);
-
-        MatrixXd transformed_row(block_size, rhs.cols());
-        MatrixXd transformed_col(block_size, rhs.cols());
-        if (is_residual_component) {
-            transformed_row = rhs_row;
-            transformed_col = rhs_col;
-        } else if (block_idx == 0) {
-            const VectorXd gdiag = grm_block.col(0);
-            transformed_row = (rhs_row.array().colwise() * gdiag.array()).matrix();
-            transformed_col = (rhs_col.array().colwise() * gdiag.array()).matrix();
-        } else {
-            transformed_row = grm_block * rhs_row;
-            transformed_col = grm_block * rhs_col;
-        }
-
-        if (trait_row == trait_col) {
-            result.middleRows(trait_row * num_id + start_index, block_size) = transformed_row;
-        } else {
-            result.middleRows(trait_row * num_id + start_index, block_size) = transformed_col;
-            result.middleRows(trait_col * num_id + start_index, block_size) = transformed_row;
-        }
-    }
-
-    return result;
-}
-
-VectorXd apply_joint_genetic_random_effect(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& rhs,
-        const VectorXd& varcom,
-        std::int64_t num_id) {
-    VectorXd result = VectorXd::Zero(rhs.size());
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const VectorXd rhs_binary = rhs.segment(start_index, block_size);
-        const VectorXd rhs_continuous = rhs.segment(num_id + start_index, block_size);
-        VectorXd gx_binary(block_size);
-        VectorXd gx_continuous(block_size);
-
-        if (block_idx == 0) {
-            const VectorXd gdiag = grm_block.col(0);
-            gx_binary = gdiag.cwiseProduct(rhs_binary);
-            gx_continuous = gdiag.cwiseProduct(rhs_continuous);
-        } else {
-            gx_binary = grm_block * rhs_binary;
-            gx_continuous = grm_block * rhs_continuous;
-        }
-
-        result.segment(start_index, block_size) =
-            varcom(0) * gx_binary + varcom(1) * gx_continuous;
-        result.segment(num_id + start_index, block_size) =
-            varcom(1) * gx_binary + varcom(2) * gx_continuous;
-    }
-
-    return result;
-}
-
-double append_joint_inverse_singleton_block(
-        const MatrixXd& grm_block,
-        const VectorXd& residual_diag,
-        const VectorXd& varcom,
-        std::int64_t start_index,
-        std::int64_t num_id,
-        std::vector<GrmTriplet>& triplets,
-        VectorXd& trace_vi_components) {
-    if (grm_block.size() == 0) {
-        return 0.0;
-    }
-
-    double logdet = 0.0;
-    for (std::int64_t row_idx = 0; row_idx < grm_block.rows(); ++row_idx) {
-        const double g_value = grm_block(row_idx, 0);
-        const double variance_binary = varcom(0) * g_value + residual_diag(start_index + row_idx);
-        const double covariance = varcom(1) * g_value;
-        const double variance_continuous = varcom(2) * g_value + varcom(3);
-        const double determinant = variance_binary * variance_continuous - covariance * covariance;
-        if (!(determinant > 0.0)) {
-            fatal_error("The joint covariance block for a singleton sample is not positive definite.");
-        }
-
-        const double inverse_binary = variance_continuous / determinant;
-        const double inverse_cross = -covariance / determinant;
-        const double inverse_continuous = variance_binary / determinant;
-        const std::int64_t binary_index = start_index + row_idx;
-        const std::int64_t continuous_index = num_id + binary_index;
-
-        triplets.emplace_back(binary_index, binary_index, inverse_binary);
-        triplets.emplace_back(binary_index, continuous_index, inverse_cross);
-        triplets.emplace_back(continuous_index, binary_index, inverse_cross);
-        triplets.emplace_back(continuous_index, continuous_index, inverse_continuous);
-
-        trace_vi_components(0) += inverse_binary * g_value;
-        trace_vi_components(1) += 2.0 * inverse_cross * g_value;
-        trace_vi_components(2) += inverse_continuous * g_value;
-        trace_vi_components(3) += inverse_continuous;
-        logdet += std::log(determinant);
-    }
-
-    return logdet;
-}
-
-double append_joint_inverse_dense_block(
-        const MatrixXd& grm_block,
-        const VectorXd& residual_diag,
-        const VectorXd& varcom,
-        std::int64_t start_index,
-        std::int64_t num_id,
-        std::vector<GrmTriplet>& triplets,
-        VectorXd& trace_vi_components) {
-    const std::int64_t block_size = grm_block.rows();
-    MatrixXd covariance_block = MatrixXd::Zero(block_size * 2, block_size * 2);
-    covariance_block.topLeftCorner(block_size, block_size) = grm_block * varcom(0);
-    covariance_block.topLeftCorner(block_size, block_size).diagonal().array() += residual_diag.array();
-    covariance_block.topRightCorner(block_size, block_size) = grm_block * varcom(1);
-    covariance_block.bottomLeftCorner(block_size, block_size) = grm_block * varcom(1);
-    covariance_block.bottomRightCorner(block_size, block_size) = grm_block * varcom(2);
-    covariance_block.bottomRightCorner(block_size, block_size).diagonal().array() += varcom(3);
-
-    Eigen::LDLT<MatrixXd> ldlt(covariance_block);
-    if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 0.0) {
-        fatal_error("Failed to factorize binary-continuous covariance block starting at index {}.", start_index);
-    }
-
-    const MatrixXd inverse_block =
-        ldlt.solve(MatrixXd::Identity(covariance_block.rows(), covariance_block.cols()));
-    const MatrixXd inverse_binary =
-        inverse_block.topLeftCorner(block_size, block_size);
-    const MatrixXd inverse_cross =
-        inverse_block.topRightCorner(block_size, block_size);
-    const MatrixXd inverse_continuous =
-        inverse_block.bottomRightCorner(block_size, block_size);
-
-    trace_vi_components(0) += (inverse_binary.cwiseProduct(grm_block)).sum();
-    trace_vi_components(1) += 2.0 * (inverse_cross.cwiseProduct(grm_block)).sum();
-    trace_vi_components(2) += (inverse_continuous.cwiseProduct(grm_block)).sum();
-    trace_vi_components(3) += inverse_continuous.diagonal().sum();
-
-    for (std::int64_t row_idx = 0; row_idx < block_size; ++row_idx) {
-        for (std::int64_t col_idx = 0; col_idx < block_size; ++col_idx) {
-            const std::int64_t binary_row = start_index + row_idx;
-            const std::int64_t binary_col = start_index + col_idx;
-            const std::int64_t continuous_row = num_id + binary_row;
-            const std::int64_t continuous_col = num_id + binary_col;
-
-            triplets.emplace_back(binary_row, binary_col, inverse_binary(row_idx, col_idx));
-            triplets.emplace_back(binary_row, continuous_col, inverse_cross(row_idx, col_idx));
-            triplets.emplace_back(continuous_row, binary_col,
-                inverse_block(block_size + row_idx, col_idx));
-            triplets.emplace_back(continuous_row, continuous_col, inverse_continuous(row_idx, col_idx));
-        }
-    }
-
-    return ldlt.vectorD().array().log().sum();
-}
-
-JointInverseCovarianceResult build_joint_main_inverse_covariance_matrix(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& residual_diag,
-        const VectorXd& varcom,
-        std::int64_t num_id) {
-    JointInverseCovarianceResult result;
-    result.trace_vi_components = VectorXd::Zero(4);
-
-    std::vector<GrmTriplet> triplets;
-    triplets.reserve(4 * count_grm_triplets(grm_blocks));
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        const VectorXd residual_block = residual_diag.segment(start_index, block_size);
-        if (block_idx == 0) {
-            result.logdet += append_joint_inverse_singleton_block(
-                grm_block, residual_block, varcom, start_index, num_id, triplets, result.trace_vi_components);
-        } else {
-            result.logdet += append_joint_inverse_dense_block(
-                grm_block, residual_block, varcom, start_index, num_id, triplets, result.trace_vi_components);
-        }
-    }
-
-    result.inverse_matrix.resize(num_id * 2, num_id * 2);
-    result.inverse_matrix.setFromTriplets(triplets.begin(), triplets.end());
-    return result;
-}
-
-MatrixXd build_bivariate_em_information_block(
-        double var_trait1,
-        double covariance,
-        double var_trait2,
-        std::int64_t num_id) {
-    MatrixXd covariance_block = MatrixXd::Zero(3, 3);
-    covariance_block <<
-        2.0 * std::pow(var_trait1, 2), 2.0 * var_trait1 * covariance, 2.0 * std::pow(covariance, 2),
-        2.0 * var_trait1 * covariance, var_trait1 * var_trait2 + std::pow(covariance, 2), 2.0 * covariance * var_trait2,
-        2.0 * std::pow(covariance, 2), 2.0 * covariance * var_trait2, 2.0 * std::pow(var_trait2, 2);
-    covariance_block /= (2.0 * static_cast<double>(num_id));
-    covariance_block.diagonal().array() += kEmStabilityNudge;
-
-    Eigen::LDLT<MatrixXd> ldlt(covariance_block);
-    if (ldlt.info() != Eigen::Success) {
-        fatal_error("Failed to build the bivariate EM information block.");
-    }
-
-    return 0.5 * ldlt.solve(MatrixXd::Identity(3, 3));
-}
-
-MatrixXd build_joint_em_information(const VectorXd& varcom, std::int64_t num_id) {
-    MatrixXd em = MatrixXd::Zero(4, 4);
-    em.topLeftCorner(3, 3) = build_bivariate_em_information_block(
-        varcom(0), varcom(1), varcom(2), num_id);
-    em(3, 3) = num_id / (2.0 * std::pow(varcom(3), 2));
-    return em;
-}
-
-MatrixXd build_lower_triangle_basis_matrix(std::int64_t matrix_size, std::int64_t packed_index) {
-    MatrixXd basis_matrix = MatrixXd::Zero(matrix_size, matrix_size);
-    const auto [row, col] = lower_triangle_pair_from_index(packed_index, matrix_size);
-    basis_matrix(row, col) = 1.0;
-    basis_matrix(col, row) = 1.0;
-    return basis_matrix;
-}
-
-MatrixXd build_covariance_matrix_em_information(
-        const MatrixXd& covariance_matrix,
-        std::int64_t num_id) {
-    const std::int64_t matrix_size = covariance_matrix.rows();
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(matrix_size);
-    MatrixXd em_information = MatrixXd::Zero(num_covariance_terms, num_covariance_terms);
-
-    Eigen::LDLT<MatrixXd> ldlt(covariance_matrix);
-    if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 0.0) {
-        fatal_error("Failed to build the multitrait continuous EM information block.");
-    }
-
-    const MatrixXd inverse_covariance =
-        ldlt.solve(MatrixXd::Identity(matrix_size, matrix_size));
-    std::vector<MatrixXd> inverse_basis_products(num_covariance_terms);
-    for (std::int64_t component = 0; component < num_covariance_terms; ++component) {
-        inverse_basis_products[component] =
-            inverse_covariance * build_lower_triangle_basis_matrix(matrix_size, component);
-    }
-
-    for (std::int64_t row = 0; row < num_covariance_terms; ++row) {
-        for (std::int64_t col = 0; col <= row; ++col) {
-            const double information =
-                0.5 * static_cast<double>(num_id) *
-                (inverse_basis_products[row] * inverse_basis_products[col]).trace();
-            em_information(row, col) = em_information(col, row) = information;
-        }
-    }
-
-    em_information.diagonal().array() += 1e-10;
-    return em_information;
-}
-
-MatrixXd build_multitrait_continuous_em_information(
-        const VectorXd& varcom,
-        std::int64_t num_id,
-        std::int64_t num_traits) {
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    MatrixXd em_information = MatrixXd::Zero(2 * num_covariance_terms, 2 * num_covariance_terms);
-    em_information.topLeftCorner(num_covariance_terms, num_covariance_terms) =
-        build_covariance_matrix_em_information(
-            unpack_lower_triangle_to_symmetric_matrix(varcom, num_traits, 0),
-            num_id);
-    em_information.bottomRightCorner(num_covariance_terms, num_covariance_terms) =
-        build_covariance_matrix_em_information(
-            unpack_lower_triangle_to_symmetric_matrix(varcom, num_traits, num_covariance_terms),
-            num_id);
-    return em_information;
-}
-
-VarianceUpdateResult find_valid_joint_variance_update(
-        const MatrixXd& ai_mat,
-        const MatrixXd& em_mat,
-        const VectorXd& score,
-        const VectorXd& varcom) {
-    VarianceUpdateResult update_result;
-
-    for (int step = 0; step <= 100; ++step) {
-        const double gamma = step * 0.01;
-        const MatrixXd blended_information = (1.0 - gamma) * ai_mat + gamma * em_mat;
-        Eigen::LDLT<MatrixXd> ldlt(blended_information);
-        if (ldlt.info() != Eigen::Success) {
-            continue;
-        }
-
-        update_result.delta = ldlt.solve(score);
-        update_result.updated_varcom = varcom + update_result.delta;
-        if (is_valid_joint_main_variance_components(update_result.updated_varcom)) {
-            spdlog::info("Binary-continuous EM weight value: {}", gamma);
-            return update_result;
-        }
-    }
-
-    Eigen::LDLT<MatrixXd> em_ldlt(em_mat);
-    if (em_ldlt.info() != Eigen::Success) {
-        fatal_error("Failed to find a valid AI/EM update for the binary-continuous null model.");
-    }
-
-    const VectorXd full_step = em_ldlt.solve(score);
-    for (int shrink_step = 0; shrink_step <= 60; ++shrink_step) {
-        const double shrink = std::pow(0.5, shrink_step);
-        update_result.delta = shrink * full_step;
-        update_result.updated_varcom = varcom + update_result.delta;
-        if (is_valid_joint_main_variance_components(update_result.updated_varcom)) {
-            spdlog::info("Binary-continuous EM fallback shrink factor: {}", shrink);
-            return update_result;
-        }
-    }
-
-    fatal_error("Unable to find a valid variance-component update for the binary-continuous null model.");
-}
-
-JointProjectionState evaluate_joint_main_projection_state(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& joint_design,
-        const VectorXd& working_response,
-        const VectorXd& residual_diag,
-        const VectorXd& varcom,
-        std::int64_t num_id) {
-    JointProjectionState state;
-    state.inverse_result = build_joint_main_inverse_covariance_matrix(
-        grm_blocks, block_offsets, residual_diag, varcom, num_id);
-    state.fixed_effect_projection = build_projection_cache(
-        state.inverse_result.inverse_matrix, joint_design, true);
-    state.projected_response = apply_projection(
-        state.inverse_result.inverse_matrix,
-        state.fixed_effect_projection.inverse_times_design,
-        state.fixed_effect_projection.design_cross_inverse,
-        working_response);
-    state.projected_random_response = apply_joint_genetic_random_effect(
-        grm_blocks, block_offsets, state.projected_response, varcom, num_id);
-    state.neg2_reml = state.inverse_result.logdet +
-                      state.fixed_effect_projection.design_logdet +
-                      working_response.dot(state.projected_response);
-    return state;
-}
-
-JointVarianceFitState fit_joint_main_working_variance(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& joint_design,
-        const VectorXd& working_response,
-        const VectorXd& residual_diag,
-        const VectorXd& initial_varcom,
-        int maxiter,
-        double cc_par,
-        double cc_gra,
-        double cc_logL,
-        std::int64_t num_id,
-        const std::string& log_prefix) {
-    JointVarianceFitState result;
-    result.varcom = initial_varcom;
-
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    for (int iter = 0; iter < maxiter; ++iter) {
-        spdlog::info("{} variance iteration {}", log_prefix, iter + 1);
-
-        result.projection_state = evaluate_joint_main_projection_state(
-            grm_blocks, block_offsets, joint_design, working_response, residual_diag, result.varcom, num_id);
-        result.neg2_reml = result.projection_state.neg2_reml;
-
-        std::array<VectorXd, 4> kpy_vec;
-        std::array<VectorXd, 4> pkpy_vec;
-        for (int component = 0; component < 4; ++component) {
-            kpy_vec[component] = apply_joint_variance_component(
-                grm_blocks, block_offsets, result.projection_state.projected_response, component, num_id);
-            pkpy_vec[component] = apply_projection(
-                result.projection_state.inverse_result.inverse_matrix,
-                result.projection_state.fixed_effect_projection.inverse_times_design,
-                result.projection_state.fixed_effect_projection.design_cross_inverse,
-                kpy_vec[component]);
-
-            const MatrixXd design_cross_component =
-                result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-                apply_joint_variance_component(
-                    grm_blocks,
-                    block_offsets,
-                    result.projection_state.fixed_effect_projection.inverse_times_design,
-                    component,
-                    num_id);
-            const double trace_projection_component =
-                result.projection_state.inverse_result.trace_vi_components(component) -
-                (result.projection_state.fixed_effect_projection.design_cross_inverse
-                    .cwiseProduct(design_cross_component)).sum();
-            result.score(component) = 0.5 * (
-                result.projection_state.projected_response.dot(kpy_vec[component]) -
-                trace_projection_component);
-        }
-
-        for (int row = 0; row < 4; ++row) {
-            for (int col = 0; col <= row; ++col) {
-                result.ai(row, col) = result.ai(col, row) =
-                    0.5 * kpy_vec[row].dot(pkpy_vec[col]);
-            }
-        }
-        result.em = build_joint_em_information(result.varcom, num_id);
-
-        const VarianceUpdateResult update_result = find_valid_joint_variance_update(
-            result.ai, result.em, result.score, result.varcom);
-        const double cc_par_val =
-            std::sqrt(update_result.delta.squaredNorm() /
-                      std::max(1.0, result.varcom.squaredNorm()));
-        const double cc_gra_val = result.score.norm();
-        const double cc_logL_val = std::isfinite(previous_neg2_reml)
-            ? std::abs(result.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-        const bool parameter_stable = cc_par_val < cc_par;
-        const bool gradient_small = cc_gra_val < cc_gra;
-        const bool objective_stable = cc_logL_val < cc_logL;
-
-        spdlog::info("{} -2 working REML: {}", log_prefix, result.neg2_reml);
-        spdlog::info("{} Score: {}", log_prefix, format_vector_for_log(result.score));
-        spdlog::info("{} Updated variances: {}", log_prefix,
-            format_vector_for_log(update_result.updated_varcom));
-        spdlog::info(
-            "{} Convergence metrics: cc_par={}, cc_gra={}, cc_logL={}",
-            log_prefix, cc_par_val, cc_gra_val, cc_logL_val);
-
-        result.varcom = update_result.updated_varcom;
-        // For the joint model, a tiny step or a flat objective alone is not
-        // enough: the score must also be small before we accept convergence.
-        result.converged = gradient_small && (parameter_stable || objective_stable);
-        previous_neg2_reml = result.neg2_reml;
-        if (result.converged) {
-            break;
-        }
-    }
-
-    result.projection_state = evaluate_joint_main_projection_state(
-        grm_blocks, block_offsets, joint_design, working_response, residual_diag, result.varcom, num_id);
-    result.neg2_reml = result.projection_state.neg2_reml;
-    result.score.setZero();
-    result.ai.setZero();
-    result.em = build_joint_em_information(result.varcom, num_id);
-
-    std::array<VectorXd, 4> final_kpy_vec;
-    std::array<VectorXd, 4> final_pkpy_vec;
-    for (int component = 0; component < 4; ++component) {
-        final_kpy_vec[component] = apply_joint_variance_component(
-            grm_blocks, block_offsets, result.projection_state.projected_response, component, num_id);
-        final_pkpy_vec[component] = apply_projection(
-            result.projection_state.inverse_result.inverse_matrix,
-            result.projection_state.fixed_effect_projection.inverse_times_design,
-            result.projection_state.fixed_effect_projection.design_cross_inverse,
-            final_kpy_vec[component]);
-
-        const MatrixXd design_cross_component =
-            result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-            apply_joint_variance_component(
-                grm_blocks,
-                block_offsets,
-                result.projection_state.fixed_effect_projection.inverse_times_design,
-                component,
-                num_id);
-        const double trace_projection_component =
-            result.projection_state.inverse_result.trace_vi_components(component) -
-            (result.projection_state.fixed_effect_projection.design_cross_inverse
-                .cwiseProduct(design_cross_component)).sum();
-        result.score(component) = 0.5 * (
-            result.projection_state.projected_response.dot(final_kpy_vec[component]) -
-            trace_projection_component);
-    }
-
-    for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col <= row; ++col) {
-            result.ai(row, col) = result.ai(col, row) =
-                0.5 * final_kpy_vec[row].dot(final_pkpy_vec[col]);
-        }
-    }
-
-    return result;
-}
-
-JointCovarianceFitState fit_joint_main_working_genetic_covariance(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& joint_design,
-        const VectorXd& working_response,
-        const VectorXd& residual_diag,
-        const VectorXd& fixed_varcom,
-        int maxiter,
-        double cc_par,
-        double cc_gra,
-        double cc_logL,
-        std::int64_t num_id,
-        const std::string& log_prefix) {
-    JointCovarianceFitState result;
-    result.varcom = fixed_varcom;
-
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    for (int iter = 0; iter < maxiter; ++iter) {
-        spdlog::info("{} covariance iteration {}", log_prefix, iter + 1);
-
-        result.projection_state = evaluate_joint_main_projection_state(
-            grm_blocks, block_offsets, joint_design, working_response, residual_diag, result.varcom, num_id);
-        result.neg2_reml = result.projection_state.neg2_reml;
-
-        const VectorXd kpy = apply_joint_variance_component(
-            grm_blocks, block_offsets, result.projection_state.projected_response, 1, num_id);
-        const VectorXd pkpy = apply_projection(
-            result.projection_state.inverse_result.inverse_matrix,
-            result.projection_state.fixed_effect_projection.inverse_times_design,
-            result.projection_state.fixed_effect_projection.design_cross_inverse,
-            kpy);
-
-        const MatrixXd design_cross_component =
-            result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-            apply_joint_variance_component(
-                grm_blocks,
-                block_offsets,
-                result.projection_state.fixed_effect_projection.inverse_times_design,
-                1,
-                num_id);
-        const double trace_projection_component =
-            result.projection_state.inverse_result.trace_vi_components(1) -
-            (result.projection_state.fixed_effect_projection.design_cross_inverse
-                .cwiseProduct(design_cross_component)).sum();
-        result.score = 0.5 * (
-            result.projection_state.projected_response.dot(kpy) -
-            trace_projection_component);
-        result.ai = 0.5 * kpy.dot(pkpy);
-        result.em = build_joint_em_information(result.varcom, num_id)(1, 1);
-
-        const double covariance_bound = joint_genetic_covariance_bound(result.varcom);
-        const ScalarVarianceUpdateState update_state = find_bounded_scalar_update(
-            result.score,
-            result.ai,
-            result.em,
-            result.varcom(1),
-            -covariance_bound,
-            covariance_bound);
-        const double updated_covariance = update_state.updated_variance;
-        const double cc_par_val =
-            std::abs(updated_covariance - result.varcom(1)) /
-            std::max(1.0, std::abs(result.varcom(1)));
-        const double cc_gra_val = std::abs(result.score);
-        const double cc_logL_val = std::isfinite(previous_neg2_reml)
-            ? std::abs(result.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-        const bool parameter_stable = cc_par_val < cc_par;
-        const bool gradient_small = cc_gra_val < cc_gra;
-        const bool objective_stable = cc_logL_val < cc_logL;
-
-        spdlog::info("{} -2 working REML: {}", log_prefix, result.neg2_reml);
-        spdlog::info("{} Covariance score: {}, AI: {}, EM: {}, gamma: {}",
-            log_prefix, result.score, result.ai, result.em, update_state.gamma);
-        spdlog::info("{} Updated genetic covariance: {}", log_prefix, updated_covariance);
-        spdlog::info(
-            "{} Convergence metrics: cc_par={}, cc_gra={}, cc_logL={}",
-            log_prefix, cc_par_val, cc_gra_val, cc_logL_val);
-
-        result.gamma = update_state.gamma;
-        result.varcom(1) = updated_covariance;
-        result.converged = gradient_small && (parameter_stable || objective_stable);
-        previous_neg2_reml = result.neg2_reml;
-        if (result.converged) {
-            break;
-        }
-    }
-
-    result.projection_state = evaluate_joint_main_projection_state(
-        grm_blocks, block_offsets, joint_design, working_response, residual_diag, result.varcom, num_id);
-    result.neg2_reml = result.projection_state.neg2_reml;
-
-    const VectorXd final_kpy = apply_joint_variance_component(
-        grm_blocks, block_offsets, result.projection_state.projected_response, 1, num_id);
-    const VectorXd final_pkpy = apply_projection(
-        result.projection_state.inverse_result.inverse_matrix,
-        result.projection_state.fixed_effect_projection.inverse_times_design,
-        result.projection_state.fixed_effect_projection.design_cross_inverse,
-        final_kpy);
-    const MatrixXd final_design_cross_component =
-        result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-        apply_joint_variance_component(
-            grm_blocks,
-            block_offsets,
-            result.projection_state.fixed_effect_projection.inverse_times_design,
-            1,
-            num_id);
-    const double final_trace_projection_component =
-        result.projection_state.inverse_result.trace_vi_components(1) -
-        (result.projection_state.fixed_effect_projection.design_cross_inverse
-            .cwiseProduct(final_design_cross_component)).sum();
-    result.score = 0.5 * (
-        result.projection_state.projected_response.dot(final_kpy) -
-        final_trace_projection_component);
-    result.ai = 0.5 * final_kpy.dot(final_pkpy);
-    result.em = build_joint_em_information(result.varcom, num_id)(1, 1);
-    return result;
-}
-
-double append_multitrait_continuous_inverse_singleton_block(
-        const MatrixXd& grm_block,
-        const MatrixXd& genetic_covariance,
-        const MatrixXd& residual_covariance,
-        std::int64_t start_index,
-        std::int64_t num_id,
-        std::int64_t num_traits,
-        std::vector<GrmTriplet>& triplets,
-        VectorXd& trace_vi_components) {
-    if (grm_block.size() == 0) {
-        return 0.0;
-    }
-
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    double logdet = 0.0;
-    for (std::int64_t row_idx = 0; row_idx < grm_block.rows(); ++row_idx) {
-        const double g_value = grm_block(row_idx, 0);
-        const MatrixXd covariance_block =
-            g_value * genetic_covariance + residual_covariance;
-        Eigen::LDLT<MatrixXd> ldlt(covariance_block);
-        if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 0.0) {
-            fatal_error("The multitrait continuous covariance block for a singleton sample is not positive definite.");
-        }
-
-        const MatrixXd inverse_block =
-            ldlt.solve(MatrixXd::Identity(num_traits, num_traits));
-        for (std::int64_t trait_row = 0; trait_row < num_traits; ++trait_row) {
-            for (std::int64_t trait_col = 0; trait_col < num_traits; ++trait_col) {
-                triplets.emplace_back(
-                    trait_row * num_id + start_index + row_idx,
-                    trait_col * num_id + start_index + row_idx,
-                    inverse_block(trait_row, trait_col));
-            }
-        }
-
-        for (std::int64_t component = 0; component < num_covariance_terms; ++component) {
-            const auto [trait_row, trait_col] =
-                lower_triangle_pair_from_index(component, num_traits);
-            const double trace_contribution = (trait_row == trait_col)
-                ? inverse_block(trait_row, trait_col)
-                : (inverse_block(trait_row, trait_col) + inverse_block(trait_col, trait_row));
-            trace_vi_components(component) += trace_contribution * g_value;
-            trace_vi_components(num_covariance_terms + component) += trace_contribution;
-        }
-        logdet += ldlt.vectorD().array().log().sum();
-    }
-
-    return logdet;
-}
-
-double append_multitrait_continuous_inverse_dense_block(
-        const MatrixXd& grm_block,
-        const MatrixXd& genetic_covariance,
-        const MatrixXd& residual_covariance,
-        std::int64_t start_index,
-        std::int64_t num_id,
-        std::int64_t num_traits,
-        std::vector<GrmTriplet>& triplets,
-        VectorXd& trace_vi_components) {
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const std::int64_t block_size = grm_block.rows();
-    MatrixXd covariance_block = MatrixXd::Zero(block_size * num_traits, block_size * num_traits);
-
-    for (std::int64_t trait_row = 0; trait_row < num_traits; ++trait_row) {
-        for (std::int64_t trait_col = 0; trait_col < num_traits; ++trait_col) {
-            MatrixXd trait_covariance_block = grm_block * genetic_covariance(trait_row, trait_col);
-            trait_covariance_block.diagonal().array() += residual_covariance(trait_row, trait_col);
-            covariance_block.block(
-                trait_row * block_size,
-                trait_col * block_size,
-                block_size,
-                block_size) = trait_covariance_block;
-        }
-    }
-
-    Eigen::LDLT<MatrixXd> ldlt(covariance_block);
-    if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 0.0) {
-        fatal_error("Failed to factorize a multitrait continuous covariance block starting at index {}.",
-            start_index);
-    }
-
-    const MatrixXd inverse_block =
-        ldlt.solve(MatrixXd::Identity(covariance_block.rows(), covariance_block.cols()));
-
-    for (std::int64_t component = 0; component < num_covariance_terms; ++component) {
-        const auto [trait_row, trait_col] =
-            lower_triangle_pair_from_index(component, num_traits);
-        const MatrixXd inverse_row_col = inverse_block.block(
-            trait_row * block_size,
-            trait_col * block_size,
-            block_size,
-            block_size);
-        if (trait_row == trait_col) {
-            trace_vi_components(component) +=
-                (inverse_row_col.cwiseProduct(grm_block)).sum();
-            trace_vi_components(num_covariance_terms + component) +=
-                inverse_row_col.diagonal().sum();
-        } else {
-            const MatrixXd inverse_col_row = inverse_block.block(
-                trait_col * block_size,
-                trait_row * block_size,
-                block_size,
-                block_size);
-            trace_vi_components(component) +=
-                (inverse_row_col.cwiseProduct(grm_block)).sum() +
-                (inverse_col_row.cwiseProduct(grm_block)).sum();
-            trace_vi_components(num_covariance_terms + component) +=
-                inverse_row_col.diagonal().sum() +
-                inverse_col_row.diagonal().sum();
-        }
-    }
-
-    for (std::int64_t trait_row = 0; trait_row < num_traits; ++trait_row) {
-        for (std::int64_t trait_col = 0; trait_col < num_traits; ++trait_col) {
-            const MatrixXd inverse_trait_block = inverse_block.block(
-                trait_row * block_size,
-                trait_col * block_size,
-                block_size,
-                block_size);
-            for (std::int64_t row_idx = 0; row_idx < block_size; ++row_idx) {
-                for (std::int64_t col_idx = 0; col_idx < block_size; ++col_idx) {
-                    triplets.emplace_back(
-                        trait_row * num_id + start_index + row_idx,
-                        trait_col * num_id + start_index + col_idx,
-                        inverse_trait_block(row_idx, col_idx));
-                }
-            }
-        }
-    }
-
-    return ldlt.vectorD().array().log().sum();
-}
-
-MultitraitContinuousInverseCovarianceResult build_multitrait_continuous_inverse_covariance_matrix(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const VectorXd& varcom,
-        std::int64_t num_id,
-        std::int64_t num_traits) {
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const MatrixXd genetic_covariance =
-        unpack_lower_triangle_to_symmetric_matrix(varcom, num_traits, 0);
-    const MatrixXd residual_covariance =
-        unpack_lower_triangle_to_symmetric_matrix(varcom, num_traits, num_covariance_terms);
-
-    MultitraitContinuousInverseCovarianceResult result;
-    result.trace_vi_components = VectorXd::Zero(2 * num_covariance_terms);
-
-    std::vector<GrmTriplet> triplets;
-    triplets.reserve(
-        static_cast<std::size_t>(num_traits * num_traits) *
-        count_grm_triplets(grm_blocks));
-
-    for (std::size_t block_idx = 0; block_idx < grm_blocks.size(); ++block_idx) {
-        const MatrixXd& grm_block = grm_blocks[block_idx];
-        const std::int64_t start_index = block_offsets[block_idx];
-        const std::int64_t block_size = grm_block.rows();
-        if (block_size == 0) {
-            continue;
-        }
-
-        if (block_idx == 0) {
-            result.logdet += append_multitrait_continuous_inverse_singleton_block(
-                grm_block,
-                genetic_covariance,
-                residual_covariance,
-                start_index,
-                num_id,
-                num_traits,
-                triplets,
-                result.trace_vi_components);
-        } else {
-            result.logdet += append_multitrait_continuous_inverse_dense_block(
-                grm_block,
-                genetic_covariance,
-                residual_covariance,
-                start_index,
-                num_id,
-                num_traits,
-                triplets,
-                result.trace_vi_components);
-        }
-    }
-
-    result.inverse_matrix.resize(num_id * num_traits, num_id * num_traits);
-    result.inverse_matrix.setFromTriplets(triplets.begin(), triplets.end());
-    return result;
-}
-
-VarianceUpdateResult find_valid_multitrait_continuous_variance_update(
-        const MatrixXd& ai_mat,
-        const MatrixXd& em_mat,
-        const VectorXd& score,
-        const VectorXd& varcom,
-        std::int64_t num_traits) {
-    VarianceUpdateResult update_result;
-
-    for (int step = 0; step <= 100; ++step) {
-        const double gamma = step * 0.01;
-        const MatrixXd blended_information = (1.0 - gamma) * ai_mat + gamma * em_mat;
-        Eigen::LDLT<MatrixXd> ldlt(blended_information);
-        if (ldlt.info() != Eigen::Success) {
-            continue;
-        }
-
-        update_result.delta = ldlt.solve(score);
-        update_result.updated_varcom = varcom + update_result.delta;
-        if (is_valid_multitrait_continuous_variance_components(
-                update_result.updated_varcom, num_traits)) {
-            spdlog::info("Multitrait continuous EM weight value: {}", gamma);
-            return update_result;
-        }
-    }
-
-    Eigen::LDLT<MatrixXd> em_ldlt(em_mat);
-    if (em_ldlt.info() != Eigen::Success) {
-        fatal_error("Failed to find a valid AI/EM update for the multitrait continuous null model.");
-    }
-
-    const VectorXd full_step = em_ldlt.solve(score);
-    for (int shrink_step = 0; shrink_step <= 60; ++shrink_step) {
-        const double shrink = std::pow(0.5, shrink_step);
-        update_result.delta = shrink * full_step;
-        update_result.updated_varcom = varcom + update_result.delta;
-        if (is_valid_multitrait_continuous_variance_components(
-                update_result.updated_varcom, num_traits)) {
-            spdlog::info("Multitrait continuous EM fallback shrink factor: {}", shrink);
-            return update_result;
-        }
-    }
-
-    fatal_error("Unable to find a valid variance-component update for the multitrait continuous null model.");
-}
-
-MultitraitContinuousProjectionState evaluate_multitrait_continuous_projection_state(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& joint_design,
-        const VectorXd& stacked_response,
-        const VectorXd& varcom,
-        std::int64_t num_id,
-        std::int64_t num_traits) {
-    MultitraitContinuousProjectionState state;
-    state.inverse_result = build_multitrait_continuous_inverse_covariance_matrix(
-        grm_blocks, block_offsets, varcom, num_id, num_traits);
-    state.fixed_effect_projection = build_projection_cache(
-        state.inverse_result.inverse_matrix, joint_design, true);
-    state.projected_response = apply_projection(
-        state.inverse_result.inverse_matrix,
-        state.fixed_effect_projection.inverse_times_design,
-        state.fixed_effect_projection.design_cross_inverse,
-        stacked_response);
-    state.neg2_reml = state.inverse_result.logdet +
-                      state.fixed_effect_projection.design_logdet +
-                      stacked_response.dot(state.projected_response);
-    return state;
-}
-
-MultitraitContinuousVarianceFitState fit_multitrait_continuous_variance(
-        const std::vector<MatrixXd>& grm_blocks,
-        const std::vector<std::int64_t>& block_offsets,
-        const MatrixXd& joint_design,
-        const VectorXd& stacked_response,
-        const VectorXd& initial_varcom,
-        int maxiter,
-        double cc_par,
-        double cc_gra,
-        double cc_logL,
-        std::int64_t num_id,
-        std::int64_t num_traits,
-        const std::string& log_prefix) {
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const std::int64_t num_variance_terms = 2 * num_covariance_terms;
-
-    MultitraitContinuousVarianceFitState result;
-    result.varcom = initial_varcom;
-    result.score = VectorXd::Zero(num_variance_terms);
-    result.ai = MatrixXd::Zero(num_variance_terms, num_variance_terms);
-    result.em = MatrixXd::Zero(num_variance_terms, num_variance_terms);
-
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    for (int iter = 0; iter < maxiter; ++iter) {
-        spdlog::info("{} variance iteration {}", log_prefix, iter + 1);
-
-        result.projection_state = evaluate_multitrait_continuous_projection_state(
-            grm_blocks,
-            block_offsets,
-            joint_design,
-            stacked_response,
-            result.varcom,
-            num_id,
-            num_traits);
-        result.neg2_reml = result.projection_state.neg2_reml;
-
-        std::vector<VectorXd> kpy_vec(num_variance_terms);
-        std::vector<VectorXd> pkpy_vec(num_variance_terms);
-        for (int component = 0; component < num_variance_terms; ++component) {
-            kpy_vec[component] = apply_multitrait_continuous_variance_component(
-                grm_blocks,
-                block_offsets,
-                result.projection_state.projected_response,
-                component,
-                num_id,
-                num_traits);
-            pkpy_vec[component] = apply_projection(
-                result.projection_state.inverse_result.inverse_matrix,
-                result.projection_state.fixed_effect_projection.inverse_times_design,
-                result.projection_state.fixed_effect_projection.design_cross_inverse,
-                kpy_vec[component]);
-
-            const MatrixXd design_cross_component =
-                result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-                apply_multitrait_continuous_variance_component(
-                    grm_blocks,
-                    block_offsets,
-                    result.projection_state.fixed_effect_projection.inverse_times_design,
-                    component,
-                    num_id,
-                    num_traits);
-            const double trace_projection_component =
-                result.projection_state.inverse_result.trace_vi_components(component) -
-                (result.projection_state.fixed_effect_projection.design_cross_inverse
-                    .cwiseProduct(design_cross_component)).sum();
-            result.score(component) = 0.5 * (
-                result.projection_state.projected_response.dot(kpy_vec[component]) -
-                trace_projection_component);
-        }
-
-        for (int row = 0; row < num_variance_terms; ++row) {
-            for (int col = 0; col <= row; ++col) {
-                result.ai(row, col) = result.ai(col, row) =
-                    0.5 * kpy_vec[row].dot(pkpy_vec[col]);
-            }
-        }
-        result.em = build_multitrait_continuous_em_information(
-            result.varcom, num_id, num_traits);
-
-        const VarianceUpdateResult update_result =
-            find_valid_multitrait_continuous_variance_update(
-                result.ai, result.em, result.score, result.varcom, num_traits);
-        const double cc_par_val =
-            std::sqrt(update_result.delta.squaredNorm() /
-                      std::max(1.0, result.varcom.squaredNorm()));
-        const double cc_gra_val = result.score.norm();
-        const double cc_logL_val = std::isfinite(previous_neg2_reml)
-            ? std::abs(result.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-        const bool parameter_stable = cc_par_val < cc_par;
-        const bool gradient_small = cc_gra_val < cc_gra;
-        const bool objective_stable = cc_logL_val < cc_logL;
-
-        spdlog::info("{} -2 REML: {}", log_prefix, result.neg2_reml);
-        spdlog::info("{} Score: {}", log_prefix, format_vector_for_log(result.score));
-        spdlog::info("{} Updated variances: {}", log_prefix,
-            format_vector_for_log(update_result.updated_varcom));
-        spdlog::info(
-            "{} Convergence metrics: cc_par={}, cc_gra={}, cc_logL={}",
-            log_prefix, cc_par_val, cc_gra_val, cc_logL_val);
-
-        result.varcom = update_result.updated_varcom;
-        result.converged = gradient_small && (parameter_stable || objective_stable);
-        previous_neg2_reml = result.neg2_reml;
-        if (result.converged) {
-            break;
-        }
-    }
-
-    result.projection_state = evaluate_multitrait_continuous_projection_state(
-        grm_blocks,
-        block_offsets,
-        joint_design,
-        stacked_response,
-        result.varcom,
-        num_id,
-        num_traits);
-    result.neg2_reml = result.projection_state.neg2_reml;
-    result.score.setZero();
-    result.ai.setZero();
-    result.em = build_multitrait_continuous_em_information(
-        result.varcom, num_id, num_traits);
-
-    std::vector<VectorXd> final_kpy_vec(num_variance_terms);
-    std::vector<VectorXd> final_pkpy_vec(num_variance_terms);
-    for (int component = 0; component < num_variance_terms; ++component) {
-        final_kpy_vec[component] = apply_multitrait_continuous_variance_component(
-            grm_blocks,
-            block_offsets,
-            result.projection_state.projected_response,
-            component,
-            num_id,
-            num_traits);
-        final_pkpy_vec[component] = apply_projection(
-            result.projection_state.inverse_result.inverse_matrix,
-            result.projection_state.fixed_effect_projection.inverse_times_design,
-            result.projection_state.fixed_effect_projection.design_cross_inverse,
-            final_kpy_vec[component]);
-
-        const MatrixXd design_cross_component =
-            result.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-            apply_multitrait_continuous_variance_component(
-                grm_blocks,
-                block_offsets,
-                result.projection_state.fixed_effect_projection.inverse_times_design,
-                component,
-                num_id,
-                num_traits);
-        const double trace_projection_component =
-            result.projection_state.inverse_result.trace_vi_components(component) -
-            (result.projection_state.fixed_effect_projection.design_cross_inverse
-                .cwiseProduct(design_cross_component)).sum();
-        result.score(component) = 0.5 * (
-            result.projection_state.projected_response.dot(final_kpy_vec[component]) -
-            trace_projection_component);
-    }
-
-    for (int row = 0; row < num_variance_terms; ++row) {
-        for (int col = 0; col <= row; ++col) {
-            result.ai(row, col) = result.ai(col, row) =
-                0.5 * final_kpy_vec[row].dot(final_pkpy_vec[col]);
-        }
-    }
-
-    return result;
-}
-
+// ===== Variance-component estimation (REML) helpers =====
+
+// Computes a REML update step that keeps every variance component positive.
+// It blends the average-information matrix (ai_mat) with the EM information
+// (em_mat) as (1-γ)*AI + γ*EM, increasing γ from 0 in steps of 0.01 until the
+// resulting varcom + delta has all positive entries. delta solves
+// (blended information) * delta = score (fd_mat). Returns the step and the
+// updated variance components.
 VarianceUpdateResult find_positive_variance_update(const MatrixXd& ai_mat, const MatrixXd& em_mat,
         const VectorXd& fd_mat, const VectorXd& varcom) {
     VarianceUpdateResult update_result;
@@ -2449,17 +772,69 @@ VarianceUpdateResult find_positive_variance_update(const MatrixXd& ai_mat, const
     return update_result;
 }
 
-void write_variance_components_with_se(const std::string& out_file, const VectorXd& varcom, const VectorXd& se_varcom) {
+// Writes the estimated variance components and their standard errors, one per
+// line, to <out_file>.var.
+void write_variance_components_with_se(const std::string& out_file, const VectorXd& varcom,
+        const VectorXd& se_varcom, const std::vector<std::string>& component_names) {
     ofstream fout(out_file + ".var");
-    if(!fout.is_open()){
-        fatal_error("Fail to open the output file: {}.var", out_file);
-    }
-
-    for(std::int64_t i = 0; i < varcom.size(); ++i){
-        fout << varcom(i) << " " << se_varcom(i) << std::endl;
+    if(!fout.is_open()){ fatal_error("Fail to open the output file: {}.var", out_file); }
+    fout << "component\tvariance\tse\n";
+    for (std::int64_t i = 0; i < varcom.size(); ++i) {
+        fout << component_names[i] << "\t" << varcom(i) << "\t" << se_varcom(i) << "\n";
     }
 }
 
+// Write per-component heritability / variance proportion and delta-method SE,
+// matching the rows of the .var file (G, GxE, [NxE], residual) plus h2_total.
+//   prop_i  = varcom_i * d_i / V_p,   V_p = sum_k varcom_k d_k
+//   d = per-kernel diagonal means [d_g, d_gxe, (d_nxe), 1]
+//   SE via the delta method on the full AI^{-1}.
+// For G and GxE the proportion IS the heritability; for NxE/residual it is the
+// phenotypic-variance proportion (not counted as genetic h2).
+// Writes per-component variance proportion (h2) and delta-method SE to <out>.h2.
+//   prop_i = varcom_i * d_i / Vp,   Vp = sum_k varcom_k * d_k
+//   d      = per-kernel diagonal means (e.g. [tr(K)/n, ..., 1] with 1 for residual)
+//   SE via the delta method on the full AI^{-1}.
+// component_names labels each row (length == varcom.size()); genetic_indices lists
+// the components summed into the final "total" row (e.g. {0} = G for the main model,
+// {0,1} = G+GxE for the GxE model).
+void write_heritability_with_se(const std::string& out_file, const VectorXd& varcom,
+        const MatrixXd& ai_mat_inv, const VectorXd& d,
+        const std::vector<std::string>& component_names,
+        const std::vector<int>& genetic_indices) {
+    const int nc = static_cast<int>(varcom.size());
+    const double Vp = varcom.dot(d);
+
+    auto ratio_se = [&](const VectorXd& c) -> double {
+        const double num = c.dot(varcom);
+        VectorXd grad(nc);
+        for (int k = 0; k < nc; ++k) grad(k) = (c(k) * Vp - num * d(k)) / (Vp * Vp);
+        const double var = grad.dot(ai_mat_inv * grad);
+        return var > 0.0 ? std::sqrt(var) : 0.0;
+    };
+    auto comp_se = [&](int k) -> double {
+        VectorXd c = VectorXd::Zero(nc);
+        c(k) = d(k);
+        return ratio_se(c);
+    };
+
+    const VectorXd prop = (varcom.cwiseProduct(d)) / Vp;
+
+    ofstream fout(out_file + ".h2");
+    if(!fout.is_open()){
+        fatal_error("Fail to open the output file: {}.h2", out_file);
+    }
+    fout << "component\th2\tse\n";
+    for (int k = 0; k < nc; ++k) {
+        fout << component_names[k] << "\t" << prop(k) << "\t" << comp_se(k) << "\n";
+    }
+    // "total" = combined proportion of the genetic / interaction components.
+    VectorXd c_tot = VectorXd::Zero(nc);
+    for (int idx : genetic_indices) c_tot(idx) = d(idx);
+    fout << "total\t" << (c_tot.dot(varcom) / Vp) << "\t" << ratio_se(c_tot) << "\n";
+}
+
+// Writes the estimated variance components (no standard errors) to <out_file>.var.
 void write_variance_components(const std::string& out_file, const VectorXd& varcom) {
     ofstream fout(out_file + ".var");
     if(!fout.is_open()){
@@ -2469,18 +844,27 @@ void write_variance_components(const std::string& out_file, const VectorXd& varc
     fout << varcom << std::endl;
 }
 
+// Performs one AI-REML iteration for the 2-component main-effect model, working
+// entirely in the GRM eigenbasis where everything reduces to diagonal algebra.
+// Inputs are the GRM eigenvalues and the rotated design / response (xmat_trans,
+// y_trans). Returns the -2 log-likelihood, the score vector and the AI matrix for
+// the two components (genetic σ²_g, residual σ²_e).
 MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenvals,
         const MatrixXd& xmat_trans, const MatrixXd& y_trans, const VectorXd& varcom) {
     MainModelIterationState iteration_state;
 
+    // In the eigenbasis V is diagonal with entries λ_i σ²_g + σ²_e, so V^{-1} is
+    // just the reciprocal; -log|V^{-1}| = log|V| contributes to -2 logL.
     const VectorXd inverse_diagonal =
         (1.0 / (grm_eigenvals.array() * varcom(0) + varcom(1))).matrix();
     iteration_state.logL = -(inverse_diagonal.array().log()).sum();
 
+    // Add the fixed-effect determinant term log|X'V^{-1}X| (REML correction).
     ProjectionCache fixed_effect_projection =
         build_projection_cache(inverse_diagonal, xmat_trans, true);
     iteration_state.logL += fixed_effect_projection.design_logdet;
 
+    // Py = projected response; y'Py completes the -2 logL.
     const VectorXd py = apply_projection(
         inverse_diagonal,
         fixed_effect_projection.inverse_times_design,
@@ -2488,6 +872,8 @@ MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenv
         y_trans).col(0);
     iteration_state.logL += (y_trans.transpose() * py).sum();
 
+    // dpy = D P y (D = diag(eigenvalues)) and the further projections PDPy, PPy
+    // are the building blocks of the REML score and AI matrix.
     const VectorXd dpy = grm_eigenvals.cwiseProduct(py);
     const VectorXd pdpy = apply_projection(
         inverse_diagonal,
@@ -2500,6 +886,8 @@ MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenv
         fixed_effect_projection.design_cross_inverse,
         py);
 
+    // Score for σ²_g: -0.5 [ tr(PD) - y'PDPy ], with tr(PD) computed as
+    // tr(V^{-1}D) minus the fixed-effect correction term.
     iteration_state.fd_mat(0) = (inverse_diagonal.cwiseProduct(grm_eigenvals)).sum();
     MatrixXd inverse_times_genetic_design =
         fixed_effect_projection.inverse_times_design.array().colwise() * grm_eigenvals.array();
@@ -2509,6 +897,7 @@ MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenv
     iteration_state.fd_mat(0) -= (py.transpose() * dpy).sum();
     iteration_state.fd_mat(0) *= -0.5;
 
+    // Score for σ²_e: -0.5 [ tr(P) - y'PPy ].
     iteration_state.fd_mat(1) = inverse_diagonal.sum() - (
         fixed_effect_projection.design_cross_inverse.cwiseProduct(
             fixed_effect_projection.inverse_times_design.transpose() *
@@ -2516,6 +905,7 @@ MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenv
     iteration_state.fd_mat(1) -= (py.transpose() * py).sum();
     iteration_state.fd_mat(1) *= -0.5;
 
+    // Average-information matrix: 0.5 * (K_i P y)' P (K_j P y) for each pair.
     iteration_state.ai_mat(0, 0) = 0.5 * dpy.dot(pdpy);
     iteration_state.ai_mat(1, 1) = 0.5 * py.dot(ppy);
     iteration_state.ai_mat(0, 1) = 0.5 * dpy.dot(ppy);
@@ -2524,6 +914,11 @@ MainModelIterationState evaluate_main_model_iteration(const VectorXd& grm_eigenv
     return iteration_state;
 }
 
+// ===== Per-SNP scanning helpers (.bed streaming, random-SNP calibration) =====
+
+// Prepares metadata for scanning the .bed file: maps the analysis sample IDs to
+// their .fam row indices, records the SNP/sample counts, and validates that the
+// .bed file size matches those counts.
 BedScanContext prepare_bed_scan_context(GENO& geno, const std::vector<string>& sample_ids) {
     BedScanContext context;
     context.id_index_in_bed_vec = geno.find_fam_index(sample_ids);
@@ -2536,10 +931,15 @@ BedScanContext prepare_bed_scan_context(GENO& geno, const std::vector<string>& s
     return context;
 }
 
+// Samples `num_random_snp` distinct SNP indices in [0, num_snp) for the gamma
+// calibration panel.
 std::vector<std::int64_t> sample_random_snp_indices(std::int64_t num_snp, std::int64_t num_random_snp) {
     return sample_unique_integers(0, num_snp, num_random_snp);
 }
 
+// Reads the random-SNP genotype panel from the .bed file and mean-centers each
+// SNP column (subtracting 2*allele-frequency). Also returns per-SNP frequency,
+// missing rate and non-missing genotype counts.
 void load_centered_random_snp_panel(GENO& geno, const string& bed_file,
         const std::vector<std::int64_t>& snp_indices, const std::vector<std::int64_t>& id_index_in_bed_vec,
         MatrixXd& snp_mat, VectorXd& freq_arr, VectorXd& missing_rate_arr, VectorXd& nobs_geno_arr) {
@@ -2548,6 +948,9 @@ void load_centered_random_snp_panel(GENO& geno, const string& bed_file,
     snp_mat.rowwise() -= 2 * freq_arr.transpose();
 }
 
+// Splits the SNP range [start_pos, end_pos) into npart_snp roughly equal chunks
+// and returns the start index / count for the given partition_index. The last
+// partition absorbs any remainder so the whole range is covered.
 SnpPartition get_snp_partition(std::int64_t start_pos, std::int64_t end_pos, int npart_snp, int partition_index) {
     const std::int64_t base_partition_size = (end_pos - start_pos) / npart_snp;
     SnpPartition partition;
@@ -2559,6 +962,9 @@ SnpPartition get_snp_partition(std::int64_t start_pos, std::int64_t end_pos, int
     return partition;
 }
 
+// Aborts (with a formatted error containing num_used) if the fraction of random
+// SNPs that passed QC is below min_fraction, since gamma calibration would then be
+// unreliable.
 void require_random_snp_fraction(std::int64_t num_used, std::int64_t num_random_snp,
         double min_fraction, const char* error_template) {
     if (num_used * 1.0 / num_random_snp < min_fraction) {
@@ -2566,6 +972,7 @@ void require_random_snp_fraction(std::int64_t num_used, std::int64_t num_random_
     }
 }
 
+// Opens an output file stream, aborting via fatal_error if it cannot be created.
 ofstream open_output_stream(const string& file_path) {
     ofstream fout(file_path);
     if(!fout.is_open()){
@@ -2574,6 +981,11 @@ ofstream open_output_stream(const string& file_path) {
     return fout;
 }
 
+// ===== CLI definition, validation and logging =====
+
+// Declares all command-line flags/options on the CLI11 app and binds them to the
+// fields of `options`, including help text and defaults. Establishes that
+// --test-main and --test-gxe are mutually exclusive.
 void configure_run_cli(CLI::App& app, RunOptions& options) {
     app.description(R"(
     Quick Start:
@@ -2583,15 +995,6 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
 
       Test SNP Main Effects:
         fastgxe --test-main --grm grm_file --bfile bed_file --data data_file --trait BMI --out test_main
-
-      Test Binary-Trait SNP Main Effects:
-        fastgxe --test-main-binary --grm grm_file --bfile bed_file --data data_file --trait disease --out test_main_binary
-
-      Test Joint Binary + Continuous SNP Main Effects:
-        fastgxe --test-main-binary-continuous --grm grm_file --bfile bed_file --data data_file --trait disease BMI --out test_main_binary_continuous
-
-      Test Multitrait Continuous SNP Main Effects:
-        fastgxe --test-main-multitrait-continuous --grm grm_file --bfile bed_file --data data_file --trait trait1 trait2 trait3 --out test_main_multitrait_continuous
     )");
 
     app.add_option("-p,--threads", options.threads,
@@ -2599,39 +1002,11 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
         ->default_val(10);
 
     auto* test_main_flag = app.add_flag("--test-main", options.test_main,
-        "Enable testing of SNP main effects for continuous traits (mutually exclusive with --test-main-binary, --test-main-binary-continuous and --test-gxe).");
-    auto* test_main_binary_flag = app.add_flag("--test-main-binary", options.test_main_binary,
-        "Enable testing of SNP main effects for binary traits using the logistic mixed model (mutually exclusive with --test-main, --test-main-binary-continuous and --test-gxe).");
-    auto* test_main_binary_continuous_flag = app.add_flag(
-        "--test-main-binary-continuous",
-        options.test_main_binary_continuous,
-        "Enable the joint binary-plus-continuous SNP main-effect model. The first --trait is binary and the second --trait is continuous (mutually exclusive with --test-main, --test-main-binary and --test-gxe).");
-    auto* test_main_multitrait_continuous_flag = app.add_flag(
-        "--test-main-multitrait-continuous",
-        options.test_main_multitrait_continuous,
-        "Enable the multitrait continuous SNP main-effect model. Use two or more continuous --trait values (mutually exclusive with --test-main, --test-main-binary, --test-main-binary-continuous and --test-gxe).");
+        "Enable testing of SNP main effects for continuous traits (mutually exclusive with --test-gxe).");
     auto* test_gxe_flag = app.add_flag("--test-gxe", options.test_gxe,
-        "Enable testing of SNP-environment interactions (mutually exclusive with --test-main, --test-main-binary, --test-main-binary-continuous and --test-main-multitrait-continuous).");
+        "Enable testing of SNP-environment interactions (mutually exclusive with --test-main).");
     test_main_flag->excludes(test_gxe_flag);
-    test_main_flag->excludes(test_main_binary_flag);
-    test_main_flag->excludes(test_main_binary_continuous_flag);
-    test_main_flag->excludes(test_main_multitrait_continuous_flag);
-    test_main_binary_flag->excludes(test_main_flag);
-    test_main_binary_flag->excludes(test_gxe_flag);
-    test_main_binary_flag->excludes(test_main_binary_continuous_flag);
-    test_main_binary_flag->excludes(test_main_multitrait_continuous_flag);
-    test_main_binary_continuous_flag->excludes(test_main_flag);
-    test_main_binary_continuous_flag->excludes(test_main_binary_flag);
-    test_main_binary_continuous_flag->excludes(test_gxe_flag);
-    test_main_binary_continuous_flag->excludes(test_main_multitrait_continuous_flag);
-    test_main_multitrait_continuous_flag->excludes(test_main_flag);
-    test_main_multitrait_continuous_flag->excludes(test_main_binary_flag);
-    test_main_multitrait_continuous_flag->excludes(test_main_binary_continuous_flag);
-    test_main_multitrait_continuous_flag->excludes(test_gxe_flag);
     test_gxe_flag->excludes(test_main_flag);
-    test_gxe_flag->excludes(test_main_binary_flag);
-    test_gxe_flag->excludes(test_main_binary_continuous_flag);
-    test_gxe_flag->excludes(test_main_multitrait_continuous_flag);
 
     app.add_flag("--no-noisebye", [&options](int count) {
         if (count > 0) options.no_noisebye = true;
@@ -2639,12 +1014,13 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
        "  - Noise-by-environment interactions are ENABLED by default.\n"
        "  - Use --no-noisebye to turn it OFF.");
 
+    app.add_flag("--keep-random", options.keep_random,
+        "Also write the per-SNP random-SNP gamma-calibration files (*.random.res). Off by default; the calibration summary is always written to <out>.gamma.");
+
     app.add_option("--data", options.data_file, "Path to input data file (required).")->required();
     app.add_option("--trait", options.trait_vec,
         "Trait(s) to analyze.\n"
-        "  - Use 1 trait for --test-main, --test-main-binary and --test-gxe.\n"
-        "  - Use 2 traits for --test-main-binary-continuous: first binary, second continuous.\n"
-        "  - Use 2 or more traits for --test-main-multitrait-continuous: all continuous.")
+        "  - Use 1 trait for --test-main and --test-gxe.")
         ->expected(-1)->required();
     app.add_option("--env-int", options.bye_vec,
         "List of interacting environmental covariates.\n"
@@ -2681,14 +1057,23 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
        "  - Standardization is ENABLED by default (mean 0, std 1).\n"
        "  - Use --no-standardize-env to turn it OFF.");
 
+    app.add_flag("--log-transform", options.log_transform,
+        "Natural-log transform the raw phenotype before analysis (requires positive values).\n"
+        "  - DISABLED by default.");
+    app.add_flag("--inv-normal", options.inv_normal,
+        "Rank-based inverse-normal transform of the phenotype (Blom, mid-ranks for ties).\n"
+        "  - DISABLED by default.\n"
+        "  - For --test-main: applied to the (optionally log-transformed) phenotype.\n"
+        "  - For --test-gxe: applied to the residual AFTER covariate/environment correction.");
+
     app.add_option("--missing-data", options.missing_in_data_vec,
         "List of missing value indicators for phenotype/covariates.\n"
         "  - Default: {NA, Na, na, NAN, NaN, nan, -NAN, -NaN, -nan, <NA>, <na>, N/A, n/a}.\n"
         "  - Customize with space-separated values (e.g., --missing-data . -999 \"?\").")
         ->expected(-1);
 
-    app.add_option("--maxiter", options.maxiter, "Maximum number of optimization iterations (default: 200).")
-        ->default_val(200);
+    app.add_option("--maxiter", options.maxiter, "Maximum number of optimization iterations (default: 100).")
+        ->default_val(100);
     app.add_option("--cc-par", options.cc_par, "Convergence threshold for parameter updates (default: 1e-7).")
         ->default_val(1e-7);
     app.add_option("--cc-gra", options.cc_gra, "Convergence threshold for gradient norm (default: 1e-6).")
@@ -2697,63 +1082,52 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
         ->default_val(5e-5);
     app.add_option("--snp-range", options.snp_range_vec, "Specify start and end SNPs (expects 2 values).")->expected(2);
     app.add_option("--npart-SNP", options.npart_snp, "Number of SNP partitions (default: 1000).")->default_val(1000);
-    app.add_option("--speed", options.speed, "Computation speed level (default: 2, higher is faster).")->default_val(2);
+    app.add_option("--exact-cut", options.exact_cut,
+        "Adaptive exact-refit threshold for --test-gxe (default: 1e-5).\n"
+        "  - A promising SNP whose fast approximate p-value is below this value is\n"
+        "    recomputed exactly (x'V^-1 x), so top hits get exact p-values while the\n"
+        "    genome-wide scan stays fast.\n"
+        "  - Range [0, 1]. Set to 0 to disable (pure fast approximation);\n"
+        "    set to 1 to force exact refit for ALL promising SNPs (slowest, most accurate).")
+        ->default_val(1e-5);
     app.add_option("--p-approx-cut", options.p_approx_cut, "P-value approximation threshold (default: 1e-3).")->default_val(1e-3);
-    app.add_option("--p-cut", options.p_cut, "P-value significance cutoff for output (default: 2).")->default_val(2);
     app.add_option("--maf", options.maf_cut, "Minor allele frequency (MAF) cutoff (default: 0.01).")->default_val(0.01);
     app.add_option("--missing-rate", options.missing_rate_cut, "Missing genotype rate cutoff (default: 0.05).")->default_val(0.05);
-    app.add_option("--num-random-snp", options.num_random_snp, "Number of randomly selected SNPs (default: 2000).")->default_val(2000);
+    app.add_option("--num-random-snp", options.num_random_snp, "Number of randomly selected SNPs (default: 1000).")->default_val(1000);
     app.add_option("--split-task", options.split_task_vec,
         "Partition the task for parallel execution (expects 2 values: total parts, current part).")
         ->expected(2);
 }
 
+// Validates parsed options: exactly one analysis mode, --env-int required for
+// GxE, exactly one trait, and a sane thread count. Aborts on violation.
 void validate_run_options(RunOptions& options) {
     const int num_analysis_modes =
         static_cast<int>(options.test_main) +
-        static_cast<int>(options.test_main_binary) +
-        static_cast<int>(options.test_main_binary_continuous) +
-        static_cast<int>(options.test_main_multitrait_continuous) +
         static_cast<int>(options.test_gxe);
     if (num_analysis_modes != 1) {
-        fatal_error("Exactly one of --test-main, --test-main-binary, --test-main-binary-continuous, --test-main-multitrait-continuous or --test-gxe must be specified.");
+        fatal_error("Exactly one of --test-main or --test-gxe must be specified.");
     }
     if (options.test_gxe && options.bye_vec.empty()) {
         fatal_error("--env-int is required when --test-gxe is specified.");
     }
-    const bool requires_exactly_two_traits =
-        options.test_main_binary_continuous;
-    const bool requires_at_least_two_traits =
-        options.test_main_multitrait_continuous;
-    const std::size_t expected_num_traits =
-        requires_exactly_two_traits ? 2 : 1;
-    if ((requires_exactly_two_traits && options.trait_vec.size() != expected_num_traits) ||
-            (requires_at_least_two_traits && options.trait_vec.size() < 2) ||
-            (!requires_exactly_two_traits && !requires_at_least_two_traits && options.trait_vec.size() != 1)) {
-        if (options.test_main_binary_continuous) {
-            fatal_error("--test-main-binary-continuous requires exactly two traits: first binary, second continuous.");
-        } else if (options.test_main_multitrait_continuous) {
-            fatal_error("--test-main-multitrait-continuous requires at least two continuous traits.");
-        } else {
-            fatal_error("This analysis mode requires exactly one trait.");
-        }
+    if (options.trait_vec.size() != 1) {
+        fatal_error("This analysis mode requires exactly one trait.");
+    }
+    if (options.exact_cut < 0.0 || options.exact_cut > 1.0) {
+        fatal_error("--exact-cut ({}) must be between 0 and 1.", options.exact_cut);
     }
     if (options.threads <= 0) {
         options.threads = 10;
     }
 }
 
+// Logs all resolved run options through spdlog for reproducibility/debugging.
 void log_run_options(const RunOptions& options) {
     spdlog::info("=== Parsed Arguments ===");
     spdlog::info("Threads: {}", options.threads);
     if (options.test_main) {
         spdlog::info("Analysis Mode: Continuous SNP main effects");
-    } else if (options.test_main_binary) {
-        spdlog::info("Analysis Mode: Binary SNP main effects");
-    } else if (options.test_main_binary_continuous) {
-        spdlog::info("Analysis Mode: Joint binary + continuous SNP main effects");
-    } else if (options.test_main_multitrait_continuous) {
-        spdlog::info("Analysis Mode: Multitrait continuous SNP main effects");
     } else if (options.test_gxe) {
         spdlog::info("Analysis Mode: SNP-environment interactions");
     }
@@ -2764,6 +1138,8 @@ void log_run_options(const RunOptions& options) {
     spdlog::info("Trait(s): {}", join_string(options.trait_vec, ", "));
     spdlog::info("Interacting environmental covariates: {}", join_or_none(options.bye_vec));
     spdlog::info("Standardization of Interacting environments: {}", options.standardize_env ? "ENABLED" : "DISABLED");
+    spdlog::info("Phenotype log-transform: {}", options.log_transform ? "ENABLED" : "DISABLED");
+    spdlog::info("Phenotype inverse-normal transform: {}", options.inv_normal ? "ENABLED" : "DISABLED");
     spdlog::info("Covariates: {}", join_or_none(options.covariate_vec));
     spdlog::info("Class Variables: {}", join_or_none(options.class_vec));
     spdlog::info("Missing Data Indicators: {}", join_string(options.missing_in_data_vec, ", "));
@@ -2774,7 +1150,9 @@ void log_run_options(const RunOptions& options) {
     }
     spdlog::info("SNP Partitions: {}", options.npart_snp);
     spdlog::info("P-value Approx Cutoff: {}", options.p_approx_cut);
-    spdlog::info("P-value Output Cutoff: {}", options.p_cut);
+    spdlog::info("GxE exact-refit cutoff: {}", options.exact_cut <= 0.0 ? "disabled (pure approximate)"
+            : (options.exact_cut >= 1.0 ? "all promising SNPs (exact)"
+            : "p < " + std::to_string(options.exact_cut)));
     spdlog::info("Minor Allele Frequency Cutoff: {}", options.maf_cut);
     spdlog::info("Missing Rate Cutoff: {}", options.missing_rate_cut);
     spdlog::info("Number of Random SNPs: {}", options.num_random_snp);
@@ -2784,6 +1162,10 @@ void log_run_options(const RunOptions& options) {
     spdlog::info("========================");
 }
 
+// Resolves the user-supplied variable names to column indices in the data-file
+// header. Expands range specifications (a:b) for covariates/classes/environments,
+// verifies all required names exist, and enforces that interacting environments
+// are not also listed as covariates or classes. Returns the resolved indices.
 ResolvedInputColumns resolve_input_columns(RunOptions& options) {
     const std::vector<std::string> head_vec = read_header_columns(options.data_file);
     std::vector<std::string> missing_names;
@@ -2833,6 +1215,10 @@ ResolvedInputColumns resolve_input_columns(RunOptions& options) {
 
 }  // namespace
 
+// ===== fastGxE: data loading and sample/GRM alignment =====
+
+// Extracts the (column 0) sample IDs retained in the phenotype table after
+// filtering, asserting they are unique and non-empty. Returns the ID list.
 vector<string> fastGxE::extract_retained_sample_ids(const PHEN& phenoA) const {
     std::vector<string> sample_ids;
     phenoA.get_given_column(0, sample_ids);
@@ -2852,6 +1238,11 @@ vector<string> fastGxE::extract_retained_sample_ids(const PHEN& phenoA) const {
     return sample_ids;
 }
 
+// Reads <agrm_file>.grm.group, keeping only records whose sample ID is in the
+// retained set, recomputes each group's size, and sorts records by (group size,
+// group id, GRM index). The resulting order places unrelated singletons first and
+// groups related samples contiguously, which is what makes the reordered GRM
+// block-diagonal. Returns the sorted group records.
 vector<fastGxE::GroupRecord> fastGxE::load_and_sort_group_records(const string& agrm_file,
         const vector<string>& retained_sample_ids, std::int64_t expected_num_samples) const {
     spdlog::info("Read the group files: {}.grm.group", agrm_file);
@@ -2895,12 +1286,12 @@ vector<fastGxE::GroupRecord> fastGxE::load_and_sort_group_records(const string& 
                       agrm_file, group_records.size(), expected_num_samples);
     }
 
-    spdlog::info("Re-calculate the group size");
+    spdlog::info("Recomputing relatedness-group sizes");
     for(auto& record : group_records){
         record.group_size = group_size_map[record.group_id];
     }
 
-    spdlog::info("Sort by group size and group index");
+    spdlog::info("Sorting samples by relatedness group (size, then group id)");
     sort(group_records.begin(), group_records.end(), [](const GroupRecord& lhs, const GroupRecord& rhs){
         if(lhs.group_size != rhs.group_size){
             return lhs.group_size < rhs.group_size;
@@ -2914,6 +1305,9 @@ vector<fastGxE::GroupRecord> fastGxE::load_and_sort_group_records(const string& 
     return group_records;
 }
 
+// Translates the sorted group records into the corresponding sample-ID order by
+// looking up each record's (1-based) GRM index in the GRM ID list. This is the
+// target order to which the phenotype table is then reordered.
 vector<string> fastGxE::build_reordered_sample_ids(const vector<GroupRecord>& group_records,
         const vector<string>& grm_sample_ids) const {
     vector<string> reordered_sample_ids;
@@ -2927,12 +1321,14 @@ vector<string> fastGxE::build_reordered_sample_ids(const vector<GroupRecord>& gr
     return reordered_sample_ids;
 }
 
+// Logs which fixed-effect design columns were dropped as linearly dependent
+// (no-op when none were removed).
 void fastGxE::log_removed_design_columns(const vector<std::int64_t>& removed_column_indices) const {
     if (removed_column_indices.empty()) {
         return;
     }
 
-    spdlog::info("Dependent columns of xmat are removed: ");
+    spdlog::info("Removing linearly dependent fixed-effect design columns:");
     std::string removed_columns;
     for (const auto& col : removed_column_indices) {
         removed_columns += std::to_string(col) + " ";
@@ -2940,10 +1336,13 @@ void fastGxE::log_removed_design_columns(const vector<std::int64_t>& removed_col
     spdlog::info("{}", removed_columns);
 }
 
+// Builds the fixed-effect design matrix m_xmat (and response m_y) from the
+// covariate/class columns, removes any linearly dependent design columns, and
+// loads the interacting-environment columns into m_bye_mat.
 void fastGxE::build_fixed_and_environment_matrices(PHEN& phenoA,
         const vector<std::int64_t>& covariate_arr, const vector<std::int64_t>& class_arr,
         const vector<std::int64_t>& bye_arr, const vector<std::int64_t>& trait) {
-    spdlog::info("Design matrix for fixed effects");
+    spdlog::info("Building fixed-effect design matrix");
     vector<std::int64_t> index_fixed_effect_vec;
     vector<string> fixed_effect_name_vec;
     m_xmat = phenoA.build_fixed_effect_design_matrix(
@@ -2954,20 +1353,27 @@ void fastGxE::build_fixed_and_environment_matrices(PHEN& phenoA,
         m_xmat, index_fixed_effect_vec, fixed_effect_name_vec, removed_column_indices);
     log_removed_design_columns(removed_column_indices);
 
-    spdlog::info("Get interaction environment covariates");
+    spdlog::info("Loading interacting-environment covariates");
     if(!bye_arr.empty()){
         phenoA.get_columns_as_matrix(bye_arr, m_bye_mat);
     }
 }
 
+// Builds the block-diagonal GRM layout from the sorted group records. Singletons
+// (group size 1) all go into block 0 (stored as an N x 1 column); each multi-member
+// relatedness group becomes its own dense block. Also fills sample_location_map,
+// mapping each sample's GRM index to its (block_id, row_index) so the kinship
+// values can later be placed into the correct block. Returns the GroupLayout.
 fastGxE::GroupLayout fastGxE::build_group_layout(const vector<GroupRecord>& group_records) const {
-    spdlog::info("Store sample index within subgroup");
+    spdlog::info("Building block-diagonal GRM layout from relatedness groups");
 
     std::vector<std::int64_t> singleton_indices;
     std::vector<vector<std::int64_t>> dense_group_indices;
     singleton_indices.reserve(group_records.size());
     dense_group_indices.reserve(group_records.size());
 
+    // Partition samples: singletons accumulate into one list; each contiguous run
+    // of a shared group_id (records are already sorted) becomes a dense group.
     std::int64_t current_group_id = std::numeric_limits<std::int64_t>::min();
     for(const auto& record : group_records){
         if(record.group_size == 1){
@@ -2986,12 +1392,16 @@ fastGxE::GroupLayout fastGxE::build_group_layout(const vector<GroupRecord>& grou
     GroupLayout layout;
     layout.sample_location_map.reserve(group_records.size());
     layout.grm_blocks.reserve(dense_group_indices.size() + 1);
+    // Block 0 holds all singletons as a single N x 1 column.
     layout.grm_blocks.emplace_back(MatrixXd::Zero(singleton_indices.size(), 1));
 
+    // Singletons are tagged with a negative block id (encoding their row only);
+    // loader uses row_index to place each diagonal kinship value.
     for(std::int64_t i = 0; i < static_cast<std::int64_t>(singleton_indices.size()); ++i){
         layout.sample_location_map.emplace(singleton_indices[i], SampleBlockLocation{-(i + 1), i});
     }
 
+    // Each dense group becomes its own square block (block_id >= 1).
     for(std::int64_t block_idx = 0; block_idx < static_cast<std::int64_t>(dense_group_indices.size()); ++block_idx){
         const auto& group_indices = dense_group_indices[block_idx];
         layout.grm_blocks.emplace_back(MatrixXd::Zero(group_indices.size(), group_indices.size()));
@@ -3004,10 +1414,15 @@ fastGxE::GroupLayout fastGxE::build_group_layout(const vector<GroupRecord>& grou
     return layout;
 }
 
+// Streams the sparse GRM file (<agrm_file>.grm.sp.bin) of (index0, index1, value)
+// records and scatters each value into the correct dense/singleton block. Pairs
+// are skipped unless both samples are retained and fall in the same block (cross-
+// block kinship is treated as zero); dense blocks are filled symmetrically and the
+// singleton block only stores its diagonal.
 void fastGxE::load_grouped_grm_blocks(const string& agrm_file,
         const std::unordered_map<std::int64_t, SampleBlockLocation>& sample_location_map,
         vector<MatrixXd>& grm_blocks) const {
-    spdlog::info("Read the GRMs");
+    spdlog::info("Reading GRM blocks from {}.grm.sp.bin", agrm_file);
 
     std::ifstream fin(agrm_file + ".grm.sp.bin", std::ios::binary);
     if(!fin.is_open()){
@@ -3045,17 +1460,21 @@ void fastGxE::load_grouped_grm_blocks(const string& agrm_file,
     }
 }
 
+// Default constructor.
 fastGxE::fastGxE(){
 
 }
 
+// Destructor.
 fastGxE::~fastGxE() {
 }
 
+// Records the output prefix and the counts of traits / covariates / classes /
+// interacting environments on the object, logging them for the user.
 void fastGxE::initialize_analysis_metadata(const string& out_file,
         const vector<std::int64_t>& covariate_arr, const vector<std::int64_t>& class_arr,
         const vector<std::int64_t>& bye_arr, const vector<std::int64_t>& trait) {
-    spdlog::info("Start analysis...");
+    spdlog::info("Preparing data for analysis...");
     m_out_file = out_file;
 
     m_num_trait = trait.size();
@@ -3068,11 +1487,14 @@ void fastGxE::initialize_analysis_metadata(const string& out_file,
     spdlog::info("The number of interaction environments: {}", m_num_bye);
 }
 
+// Reads the data file and keeps only rows whose sample ID is present in the GRM
+// and whose used columns have no missing values. Populates m_id_in_data_vec /
+// m_num_id with the surviving sample order and count.
 void fastGxE::load_filtered_phenotype(PHEN& phenoA, const string& data_file,
         const vector<std::int64_t>& covariate_arr, const vector<std::int64_t>& class_arr,
         const vector<std::int64_t>& bye_arr, const vector<std::int64_t>& trait,
         const vector<string>& grm_sample_ids, const vector<string>& missing_in_data_vec) {
-    spdlog::info("Read data file");
+    spdlog::info("Reading data file: {}", data_file);
     const vector<std::int64_t> col_used_vec = merge_unique_vectors({covariate_arr, class_arr, bye_arr, trait});
     phenoA.read_and_filter(data_file, {0}, {grm_sample_ids}, col_used_vec, missing_in_data_vec);
 
@@ -3081,17 +1503,27 @@ void fastGxE::load_filtered_phenotype(PHEN& phenoA, const string& data_file,
     spdlog::info("The number of used iids in data file: {}", m_num_id);
 }
 
+// Reorders the phenotype table so its sample order matches the relatedness-group
+// ordering used to make the GRM block-diagonal. Loads/sorts the group records,
+// reorders the PHEN rows accordingly, refreshes m_id_in_data_vec, and returns the
+// sorted group records for later block construction.
 vector<fastGxE::GroupRecord> fastGxE::reorder_phenotype_by_group(PHEN& phenoA, const string& agrm_file,
         const vector<string>& grm_sample_ids) {
     const vector<GroupRecord> group_records =
         load_and_sort_group_records(agrm_file, m_id_in_data_vec, m_num_id);
 
-    spdlog::info("Update the dataframe using the current sample id orders");
+    spdlog::info("Reordering phenotype rows to match GRM group order");
     phenoA.reorder_records_by_sample_id_order(build_reordered_sample_ids(group_records, grm_sample_ids));
     m_id_in_data_vec = extract_retained_sample_ids(phenoA);
     return group_records;
 }
 
+// Top-level data-preparation step. Loads the GRM sample IDs, filters the
+// phenotype data to those samples, reorders individuals by relatedness group so
+// the GRM is block-diagonal, builds the fixed-effect / environment design
+// matrices, and assembles the per-group GRM blocks (m_grm_mat_group_vec). All
+// later variance-component and SNP-scan routines consume these cached structures.
+// Returns 0 on success.
 /**
  * @Description: Read the data file and GRM file
  */
@@ -3104,7 +1536,7 @@ int fastGxE::pre_data(const string& out_file, const string& data_file, const str
     initialize_analysis_metadata(out_file, covariate_arr, class_arr, bye_arr, trait);
 
     // id in grm
-    spdlog::info("Read iids in GRM");
+    spdlog::info("Reading sample IDs from GRM: {}.grm", agrm_file);
     ProcessGRM ProcessGRMA;
     const vector<string> id_in_gmat_vec = ProcessGRMA.read_grm_id(agrm_file + ".grm");
     const std::int64_t num_id_in_grm = id_in_gmat_vec.size();
@@ -3130,7 +1562,7 @@ int fastGxE::pre_data(const string& out_file, const string& data_file, const str
     m_grm_mat_group_vec = std::move(group_layout.grm_blocks);
     load_grouped_grm_blocks(agrm_file, group_layout.sample_location_map, m_grm_mat_group_vec);
 
-
+    spdlog::info("Data preparation completed: {} samples retained", m_num_id);
     return 0;
 }
 
@@ -3141,8 +1573,17 @@ int fastGxE::pre_data(const string& out_file, const string& data_file, const str
 
 
 
+// ===== GRM assembly / eigen-decomposition =====
+
+// Finalizes the GRM representation from the per-group blocks.
+// - If use_eigen is false (GxE mode): assembles the block-diagonal sparse GRM
+//   m_grm_mat directly.
+// - If use_eigen is true (main-effect mode): block-wise eigen-decomposes the GRM,
+//   producing the eigenvalues m_grm_eigenvals and the sparse rotation
+//   m_grm_eigenvecs (Q), then pre-rotates the response and design into the
+//   eigenbasis (m_y_trans, m_xmat_trans) so the null model becomes diagonal.
 /**
- * @Description: Sparse GRM or perform Eigen Decompostion of GRM
+ * @Description: Sparse GRM or perform Eigen decomposition of GRM
  * @param {bool} use_eigen
  */
 void fastGxE::process_grm(bool use_eigen){
@@ -3169,7 +1610,7 @@ void fastGxE::process_grm(bool use_eigen){
         m_grm_mat.resize(m_num_id, m_num_id);
         m_grm_mat.setFromTriplets(triplet_list.begin(), triplet_list.end());
     }else{
-        spdlog::info("Eigen Decompostion of GRM");
+        spdlog::info("Eigen-decomposing the GRM (block-wise)");
         // The variance-component solver for SNP main effects works in the GRM
         // eigen basis, so precompute both eigenvalues and the sparse rotation.
         m_grm_eigenvals.resize(m_num_id);
@@ -3195,10 +1636,18 @@ void fastGxE::process_grm(bool use_eigen){
 
 
 
+// ===== GxE-specific preprocessing =====
+
+// Prepares the environment design for the GxE model. Checks the environment
+// matrix is full column rank, optionally standardizes it, and appends it to the
+// fixed-effect design (checking the combined design stays full rank). When
+// phen_correct is true it regresses the fixed effects + environments out of the
+// response and collapses the fixed-effect design to a single intercept column, so
+// downstream GxE fitting works on the residualized phenotype.
 /**
  * @Description: Scale the interaction environment covariates and add to xmat
  */
-void fastGxE::pre_data_GxE(bool standardize_env, bool phen_correct){
+void fastGxE::pre_data_GxE(bool standardize_env, bool phen_correct, bool inv_normal){
     spdlog::info("Scale the interaction environment covariates");
     require_full_column_rank(
         m_bye_mat,
@@ -3221,10 +1670,31 @@ void fastGxE::pre_data_GxE(bool standardize_env, bool phen_correct){
         // only needs an intercept in the fixed-effect design.
         m_y = m_y - m_xmat * design_qr.solve(m_y);
         m_xmat = MatrixXd::Ones(nrows, 1);
+
+        // For GxE the inverse-normal transform is applied to the corrected
+        // residual (not the raw trait), so spurious interactions driven by
+        // phenotype non-normality are removed after covariate/environment adjustment.
+        if(inv_normal){
+            spdlog::info("Applying inverse-normal transform to the corrected phenotype residual");
+            apply_inverse_normal_transform(m_y);
+        }
     }
 }
 
 
+// ===== Variance-component estimation (REML) =====
+
+// Fits the null-model variance components for the GxE (improved structLMM) model
+// by AI-REML. The covariance is
+//   V = σ²_g*GRM + σ²_gxe*GxE + [σ²_noise*diag(nxe) +] σ²_resid*I,
+// giving 4 components (or 3 when no_noisebye is set). Each iteration rebuilds the
+// block-diagonal V^{-1} and log|V|, evaluates the REML -2 log-likelihood, the
+// score vector fd_mat and the average-information matrix ai_mat (entries
+// 0.5*(K_i P y)' P (K_j P y)), then takes a positive-variance step blending AI and
+// EM information. On convergence it caches m_Vi0 = V^{-1}, m_V0_logdet, the null
+// -2 logL (m_logL_null) and the components (m_varcom_null), writes them with SEs,
+// and returns the estimates. The parameters maxiter0/cc_par0/cc_gra0/cc_logL0 are
+// the iteration cap and convergence thresholds (init_varcom is the starting point).
 /**
  * @Description: Improved structLMM model; Include the GRM and GxE rm 
  * @param {VectorXd&} init_varcom
@@ -3240,6 +1710,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
     const std::int64_t num_cov = no_noisebye ? 3 : 4;
     VectorXd varcom = initialize_variance_components(init_varcom, num_cov);
     VectorXd ai_mat_inv_diag = VectorXd::Zero(num_cov);
+    MatrixXd ai_mat_inv = MatrixXd::Identity(num_cov, num_cov);  // full AI^-1 for h2 SE
 
     spdlog::info("Initial variances are: {}", format_vector_for_log(varcom));
 
@@ -3287,6 +1758,9 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
         const double logL = inverse_result.logdet + fixed_effect_projection.design_logdet +
             (m_y.transpose() * projected_response).sum();
         spdlog::info("-2logL: {}", logL);
+        // Score for the genetic component σ²_g (K = GRM):
+        //   fd = tr(P K) - y' P K P y, with tr(PK) = tr(V^{-1}K) minus the
+        //   fixed-effect correction tr((X'V^{-1}X)^{-1} X'V^{-1} K V^{-1} X).
         MatrixXd KPy = m_grm_mat * projected_response;
         double tr_ViK = (vmat.cwiseProduct(m_grm_mat)).sum();
         double tr_design_cross_genetic = (
@@ -3294,6 +1768,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
         fd_mat(0) = tr_ViK - tr_design_cross_genetic - (projected_response.transpose() * KPy).sum();
         KPy_vec[0] = KPy;
 
+        // Score for the GxE-relationship component σ²_gxe (K = GxE matrix).
         double tr_ViKe = (vmat.cwiseProduct(gxe_relationship.sparse_matrix)).sum();
         MatrixXd design_cross_gxe_design =
             fixed_effect_projection.inverse_times_design.transpose() *
@@ -3305,6 +1780,8 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
         fd_mat(1) = tr_ViKe - tr_design_cross_gxe - (projected_response.transpose() * KePy).sum();
         KPy_vec[1] = KePy;
 
+        // Score for the noise-by-environment component σ²_noise (K = diag(nxe)),
+        // only present when noise-by-environment is enabled.
         if(!no_noisebye){
             double tr_ViNxe = (vmat.cwiseProduct(nxe_diag)).sum();
             MatrixXd design_cross_noise_design =
@@ -3319,6 +1796,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
 
 
 
+        // Score for the residual component σ²_resid (K = I): tr(P) - y'PPy.
         fd_mat(num_cov - 1) = vmat.diagonal().sum() - (
             fixed_effect_projection.design_cross_inverse.cwiseProduct(
                 fixed_effect_projection.inverse_times_design.transpose() *
@@ -3327,6 +1805,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
         fd_mat *= -0.5;
         KPy_vec[num_cov - 1] = projected_response;
 
+        // Project each K_i P y once; these P K_i P y vectors feed the AI matrix.
         vector <MatrixXd> PKPy_vec(num_cov);
         for(std::int64_t m = 0; m < num_cov; m++){
             const MatrixXd& KPy_tmp = KPy_vec[m];
@@ -3337,7 +1816,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
                 KPy_tmp);
         }
 
-        // AI
+        // AI: average-information matrix, ai(m,n) = 0.5 (K_m P y)' P (K_n P y).
         MatrixXd ai_mat(num_cov, num_cov);
         for(std::int64_t m = 0; m < num_cov; m++){
             ai_mat(m, m) = (KPy_vec[m].transpose() * PKPy_vec[m]).sum();
@@ -3346,18 +1825,20 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
             }
         }
         ai_mat *= 0.5;
-        ai_mat_inv_diag = ai_mat.inverse().diagonal();
+        ai_mat_inv = ai_mat.inverse();
+        ai_mat_inv_diag = ai_mat_inv.diagonal();
 
         // EM information diagonal: n/(2σ⁴) per variance parameter; a valid lower bound when AI is ill-conditioned.
         MatrixXd em_mat = MatrixXd::Zero(num_cov, num_cov);
         em_mat.diagonal() = m_num_id / (2 * varcom.array() * varcom.array());
         
-        // Update
+        // Update: AI/EM-blended Newton step kept inside the positive orthant.
         const VarianceUpdateResult update_result = find_positive_variance_update(ai_mat, em_mat, fd_mat, varcom);
         spdlog::info("Updated variances: {}", format_vector_for_log(update_result.updated_varcom));
 
         varcom = update_result.updated_varcom;
         
+        // Convergence: relative parameter change and gradient norm.
         double cc_par_val = (update_result.delta.cwiseProduct(update_result.delta)).sum() / (varcom.cwiseProduct(varcom)).sum();
         cc_par_val = sqrt(cc_par_val);
         double cc_gra_val = (fd_mat.cwiseProduct(fd_mat)).sum();
@@ -3376,6 +1857,8 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
     else
         spdlog::info("Variances Not Converged");
     
+    // Rebuild V^{-1} at the converged components and cache it (m_Vi0) plus log|V|
+    // for reuse by the per-SNP GxE score tests.
     const InverseCovarianceResult final_inverse = build_inverse_covariance_matrix(
         m_grm_mat_group_vec,
         gxe_relationship.group_blocks,
@@ -3403,7 +1886,23 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
     m_varcom_null = varcom;
 
     VectorXd se_varcom = ai_mat_inv_diag.cwiseSqrt();
-    write_variance_components_with_se(m_out_file, varcom, se_varcom);
+    const std::vector<std::string> comp_names = no_noisebye
+        ? std::vector<std::string>{"G", "GxE", "residual"}
+        : std::vector<std::string>{"G", "GxE", "NxE", "residual"};
+    write_variance_components_with_se(m_out_file, varcom, se_varcom, comp_names);
+
+    // Per-kernel diagonal means for the heritability decomposition:
+    //   d_g = tr(K)/n, d_gxe = tr(K_gxe)/n, d_nxe = mean(||W_i||^2/q), d_e = 1.
+    VectorXd d_means(num_cov);
+    d_means(0) = m_grm_mat.diagonal().sum() / static_cast<double>(m_num_id);
+    d_means(1) = gxe_relationship.sparse_matrix.diagonal().sum() / static_cast<double>(m_num_id);
+    if(!no_noisebye){
+        d_means(2) = nxe_vec.sum() / static_cast<double>(m_num_id);
+        d_means(3) = 1.0;
+    } else {
+        d_means(2) = 1.0;
+    }
+    write_heritability_with_se(m_out_file, varcom, ai_mat_inv, d_means, comp_names, {0, 1});
 
     return m_varcom_null;
 }
@@ -3411,6 +1910,13 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
 
 
 
+// Fits the 2-component null model for the SNP main-effect scan by AI-REML in the
+// GRM eigenbasis, where V is diagonal (λ_i σ²_g + σ²_e). Each iteration calls
+// evaluate_main_model_iteration for the -2 logL, score and AI matrix, then takes
+// an AI/EM-blended positive-variance step. On convergence it caches the estimates
+// in m_varcom_null, writes them out, and returns them. init is reset to ones (the
+// model always starts from a unit initialization); maxiter0 and the cc_* values
+// are the iteration cap and convergence thresholds.
 /**
  * @Description: Estimate variances for model with only one random effect
  * @param {VectorXd&} init
@@ -3421,7 +1927,7 @@ VectorXd fastGxE::varcom_GxE(VectorXd& init_varcom, bool no_noisebye, int maxite
  */
 VectorXd fastGxE::varcom_main(VectorXd& init, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0){
 
-    spdlog::info("Estimate variances using eigen decompostion...");
+    spdlog::info("Estimating variance components via GRM eigendecomposition...");
 
     // Preserve the original behavior: the main-effect model always starts from
     // a unit initialization rather than reusing any caller-supplied values.
@@ -3442,10 +1948,12 @@ VectorXd fastGxE::varcom_main(VectorXd& init, int maxiter0, double cc_par0, doub
             m_grm_eigenvals, m_xmat_trans, m_y_trans, varcom);
         spdlog::info("-2logL: {}", iteration_state.logL);
 
+        // EM information diagonal n/(2σ⁴), used to keep the blended step positive.
         MatrixXd em_mat = MatrixXd::Zero(2, 2);
         em_mat(0, 0) = m_num_id / (2 * varcom(0) * varcom(0));
         em_mat(1, 1) = m_num_id / (2 * varcom(1) * varcom(1));
 
+        // AI/EM-blended Newton step (stays in the positive-variance region).
         const VarianceUpdateResult update_result =
             find_positive_variance_update(iteration_state.ai_mat, em_mat, iteration_state.fd_mat, varcom);
         spdlog::info("Updated variances: {}", format_vector_for_log(update_result.updated_varcom));
@@ -3466,444 +1974,45 @@ VectorXd fastGxE::varcom_main(VectorXd& init, int maxiter0, double cc_par0, doub
     else
         spdlog::info("Variances Not Converged");
     m_varcom_null = varcom;
-    write_variance_components(m_out_file, varcom);
+
+    // Recompute the AI matrix at the converged estimates so its inverse gives the
+    // sampling covariance of the variance components (for the SEs and the .h2 SE).
+    const MainModelIterationState final_state = evaluate_main_model_iteration(
+        m_grm_eigenvals, m_xmat_trans, m_y_trans, varcom);
+    const MatrixXd ai_mat_inv = final_state.ai_mat.inverse();
+    const VectorXd se_varcom = ai_mat_inv.diagonal().cwiseSqrt();
+    const std::vector<std::string> comp_names = std::vector<std::string>{"G", "residual"};
+    write_variance_components_with_se(m_out_file, varcom, se_varcom, comp_names);
+
+    // Heritability: G = sigma2_g * d_g / Vp (SNP h2), residual = sigma2_e / Vp;
+    // total = G. d_g = tr(GRM)/n = mean of the GRM eigenvalues in the eigenbasis.
+    VectorXd d_means(2);
+    d_means(0) = m_grm_eigenvals.sum() / static_cast<double>(m_num_id);
+    d_means(1) = 1.0;
+    write_heritability_with_se(m_out_file, varcom, ai_mat_inv, d_means,
+            comp_names, {0});
 
     return m_varcom_null;
 }
 
-VectorXd fastGxE::varcom_main_binary(VectorXd& init, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0){
-    spdlog::info("Estimate binary-trait variance using logistic mixed model...");
-    require_binary_trait_matrix(m_y);
+// ===== Per-SNP association scans =====
 
-    const VectorXd y = m_y.col(0);
-    if (y.minCoeff() < 0.0 || y.maxCoeff() > 1.0) {
-        fatal_error("Binary-trait logistic mixed model requires phenotype values in {{0, 1}}.");
-    }
-    if (y.mean() <= 0.0 || y.mean() >= 1.0) {
-        fatal_error("Binary-trait logistic mixed model requires both cases and controls.");
-    }
-
-    init = initialize_variance_components(init, 1);
-    double genetic_var = std::max(init(0), 1e-6);
-    spdlog::info("Initial genetic variance: {}", genetic_var);
-
-    // Step 1 in the working-LMM algorithm: start from a standard logistic
-    // regression and set the random effect to zero.
-    VectorXd fixed_effect = fit_logistic_fixed_effects(m_xmat, y);
-    VectorXd eta = m_xmat * fixed_effect;
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    bool isCC = false;
-
-    for (int outer_iter = 0; outer_iter < maxiter0; ++outer_iter) {
-        spdlog::info("Binary outer iteration {}", outer_iter + 1);
-
-        // Outer loop: update mu, W and y* from the current eta.
-        const BinaryWorkingLmmState working_state = build_binary_working_lmm_state(y, eta);
-
-        // Inner loop: with y* and W fixed, iterate the genetic variance until
-        // the working-LMM variance component converges.
-        const BinaryVarianceFitState variance_fit = fit_binary_working_genetic_variance(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            m_grm_mat,
-            m_xmat,
-            working_state.working_response,
-            working_state.residual_diag,
-            genetic_var,
-            maxiter0,
-            cc_par0,
-            cc_gra0,
-            cc_logL0,
-            m_num_id,
-            "Inner");
-
-        const double genetic_var_new = variance_fit.genetic_var;
-        const BinaryProjectionState& projection_state = variance_fit.projection_state;
-        const VectorXd fixed_effect_new =
-            projection_state.fixed_effect_projection.design_cross_inverse *
-            (projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-             working_state.working_response);
-        const VectorXd random_effect_new =
-            genetic_var_new * projection_state.genetic_times_projected_response;
-        const VectorXd eta_new = m_xmat * fixed_effect_new + random_effect_new;
-
-        const double beta_change =
-            (fixed_effect_new - fixed_effect).norm() /
-            std::max(1.0, fixed_effect.norm());
-        const double eta_change =
-            (eta_new - eta).norm() /
-            std::sqrt(static_cast<double>(m_num_id));
-        const double var_change =
-            std::abs(genetic_var_new - genetic_var) / std::max(1.0, std::abs(genetic_var));
-        const double logL_change = std::isfinite(previous_neg2_reml)
-            ? std::abs(variance_fit.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-
-        spdlog::info("Outer {} fitted genetic variance: {}", outer_iter + 1, genetic_var_new);
-        if (!variance_fit.converged) {
-            spdlog::info("Outer {} inner variance loop hit the maximum number of iterations.", outer_iter + 1);
-        }
-
-        fixed_effect = fixed_effect_new;
-        eta = eta_new;
-        genetic_var = genetic_var_new;
-        previous_neg2_reml = variance_fit.neg2_reml;
-
-        isCC = ((var_change < cc_par0) && (beta_change < cc_par0) && (eta_change < cc_par0)) ||
-               (logL_change < cc_logL0);
-        if (isCC) {
-            break;
-        }
-    }
-
-    if (isCC) {
-        spdlog::info("Binary null-model variances converged");
-    } else {
-        spdlog::info("Binary null-model variances not converged");
-    }
-
-    // Finalize with a couple of outer-style refinements so the cached null
-    // model is consistent with both the working response and the converged
-    // inner variance loop.
-    for (int refine_iter = 0; refine_iter < 2; ++refine_iter) {
-        const BinaryWorkingLmmState refine_working_state = build_binary_working_lmm_state(y, eta);
-        const BinaryVarianceFitState refine_variance_fit = fit_binary_working_genetic_variance(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            m_grm_mat,
-            m_xmat,
-            refine_working_state.working_response,
-            refine_working_state.residual_diag,
-            genetic_var,
-            maxiter0,
-            cc_par0,
-            cc_gra0,
-            cc_logL0,
-            m_num_id,
-            "Final inner");
-        genetic_var = refine_variance_fit.genetic_var;
-        const BinaryProjectionState& refine_projection_state = refine_variance_fit.projection_state;
-        fixed_effect =
-            refine_projection_state.fixed_effect_projection.design_cross_inverse *
-            (refine_projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-             refine_working_state.working_response);
-        const VectorXd random_effect =
-            genetic_var * refine_projection_state.genetic_times_projected_response;
-        eta = m_xmat * fixed_effect + random_effect;
-    }
-
-    m_binary_eta = eta;
-    const BinaryWorkingLmmState final_working_state = build_binary_working_lmm_state(y, m_binary_eta);
-    const BinaryVarianceFitState final_variance_fit = fit_binary_working_genetic_variance(
-        m_grm_mat_group_vec,
-        m_grm_index_vec,
-        m_grm_mat,
-        m_xmat,
-        final_working_state.working_response,
-        final_working_state.residual_diag,
-        genetic_var,
-        maxiter0,
-        cc_par0,
-        cc_gra0,
-        cc_logL0,
-        m_num_id,
-        "Cached inner");
-    genetic_var = final_variance_fit.genetic_var;
-    const BinaryProjectionState& final_projection_state = final_variance_fit.projection_state;
-
-    m_binary_mu = final_working_state.mu;
-    m_binary_working_response = final_working_state.working_response;
-    m_V0_logdet = final_projection_state.inverse_result.logdet;
-    m_Vi0 = final_projection_state.inverse_result.inverse_matrix;
-    m_varcom_null = VectorXd::Constant(1, genetic_var);
-    m_logL_null = m_V0_logdet +
-                  final_projection_state.fixed_effect_projection.design_logdet +
-                  m_binary_working_response.dot(final_projection_state.projected_response);
-
-    spdlog::info("-2 working REML in binary null model: {}", m_logL_null);
-    spdlog::info("Bernoulli log-likelihood at fitted eta: {}",
-        bernoulli_loglikelihood(y, m_binary_mu));
-
-    write_variance_components(m_out_file, m_varcom_null);
-    return m_varcom_null;
-}
-
-VectorXd fastGxE::varcom_main_binary_continuous(
-        VectorXd& init, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0) {
-    spdlog::info("Estimate joint binary-continuous variances using the bivariate working mixed model...");
-    require_binary_continuous_trait_matrix(m_y);
-
-    const MatrixXd original_y = m_y;
-    const VectorXd y_binary = m_y.col(0);
-    const VectorXd y_continuous = m_y.col(1);
-    const MatrixXd joint_design = build_repeated_fixed_effect_design(m_xmat, 2);
-
-    MatrixXd binary_trait = MatrixXd::Zero(m_num_id, 1);
-    binary_trait.col(0) = y_binary;
-    m_y = binary_trait;
-    VectorXd binary_init;
-    const VectorXd binary_varcom = varcom_main_binary(
-        binary_init, maxiter0, cc_par0, cc_gra0, cc_logL0);
-
-    MatrixXd continuous_trait = MatrixXd::Zero(m_num_id, 1);
-    continuous_trait.col(0) = y_continuous;
-    m_y = continuous_trait;
-    if (m_grm_eigenvals.size() != m_num_id || m_grm_eigenvecs.rows() != m_num_id) {
-        process_grm(true);
-    } else {
-        m_y_trans = m_grm_eigenvecs.transpose() * m_y;
-        m_xmat_trans = m_grm_eigenvecs.transpose() * m_xmat;
-    }
-    VectorXd continuous_init;
-    const VectorXd continuous_varcom = varcom_main(
-        continuous_init, maxiter0, cc_par0, cc_gra0, cc_logL0);
-
-    m_y = original_y;
-
-    VectorXd beta_binary = fit_logistic_fixed_effects(m_xmat, y_binary);
-    VectorXd beta_continuous = fit_linear_fixed_effects(m_xmat, y_continuous);
-    VectorXd joint_beta(m_xmat.cols() * 2);
-    joint_beta.head(m_xmat.cols()) = beta_binary;
-    joint_beta.tail(m_xmat.cols()) = beta_continuous;
-
-    VectorXd eta_binary = m_binary_eta.size() == m_num_id
-        ? m_binary_eta
-        : VectorXd(m_xmat * beta_binary);
-
-    VectorXd varcom = init;
-    if (!is_valid_joint_main_variance_components(varcom)) {
-        varcom.resize(4);
-        varcom << binary_varcom(0), 0.0, continuous_varcom(0), continuous_varcom(1);
-    }
-    spdlog::info("Initial binary-continuous variances are: {}", format_vector_for_log(varcom));
-
-    double previous_neg2_reml = std::numeric_limits<double>::infinity();
-    bool isCC = false;
-
-    for (int outer_iter = 0; outer_iter < maxiter0; ++outer_iter) {
-        spdlog::info("Binary-continuous outer iteration {}", outer_iter + 1);
-
-        const JointMainWorkingState working_state =
-            build_joint_main_working_state(m_y, eta_binary);
-        const JointVarianceFitState variance_fit = fit_joint_main_working_variance(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            joint_design,
-            working_state.stacked_response,
-            working_state.binary_residual_diag,
-            varcom,
-            maxiter0,
-            cc_par0,
-            cc_gra0,
-            cc_logL0,
-            m_num_id,
-            "Joint inner");
-
-        const VectorXd joint_beta_new =
-            variance_fit.projection_state.fixed_effect_projection.design_cross_inverse *
-            (variance_fit.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-             working_state.stacked_response);
-        const VectorXd joint_random_new = apply_joint_genetic_random_effect(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            variance_fit.projection_state.projected_response,
-            variance_fit.varcom,
-            m_num_id);
-        const VectorXd eta_binary_new =
-            m_xmat * joint_beta_new.head(m_xmat.cols()) +
-            joint_random_new.head(m_num_id);
-
-        const double beta_change =
-            (joint_beta_new - joint_beta).norm() / std::max(1.0, joint_beta.norm());
-        const double eta_change =
-            (eta_binary_new - eta_binary).norm() / std::sqrt(static_cast<double>(m_num_id));
-        const double var_change =
-            (variance_fit.varcom - varcom).norm() / std::max(1.0, varcom.norm());
-        const double logL_change = std::isfinite(previous_neg2_reml)
-            ? std::abs(variance_fit.neg2_reml - previous_neg2_reml)
-            : std::numeric_limits<double>::infinity();
-        const double gradient_norm = variance_fit.score.norm();
-        const bool fixed_effect_stable =
-            (var_change < cc_par0) && (beta_change < cc_par0) && (eta_change < cc_par0);
-        const bool objective_stable = logL_change < cc_logL0;
-        const bool gradient_small = gradient_norm < cc_gra0;
-
-        spdlog::info("Outer {} fitted variances: {}",
-            outer_iter + 1, format_vector_for_log(variance_fit.varcom));
-        spdlog::info(
-            "Outer {} convergence metrics: var_change={}, beta_change={}, eta_change={}, grad_norm={}, logL_change={}",
-            outer_iter + 1, var_change, beta_change, eta_change, gradient_norm, logL_change);
-
-        joint_beta = joint_beta_new;
-        eta_binary = eta_binary_new;
-        varcom = variance_fit.varcom;
-        previous_neg2_reml = variance_fit.neg2_reml;
-
-        // Outer-loop convergence also requires the inner score to be small.
-        isCC = variance_fit.converged && gradient_small &&
-               (fixed_effect_stable || objective_stable);
-        if (isCC) {
-            break;
-        }
-    }
-
-    if (isCC) {
-        spdlog::info("Binary-continuous null-model variances converged");
-    } else {
-        spdlog::info("Binary-continuous null-model variances not converged");
-    }
-
-    for (int refine_iter = 0; refine_iter < 2; ++refine_iter) {
-        const JointMainWorkingState refine_working_state =
-            build_joint_main_working_state(m_y, eta_binary);
-        const JointVarianceFitState refine_variance_fit = fit_joint_main_working_variance(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            joint_design,
-            refine_working_state.stacked_response,
-            refine_working_state.binary_residual_diag,
-            varcom,
-            maxiter0,
-            cc_par0,
-            cc_gra0,
-            cc_logL0,
-            m_num_id,
-            "Joint final inner");
-        joint_beta =
-            refine_variance_fit.projection_state.fixed_effect_projection.design_cross_inverse *
-            (refine_variance_fit.projection_state.fixed_effect_projection.inverse_times_design.transpose() *
-             refine_working_state.stacked_response);
-        const VectorXd joint_random = apply_joint_genetic_random_effect(
-            m_grm_mat_group_vec,
-            m_grm_index_vec,
-            refine_variance_fit.projection_state.projected_response,
-            refine_variance_fit.varcom,
-            m_num_id);
-        eta_binary = m_xmat * joint_beta.head(m_xmat.cols()) +
-                     joint_random.head(m_num_id);
-        varcom = refine_variance_fit.varcom;
-    }
-
-    const JointMainWorkingState final_working_state =
-        build_joint_main_working_state(m_y, eta_binary);
-    const JointVarianceFitState final_variance_fit = fit_joint_main_working_variance(
-        m_grm_mat_group_vec,
-        m_grm_index_vec,
-        joint_design,
-        final_working_state.stacked_response,
-        final_working_state.binary_residual_diag,
-        varcom,
-        maxiter0,
-        cc_par0,
-        cc_gra0,
-        cc_logL0,
-        m_num_id,
-        "Joint cached inner");
-
-    m_joint_binary_eta = eta_binary;
-    m_joint_binary_mu = final_working_state.binary_mu;
-    m_joint_working_response = final_working_state.stacked_response;
-    m_V0_logdet = final_variance_fit.projection_state.inverse_result.logdet;
-    m_Vi0 = final_variance_fit.projection_state.inverse_result.inverse_matrix;
-    m_varcom_null = final_variance_fit.varcom;
-    m_logL_null = final_variance_fit.neg2_reml;
-
-    spdlog::info("-2 working REML in binary-continuous null model: {}", m_logL_null);
-    spdlog::info("Bernoulli log-likelihood at fitted eta: {}",
-        bernoulli_loglikelihood(y_binary, m_joint_binary_mu));
-
-    write_variance_components(m_out_file, m_varcom_null);
-    return m_varcom_null;
-}
-
-VectorXd fastGxE::varcom_main_multitrait_continuous(
-        VectorXd& init, int maxiter0, double cc_par0, double cc_gra0, double cc_logL0) {
-    spdlog::info("Estimate multitrait continuous variances using the multivariate mixed model...");
-    require_multitrait_continuous_trait_matrix(m_y);
-
-    const MatrixXd original_y = m_y;
-    const std::int64_t num_traits = original_y.cols();
-    const std::int64_t num_covariance_terms = num_lower_triangle_elements(num_traits);
-    const MatrixXd joint_design = build_repeated_fixed_effect_design(m_xmat, num_traits);
-
-    MatrixXd genetic_covariance = MatrixXd::Zero(num_traits, num_traits);
-    MatrixXd residual_covariance = MatrixXd::Zero(num_traits, num_traits);
-    for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-        MatrixXd single_trait_matrix = MatrixXd::Zero(m_num_id, 1);
-        single_trait_matrix.col(0) = original_y.col(trait_index);
-        m_y = single_trait_matrix;
-        if (m_grm_eigenvals.size() != m_num_id || m_grm_eigenvecs.rows() != m_num_id) {
-            process_grm(true);
-        } else {
-            m_y_trans = m_grm_eigenvecs.transpose() * m_y;
-            m_xmat_trans = m_grm_eigenvecs.transpose() * m_xmat;
-        }
-
-        VectorXd single_trait_init;
-        const VectorXd single_trait_varcom = varcom_main(
-            single_trait_init, maxiter0, cc_par0, cc_gra0, cc_logL0);
-        genetic_covariance(trait_index, trait_index) = single_trait_varcom(0);
-        residual_covariance(trait_index, trait_index) = single_trait_varcom(1);
-    }
-
-    m_y = original_y;
-    const VectorXd stacked_response = stack_trait_matrix_rows(original_y);
-
-    VectorXd varcom = init;
-    if (!is_valid_multitrait_continuous_variance_components(varcom, num_traits)) {
-        varcom.resize(2 * num_covariance_terms);
-        varcom.head(num_covariance_terms) = pack_symmetric_matrix_lower_triangle(genetic_covariance);
-        varcom.tail(num_covariance_terms) = pack_symmetric_matrix_lower_triangle(residual_covariance);
-    }
-    spdlog::info("Initial multitrait continuous variances are: {}", format_vector_for_log(varcom));
-
-    const MultitraitContinuousVarianceFitState variance_fit = fit_multitrait_continuous_variance(
-        m_grm_mat_group_vec,
-        m_grm_index_vec,
-        joint_design,
-        stacked_response,
-        varcom,
-        maxiter0,
-        cc_par0,
-        cc_gra0,
-        cc_logL0,
-        m_num_id,
-        num_traits,
-        "Multitrait continuous");
-
-    if (variance_fit.converged) {
-        spdlog::info("Multitrait continuous null-model variances converged");
-    } else {
-        spdlog::info("Multitrait continuous null-model variances not converged");
-    }
-
-    m_joint_working_response = stacked_response;
-    m_V0_logdet = variance_fit.projection_state.inverse_result.logdet;
-    m_Vi0 = variance_fit.projection_state.inverse_result.inverse_matrix;
-    m_varcom_null = variance_fit.varcom;
-    m_logL_null = variance_fit.neg2_reml;
-
-    spdlog::info("-2 REML in multitrait continuous null model: {}", m_logL_null);
-    write_variance_components(m_out_file, m_varcom_null);
-    return m_varcom_null;
-}
-
-
-
+// Genome-wide SNP main-effect scan under the 2-component null model. Working in
+// the GRM eigenbasis it (1) caches the null fixed-effect projection, (2) uses a
+// random panel of SNPs to estimate a single calibration factor gamma =
+// x'V^{-1}x / x'x (the score-test denominator approximation), then (3) streams the
+// genotype matrix in npart_snp chunks and, per SNP, forms a fast score statistic
+// (beta = se^2 * x' (P y), se^2 = 1/(gamma * x'x)) and its chi-square (1 df)
+// p-value. Results pass QC (MAF / missing-rate) and are written to <out>.res,
+// with the random panel written to <out>.random.res.
 /**
  * @Description: Test SNPs with one random-effect model
  */
 void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut, 
-                int maxiter, double cc_par, double cc_gra){
-    (void)speed;
-    (void)p_approx_cut;
-    (void)maxiter;
-    (void)cc_par;
-    (void)cc_gra;
-
-    spdlog::info("Assocation...");
+                bool keep_random,
+                std::int64_t num_random_snp,
+                double maf_cut, double missing_rate_cut){
+    spdlog::info("Association: scanning SNPs for main effects");
     GENO GenoA(bed_file);
     const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
 
@@ -3924,8 +2033,11 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
     load_centered_random_snp_panel(
         GenoA, bed_file, random_snp_index_vec, bed_context.id_index_in_bed_vec,
         snp_mat_part_random, freq_arr, missing_rate_arr, nobs_geno_arr);
+    // Rotate the random SNPs into the GRM eigenbasis so projections are diagonal.
     snp_mat_part_random = m_grm_eigenvecs.transpose() * snp_mat_part_random;
 
+    // Per random SNP: exact score-test p-value and the calibration ratio
+    // gamma_k = x' P x / x'x, later averaged into the single gamma factor.
     VectorXd gamma_correct_Vec(num_random_snp);
     VectorXd p_Vec(num_random_snp);
     #pragma omp parallel for schedule(dynamic)
@@ -3947,17 +2059,23 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
 
     std::int64_t num_random_snp_used = 0;
     double gamma_correct = 0;
-    ofstream fout = open_output_stream(m_out_file + ".random.res");
-    fout << "order af missing gamma p" << std::endl;
+    ofstream fout;
+    if(keep_random){
+        fout = open_output_stream(m_out_file + ".random.assoc");
+        fout << "order\taf\tN\tgamma\tp" << std::endl;
+    }
+    // Average gamma over QC-passing random SNPs to get one calibration factor.
     for(std::int64_t k = 0; k < num_random_snp; k++){
         if (isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut)){
-            fout << random_snp_index_vec[k] << " " << freq_arr(k) << " " << 
-                    missing_rate_arr(k) << " " << gamma_correct_Vec(k) << " " << p_Vec(k) << std::endl;
+            if(keep_random){
+                fout << random_snp_index_vec[k] << "\t" << freq_arr(k) << "\t" <<
+                        static_cast<long long>(nobs_geno_arr(k)) << "\t" << gamma_correct_Vec(k) << "\t" << p_Vec(k) << std::endl;
+            }
             num_random_snp_used++;
             gamma_correct += gamma_correct_Vec[k];
         }
     }
-    fout.close();
+    if(keep_random){ fout.close(); }
 
     require_random_snp_fraction(
         num_random_snp_used, num_random_snp, 0.1,
@@ -3966,12 +2084,23 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
     spdlog::info("Gamma factor: {}", gamma_correct);
     spdlog::info("The number of used random SNPs is: {}", num_random_snp_used);
 
+    // Always write a compact calibration summary to <out>.gamma.
+    {
+        ofstream fout_gamma = open_output_stream(m_out_file + ".gamma");
+        fout_gamma << "term\tvalue" << std::endl;
+        fout_gamma << "gamma_main\t" << gamma_correct << std::endl;
+        fout_gamma << "n_random_used\t" << num_random_snp_used << std::endl;
+        fout_gamma.close();
+    }
+
     // Move back to the sample space for fast genome-wide SNP scanning once the
     // random-SNP calibration factor has been estimated.
-    spdlog::info("Start testing SNPs...");
-    fout = open_output_stream(m_out_file + ".res");
-    fout << "order chrom SNP cm base allele1 allele2 af missing beta se p" << std::endl;
-    
+    spdlog::info("Scanning SNPs for main effects; writing results to {}.assoc", m_out_file);
+    fout = open_output_stream(m_out_file + ".assoc");
+    fout << "order\tchrom\tSNP\tbase\tallele1\tallele2\taf\tN\tbeta\tse\tp" << std::endl;
+
+    // P y mapped back to sample space; dotting each centered SNP with it gives
+    // the score numerator x'(Py) in O(n) per SNP.
     const VectorXd pyarr0 = m_grm_eigenvecs * apply_projection(
         inverse_diagonal,
         null_projection.inverse_times_design,
@@ -3996,7 +2125,8 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
         GenoA.read_bed_centered_to_buffer_omp(bed_file + ".bed", bufs.snp_mat.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
                 partition.start_snp, partition.num_snp_read, bed_context.id_index_in_bed_vec);
 
-        // Test
+        // Test: per SNP compute x'x, the calibrated variance se^2 = 1/(gamma*x'x),
+        // the effect beta = se^2 * x'(Py), and the chi-square(1) p-value.
         #pragma omp parallel for schedule(dynamic)
         for (int j = 0; j < partition.num_snp_read; ++j) {
             bufs.geno_var[j] = cblas_ddot(
@@ -4032,426 +2162,58 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
             }
         }
         const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
-        fastGxE::output(fout, snp_info_vec, freq_arr, missing_rate_arr,
-            bufs.eff.data(), bufs.se.data(), bufs.p, partition.start_snp, partition.num_snp_read, p_cut);
+        fastGxE::output(fout, snp_info_vec, freq_arr, nobs_geno_arr,
+            bufs.eff.data(), bufs.se.data(), bufs.p, partition.start_snp, partition.num_snp_read);
     }
     fout.close();
 }
 
-void fastGxE::test_main_binary(const string& bed_file, std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra){
-    (void)speed;
-    (void)p_approx_cut;
-    (void)maxiter;
-    (void)cc_par;
-    (void)cc_gra;
+// ===== Result output =====
 
-    spdlog::info("Association for binary trait using logistic mixed model...");
-    require_binary_trait_matrix(m_y);
-    if (m_binary_working_response.size() != m_num_id) {
-        fatal_error("Binary null-model working response is unavailable. Run varcom_main_binary first.");
-    }
-
-    GENO GenoA(bed_file);
-    const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
-
-    const ProjectionCache null_projection = build_projection_cache(m_Vi0, m_xmat);
-    const VectorXd projected_working_response = apply_projection(
-        m_Vi0,
-        null_projection.inverse_times_design,
-        null_projection.design_cross_inverse,
-        m_binary_working_response);
-
-    spdlog::info("Randomly select SNPs and calibrate the binary score variance");
-    const vector<std::int64_t> random_snp_index_vec = sample_random_snp_indices(bed_context.num_snp, num_random_snp);
-    MatrixXd snp_mat_part_random;
-    VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
-    load_centered_random_snp_panel(
-        GenoA, bed_file, random_snp_index_vec, bed_context.id_index_in_bed_vec,
-        snp_mat_part_random, freq_arr, missing_rate_arr, nobs_geno_arr);
-
-    VectorXd gamma_correct_Vec = VectorXd::Constant(num_random_snp, std::numeric_limits<double>::quiet_NaN());
-    VectorXd p_Vec = VectorXd::Constant(num_random_snp, std::numeric_limits<double>::quiet_NaN());
-    #pragma omp parallel for schedule(dynamic)
-    for(std::int64_t k = 0; k < num_random_snp; ++k){
-        const VectorXd snp_vec = snp_mat_part_random.col(k);
-        const VectorXd projected_snp = apply_projection(
-            m_Vi0,
-            null_projection.inverse_times_design,
-            null_projection.design_cross_inverse,
-            snp_vec);
-        const double geno_var = snp_vec.squaredNorm();
-        const double score = snp_vec.dot(projected_working_response);
-        const double projected_var = snp_vec.dot(projected_snp);
-        gamma_correct_Vec(k) = projected_var / geno_var;
-        if (projected_var > 0.0) {
-            p_Vec(k) = gsl_cdf_chisq_Q(score * score / projected_var, 1);
-        }
-    }
-    snp_mat_part_random.resize(0, 0);
-
-    std::int64_t num_random_snp_used = 0;
-    double gamma_correct = 0.0;
-    ofstream fout = open_output_stream(m_out_file + ".random.res");
-    fout << "order af missing gamma p" << std::endl;
-    for(std::int64_t k = 0; k < num_random_snp; ++k){
-        if (isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut) &&
-                std::isfinite(gamma_correct_Vec(k)) && gamma_correct_Vec(k) > 0.0){
-            fout << random_snp_index_vec[k] << " " << freq_arr(k) << " "
-                 << missing_rate_arr(k) << " " << gamma_correct_Vec(k) << " "
-                 << p_Vec(k) << std::endl;
-            ++num_random_snp_used;
-            gamma_correct += gamma_correct_Vec(k);
-        }
-    }
-    fout.close();
-
-    require_random_snp_fraction(
-        num_random_snp_used, num_random_snp, 0.1,
-        "The number of used random SNPs to calibrate the binary score is: {}, which is less than 10% of random SNPs");
-    gamma_correct /= num_random_snp_used;
-    if (!(gamma_correct > 0.0)) {
-        fatal_error("The calibrated binary score variance factor must be positive.");
-    }
-
-    spdlog::info("Binary gamma factor: {}", gamma_correct);
-    spdlog::info("The number of used random SNPs is: {}", num_random_snp_used);
-
-    spdlog::info("Start testing SNPs for the binary trait...");
-    fout = open_output_stream(m_out_file + ".res");
-    fout << "order chrom SNP cm base allele1 allele2 af missing beta se p" << std::endl;
-
-    SnpScalarScanBuffers bufs;
-    bufs.resize(get_snp_partition(start_pos, end_pos, npart_snp, 0).num_snp_read, bed_context.num_id_used);
-
-    for(std::int64_t i = 0; i < npart_snp; ++i){
-        const SnpPartition partition = get_snp_partition(start_pos, end_pos, npart_snp, i);
-        if(bufs.needs_resize(partition.num_snp_read)){
-            bufs.resize(partition.num_snp_read, bed_context.num_id_used);
-        }
-
-        spdlog::info("Part {}/{}: Start SNP, {}; the number of read SNP, {}",
-             i + 1, npart_snp, partition.start_snp, partition.num_snp_read);
-
-        GenoA.read_bed_centered_to_buffer_omp(
-            bed_file + ".bed", bufs.snp_mat.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
-            partition.start_snp, partition.num_snp_read, bed_context.id_index_in_bed_vec);
-
-        #pragma omp parallel for schedule(dynamic)
-        for (int j = 0; j < partition.num_snp_read; ++j) {
-            bufs.geno_var[j] = cblas_ddot(
-                bed_context.num_id_used, bufs.snp_mat.data() + j * bed_context.num_id_used, 1,
-                bufs.snp_mat.data() + j * bed_context.num_id_used, 1);
-            bufs.se[j] = 1.0 / (gamma_correct * bufs.geno_var[j]);
-        }
-
-        cblas_dgemv(CblasRowMajor, CblasNoTrans, partition.num_snp_read, bed_context.num_id_used, 1.0,
-            bufs.snp_mat.data(), bed_context.num_id_used, projected_working_response.data(), 1, 0.0, bufs.prod.data(), 1);
-        vdMul(partition.num_snp_read, bufs.se.data(), bufs.prod.data(), bufs.eff.data());
-
-        #pragma omp parallel for schedule(dynamic)
-        for (int j = 0; j < partition.num_snp_read; ++j) {
-            const double variance = bufs.se[j];
-            if (std::isfinite(variance) && variance > 0.0) {
-                bufs.se[j] = std::sqrt(variance);
-            } else {
-                bufs.se[j] = NAN;
-            }
-        }
-
-        #pragma omp parallel for schedule(dynamic)
-        for (std::int64_t k = 0; k < partition.num_snp_read; ++k) {
-            if (isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut) &&
-                    std::isfinite(bufs.eff[k]) && std::isfinite(bufs.se[k]) && bufs.se[k] > 0.0) {
-                const double beta = bufs.eff[k];
-                const double se = bufs.se[k];
-                bufs.p(k) = gsl_cdf_chisq_Q(beta * beta / (se * se), 1);
-            } else {
-                bufs.eff[k] = NAN;
-                bufs.se[k] = NAN;
-                bufs.p(k) = NAN;
-            }
-        }
-
-        const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
-        fastGxE::output(
-            fout, snp_info_vec, freq_arr, missing_rate_arr, bufs.eff.data(), bufs.se.data(),
-            bufs.p, partition.start_snp, partition.num_snp_read, p_cut);
-    }
-    fout.close();
-}
-
-void fastGxE::test_main_binary_continuous(const string& bed_file,
-                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra) {
-    (void)speed;
-    (void)num_random_snp;
-    (void)p_approx_cut;
-    (void)p_cut;
-    (void)maxiter;
-    (void)cc_par;
-    (void)cc_gra;
-
-    spdlog::info("Association for the joint binary-continuous model...");
-    require_binary_continuous_trait_matrix(m_y);
-    if (m_joint_working_response.size() != 2 * m_num_id) {
-        fatal_error("Joint binary-continuous working response is unavailable. Run a joint binary-continuous null model first.");
-    }
-
-    GENO GenoA(bed_file);
-    const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
-    const MatrixXd joint_design = build_repeated_fixed_effect_design(m_xmat, 2);
-    const ProjectionCache null_projection = build_projection_cache(m_Vi0, joint_design);
-    const VectorXd projected_joint_response = apply_projection(
-        m_Vi0,
-        null_projection.inverse_times_design,
-        null_projection.design_cross_inverse,
-        m_joint_working_response);
-
-    ofstream fout = open_output_stream(m_out_file + ".res");
-    fout << "order chrom SNP cm base allele1 allele2 af missing"
-         << " beta_binary se_binary p_binary"
-         << " beta_continuous se_continuous p_continuous"
-         << " p_joint" << std::endl;
-
-    SnpMatrixScanBuffers bufs;
-    bufs.resize(get_snp_partition(start_pos, end_pos, npart_snp, 0).num_snp_read,
-                bed_context.num_id_used, 2, 3);
-    VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
-
-    for (std::int64_t ipart = 0; ipart < npart_snp; ++ipart) {
-        const SnpPartition partition = get_snp_partition(start_pos, end_pos, npart_snp, ipart);
-        if (bufs.needs_resize(partition.num_snp_read)) {
-            bufs.resize(partition.num_snp_read, bed_context.num_id_used, 2, 3);
-        } else {
-            bufs.reset_values();
-        }
-
-        spdlog::info("Part {}/{}: Start SNP, {}; the number of read SNP, {}",
-            ipart + 1, npart_snp, partition.start_snp, partition.num_snp_read);
-
-        GenoA.read_bed_centered_to_buffer_omp(
-            bed_file + ".bed", bufs.snp_mat.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
-            partition.start_snp, partition.num_snp_read, bed_context.id_index_in_bed_vec);
-
-        #pragma omp parallel for schedule(dynamic)
-        for (std::int64_t k = 0; k < partition.num_snp_read; ++k) {
-            if (!isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut)) {
-                continue;
-            }
-
-            Eigen::Map<Eigen::VectorXd> snp_vec(
-                bufs.snp_mat.data() + k * bed_context.num_id_used, bed_context.num_id_used);
-            MatrixXd snp_design = MatrixXd::Zero(2 * m_num_id, 2);
-            snp_design.block(0, 0, m_num_id, 1) = snp_vec;
-            snp_design.block(m_num_id, 1, m_num_id, 1) = snp_vec;
-
-            const MatrixXd projected_snp_design = apply_projection(
-                m_Vi0,
-                null_projection.inverse_times_design,
-                null_projection.design_cross_inverse,
-                snp_design);
-            const MatrixXd information = snp_design.transpose() * projected_snp_design;
-            Eigen::LDLT<MatrixXd> ldlt(information);
-            if (ldlt.info() != Eigen::Success) {
-                continue;
-            }
-
-            const VectorXd score = snp_design.transpose() * projected_joint_response;
-            const VectorXd beta = ldlt.solve(score);
-            const MatrixXd covariance = ldlt.solve(MatrixXd::Identity(2, 2));
-            if (!beta.allFinite() || !covariance.allFinite() ||
-                    covariance(0, 0) <= 0.0 || covariance(1, 1) <= 0.0) {
-                continue;
-            }
-
-            bufs.beta_mat.row(k) = beta.transpose();
-            bufs.se_mat(k, 0) = std::sqrt(covariance(0, 0));
-            bufs.se_mat(k, 1) = std::sqrt(covariance(1, 1));
-            bufs.p_mat(k, 0) = gsl_cdf_chisq_Q(beta(0) * beta(0) / covariance(0, 0), 1);
-            bufs.p_mat(k, 1) = gsl_cdf_chisq_Q(beta(1) * beta(1) / covariance(1, 1), 1);
-            const double joint_chisq = std::max(score.dot(beta), 0.0);
-            bufs.p_mat(k, 2) = gsl_cdf_chisq_Q(joint_chisq, 2);
-        }
-
-        const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
-        for (std::int64_t k = 0; k < partition.num_snp_read; ++k) {
-            fout << partition.start_snp + k << " " << snp_info_vec[k] << " "
-                 << freq_arr(k) << " " << missing_rate_arr(k) << " "
-                 << bufs.beta_mat(k, 0) << " " << bufs.se_mat(k, 0) << " " << bufs.p_mat(k, 0) << " "
-                 << bufs.beta_mat(k, 1) << " " << bufs.se_mat(k, 1) << " " << bufs.p_mat(k, 1) << " "
-                 << bufs.p_mat(k, 2) << std::endl;
-        }
-    }
-
-    fout.close();
-}
-
-void fastGxE::test_main_multitrait_continuous(const string& bed_file,
-                std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut,
-                int maxiter, double cc_par, double cc_gra) {
-    (void)speed;
-    (void)num_random_snp;
-    (void)p_approx_cut;
-    (void)p_cut;
-    (void)maxiter;
-    (void)cc_par;
-    (void)cc_gra;
-
-    spdlog::info("Association for the multitrait continuous model...");
-    require_multitrait_continuous_trait_matrix(m_y);
-    const std::int64_t num_traits = m_y.cols();
-    if (m_joint_working_response.size() != num_traits * m_num_id) {
-        fatal_error("Multitrait continuous response is unavailable. Run varcom_main_multitrait_continuous first.");
-    }
-
-    GENO GenoA(bed_file);
-    const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
-    const MatrixXd joint_design = build_repeated_fixed_effect_design(m_xmat, num_traits);
-    const ProjectionCache null_projection = build_projection_cache(m_Vi0, joint_design);
-    const VectorXd projected_joint_response = apply_projection(
-        m_Vi0,
-        null_projection.inverse_times_design,
-        null_projection.design_cross_inverse,
-        m_joint_working_response);
-
-    ofstream fout = open_output_stream(m_out_file + ".res");
-    fout << "order chrom SNP cm base allele1 allele2 af missing";
-    for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-        const std::string raw_label =
-            trait_index < static_cast<std::int64_t>(m_trait_name_vec.size())
-                ? m_trait_name_vec[trait_index]
-                : ("trait" + std::to_string(trait_index + 1));
-        const std::string trait_label = sanitize_output_label(raw_label);
-        fout << " beta_" << trait_label
-             << " se_" << trait_label
-             << " p_" << trait_label;
-    }
-    fout << " p_joint" << std::endl;
-
-    SnpMatrixScanBuffers bufs;
-    bufs.resize(get_snp_partition(start_pos, end_pos, npart_snp, 0).num_snp_read,
-                bed_context.num_id_used, num_traits, num_traits + 1);
-    VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
-
-    for (std::int64_t ipart = 0; ipart < npart_snp; ++ipart) {
-        const SnpPartition partition = get_snp_partition(start_pos, end_pos, npart_snp, ipart);
-        if (bufs.needs_resize(partition.num_snp_read)) {
-            bufs.resize(partition.num_snp_read, bed_context.num_id_used,
-                        num_traits, num_traits + 1);
-        } else {
-            bufs.reset_values();
-        }
-
-        spdlog::info("Part {}/{}: Start SNP, {}; the number of read SNP, {}",
-            ipart + 1, npart_snp, partition.start_snp, partition.num_snp_read);
-
-        GenoA.read_bed_centered_to_buffer_omp(
-            bed_file + ".bed", bufs.snp_mat.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
-            partition.start_snp, partition.num_snp_read, bed_context.id_index_in_bed_vec);
-
-        #pragma omp parallel for schedule(dynamic)
-        for (std::int64_t k = 0; k < partition.num_snp_read; ++k) {
-            if (!isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut)) {
-                continue;
-            }
-
-            Eigen::Map<Eigen::VectorXd> snp_vec(
-                bufs.snp_mat.data() + k * bed_context.num_id_used, bed_context.num_id_used);
-            MatrixXd snp_design = MatrixXd::Zero(num_traits * m_num_id, num_traits);
-            for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-                snp_design.block(trait_index * m_num_id, trait_index, m_num_id, 1) = snp_vec;
-            }
-
-            const MatrixXd projected_snp_design = apply_projection(
-                m_Vi0,
-                null_projection.inverse_times_design,
-                null_projection.design_cross_inverse,
-                snp_design);
-            const MatrixXd information = snp_design.transpose() * projected_snp_design;
-            Eigen::LDLT<MatrixXd> ldlt(information);
-            if (ldlt.info() != Eigen::Success) {
-                continue;
-            }
-
-            const VectorXd score = snp_design.transpose() * projected_joint_response;
-            const VectorXd beta = ldlt.solve(score);
-            const MatrixXd covariance = ldlt.solve(MatrixXd::Identity(num_traits, num_traits));
-            if (!beta.allFinite() || !covariance.allFinite()) {
-                continue;
-            }
-
-            bufs.beta_mat.row(k) = beta.transpose();
-            bool has_valid_standard_errors = true;
-            for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-                if (covariance(trait_index, trait_index) <= 0.0) {
-                    has_valid_standard_errors = false;
-                    break;
-                }
-                bufs.se_mat(k, trait_index) = std::sqrt(covariance(trait_index, trait_index));
-                bufs.p_mat(k, trait_index) = gsl_cdf_chisq_Q(
-                    beta(trait_index) * beta(trait_index) / covariance(trait_index, trait_index), 1);
-            }
-            if (!has_valid_standard_errors) {
-                bufs.beta_mat.row(k).setConstant(std::numeric_limits<double>::quiet_NaN());
-                bufs.se_mat.row(k).setConstant(std::numeric_limits<double>::quiet_NaN());
-                bufs.p_mat.row(k).setConstant(std::numeric_limits<double>::quiet_NaN());
-                continue;
-            }
-            const double joint_chisq = std::max(score.dot(beta), 0.0);
-            bufs.p_mat(k, num_traits) = gsl_cdf_chisq_Q(joint_chisq, num_traits);
-        }
-
-        const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
-        for (std::int64_t k = 0; k < partition.num_snp_read; ++k) {
-            fout << partition.start_snp + k << " " << snp_info_vec[k] << " "
-                 << freq_arr(k) << " " << missing_rate_arr(k);
-            for (std::int64_t trait_index = 0; trait_index < num_traits; ++trait_index) {
-                fout << " " << bufs.beta_mat(k, trait_index)
-                     << " " << bufs.se_mat(k, trait_index)
-                     << " " << bufs.p_mat(k, trait_index);
-            }
-            fout << " " << bufs.p_mat(k, num_traits) << std::endl;
-        }
-    }
-
-    fout.close();
-}
-
-
-void fastGxE::output(ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
+// Writes one result row per SNP for the main-effect scan (annotation, frequency,
+// missing rate, effect, SE, p-value) to the output stream.
+void fastGxE::output(ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
                 const double* eff_arr, const double* se_arr, const VectorXd& p_arr,
-                std::int64_t start_snp, std::int64_t num_snp_read, double p_cut){
+                std::int64_t start_snp, std::int64_t num_snp_read){
     for(std::int64_t i = 0; i < num_snp_read; i++){
-        fout << start_snp + i << " " << snp_info_vec[i] << " " << freq_arr(i) << " "  << missing_rate_arr(i) << " "
-                << " " << eff_arr[i] << " " << se_arr[i] 
-                << " "<< p_arr(i) << std::endl;
+        fout << start_snp + i << "\t" << snp_info_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i))
+                << "\t" << eff_arr[i] << "\t" << se_arr[i]
+                << "\t" << p_arr(i) << std::endl;
     }
 }
 
+// Appends a "<first>_<second>" suffix to the output prefix so that range- or
+// task-split runs write to distinct files.
 void fastGxE::reset_output_prefix(const string& out_file, std::int64_t first, std::int64_t second){
     m_out_file = out_file + "." + std::to_string(first) + "_"  + std::to_string(second);
 }
 
+// SNP QC predicate: passes if the allele frequency is within [maf_cut, 1-maf_cut]
+// and the missing-genotype rate is below missing_rate_cut.
 bool fastGxE::isValidSnp(double af, double missing_rate, double maf_cut, double missing_rate_cut) {
     return af > maf_cut && af < 1 - maf_cut && missing_rate < missing_rate_cut;
 }
 
 
 
+// Multi-environment GxE scan that produces a single combined GxE statistic per
+// SNP (structLMM-style), as opposed to the per-environment breakdown of test_GxE.
+// Using the cached null V^{-1} (m_Vi0): (1) a random SNP panel calibrates the
+// main-effect gamma and the matrices gamma_GxE (with and without the SNP main
+// effect) whose eigenvalues weight a mixture-of-chi-squares; (2) per genome-wide
+// SNP it computes the main-effect test, then a score statistic
+//   score = || E' diag(x) P y ||^2
+// whose null distribution is a weighted sum of chi-squares evaluated with the
+// saddlepoint approximation (saddle). When the approximate main- or GxE-p crosses
+// p_approx_cut it refits exactly (exact == true) or with an approximate calibration.
+// Results go to <out>.res; the random panel to <out>.random.res.
 /**
- * @Description: Assocation of GxE using an improved structLMM model
+ * @Description: Association of GxE using an improved structLMM model
  */
 void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut){
-    spdlog::info("Assocation...");
+                bool exact, std::int64_t num_random_snp,
+                double p_approx_cut, double maf_cut, double missing_rate_cut){
+    spdlog::info("Association: combined multi-environment GxE scan");
     GENO GenoA(bed_file);
     vector<std::int64_t> id_index_in_bed_vec = GenoA.find_fam_index(m_id_in_data_vec);
     std::int64_t num_id_used = id_index_in_bed_vec.size();
@@ -4470,9 +2232,12 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
     MatrixXd snp_mat_part_random;
     VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
     GenoA.read_bed_by_snp_indices(bed_file + ".bed", snp_mat_part_random, freq_arr, missing_rate_arr, nobs_geno_arr, random_snp_index_vec, id_index_in_bed_vec);
+    // Mean-center each random SNP column.
     snp_mat_part_random.rowwise() -= 2*freq_arr.transpose();
 
-    // main 
+    // Per-random-SNP calibration accumulators: main-effect gamma, and the GxE
+    // gamma matrices (with / without the SNP main effect) plus their statistics.
+    // main
     VectorXd beta_main_Vec = VectorXd::Ones(num_random_snp) * NAN;
     VectorXd se_main_Vec = VectorXd::Ones(num_random_snp) * NAN;
     VectorXd p_main_Vec = VectorXd::Ones(num_random_snp) * NAN;
@@ -4494,7 +2259,7 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
             VectorXd snpk = snp_mat_part_random.col(i);
             double snp_norm2 = snpk.transpose() * snpk;
 
-            // main
+            // main: exact LMM main-effect estimate and gamma = (x'V^{-1}x)/(x'x).
             double beta_main_var = 1 / (snpk.transpose() * this->m_Vi0 * snpk);
             se_main_Vec(i) = sqrt(beta_main_var);
             double beta_main = beta_main_var * snpk.transpose() * Vi0y;
@@ -4503,7 +2268,9 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
             p_main_Vec(i) = p_main;
             gamma_main_Vec(i) = (1 / beta_main_var) / snp_norm2;
 
-            // GxE without main effect
+            // GxE without main effect: score = ||(E∘x)' V^{-1} y||^2; its null is
+            // a weighted chi-square mixture with weights = eig(EoG' V^{-1} EoG),
+            // and saddle() gives the p-value. EoG = E elementwise-scaled by the SNP.
             MatrixXd EoG = this->m_bye_mat.array().colwise() * snpk.array();
             VectorXd EoGtViy = EoG.transpose() * Vi0y;
             double score = EoGtViy.transpose() * EoGtViy;
@@ -4516,7 +2283,8 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
             VectorXd a = eigensolver.eigenvalues().real();
             p_GxEnoMain_Vec(i) = saddle(score, a);
 
-            // GxE with main effect
+            // GxE with main effect: same score test but with the SNP main effect
+            // projected out of y (P from the scalar projection on snpk).
             ScalarProjectionCache snp_main_projection = build_scalar_projection_cache(this->m_Vi0, snpk);
             VectorXd projected_null_response = apply_projection(
                 this->m_Vi0,
@@ -4574,6 +2342,8 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
     gamma_GxEwithMain /= num_random_snp_used;
     spdlog::info("The number of used random SNPs is: {}", num_random_snp_used);
     
+    // Eigenvalues of the averaged gamma matrices become the chi-square mixture
+    // weights used (scaled by x'x per SNP) in the genome-wide saddlepoint tests.
     Eigen::VectorXd chi2_coef_GxEnoMain_Vec; // coefficient weights for chi2
     Eigen::VectorXd chi2_coef_GxEwithMain_Vec;
     Eigen::EigenSolver<Eigen::MatrixXd> eigensolver;
@@ -4638,7 +2408,8 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
                 double p_main = gsl_cdf_chisq_Q(beta_main * beta_main / beta_main_var, 1);
                 p_main_Vec(k) = p_main;
 
-                // GxE without main effect
+                // GxE without main effect: fast combined score using the
+                // precomputed chi-square weights (scaled by x'x) for the p-value.
                 vdMul(num_id_used, Vi0y_pt, snp_mat_part.data() + k*num_id_used, EP0y_part[thread_id].data());
                 cblas_dgemv(CblasColMajor, CblasTrans, num_id_used, m_num_bye, 1.0, bye_mat_pt, num_id_used,
                             EP0y_part[thread_id].data(), 1, 0.0, WEP0y_part[thread_id].data(), 1);
@@ -4646,6 +2417,8 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
                 VectorXd chi_coef_Vec_kth = chi2_coef_GxEnoMain_Vec * snpk_norm2;
                 double p_gxe = saddle(score, chi_coef_Vec_kth);
 
+                // Only the promising SNPs are refined with the (more expensive)
+                // main-effect-adjusted GxE test: exact (exact == true) or approximate.
                 if(p_main < p_approx_cut || p_gxe < p_approx_cut){
                     // GxE with main effect
                     Eigen::Map<Eigen::VectorXd> snpk(snp_mat_part.data() + k * num_id_used, num_id_used);
@@ -4656,7 +2429,7 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
                         snp_main_projection.design_cross_inverse,
                         m_y).col(0);
                     
-                    if(speed == 0){
+                    if(exact){
                         // exact test
                         MatrixXd EoG = this->m_bye_mat.array().colwise() * snpk.array();
                         VectorXd EoGtPy = EoG.transpose() * projected_null_response;
@@ -4697,6 +2470,9 @@ void fastGxE::test_GxE_multi(const string& bed_file, std::int64_t start_pos, std
     fout.close();
 }
 
+// Writes one result row per SNP for the multi-environment GxE scan: annotation,
+// frequency, missing rate, the main-effect estimate and the combined GxE score /
+// p-value.
 void fastGxE::output_GxE_multi(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
             const VectorXd& beta_main_Vec, const VectorXd& se_main_Vec, const VectorXd& p_main_Vec,
             const VectorXd& score_Vec, const VectorXd& p_Vec, std::int64_t start_snp, std::int64_t num_snp_read){
@@ -4707,13 +2483,28 @@ void fastGxE::output_GxE_multi(std::ofstream& fout, const vector<string>& snp_in
     }
 }
 
+// Main per-environment GxE genome-wide scan (the default --test-gxe path).
+// Using the cached null V^{-1} (m_Vi0) it runs four stages, all calibrated on a
+// random SNP panel so the genome-wide pass is cheap:
+//   1) main effect: average gamma_main = (x'V^{-1}x)/(x'x);
+//   2) marginal GxE per environment without the SNP main effect: gamma_GxEnoMain;
+//   3) joint SNP + single-environment fits: per-environment 2x2 gamma matrices;
+//   4) genome-wide scan: for each SNP compute the main-effect and per-environment
+//      interaction z-scores from the calibrated denominators, refit exactly /
+//      approximately only when a p-value passes p_approx_cut, combine the
+//      per-environment GxE p-values with ACAT (p_single), compute a correlation-
+//      based combined score test (p_multi) via the saddlepoint method on the
+//      environment-correlation eigenvalues, and ACAT-combine the two into p_gxe.
+// Results are written to <out>.res with per-stage random panels alongside.
 void fastGxE::test_GxE(const string& bed_file,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
-                int speed, std::int64_t num_random_snp,
-                double p_approx_cut, double p_cut, double maf_cut, double missing_rate_cut){
-    (void)p_cut;
+                bool keep_random,
+                double exact_cut, std::int64_t num_random_snp,
+                double p_approx_cut, double maf_cut, double missing_rate_cut){
 
-    spdlog::info("GxE analysis for individual environments");
+    spdlog::info("Association: SNP-by-environment (GxE) scan for individual environments");
+    spdlog::info("GxE exact-refit cutoff for promising SNPs: {}",
+            exact_cut <= 0.0 ? "disabled" : (exact_cut >= 1.0 ? "all" : "p < " + std::to_string(exact_cut)));
     GENO GenoA(bed_file);
     const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
     spdlog::info("The number of used iids: {}", bed_context.num_id_used);
@@ -4729,7 +2520,7 @@ void fastGxE::test_GxE(const string& bed_file,
     const VectorXd snp_squaredNorm_Vec = snp_mat_part_random.colwise().squaredNorm();
 
     // 1) Random-SNP calibration for the SNP main effect.
-    spdlog::info("main");
+    spdlog::info("Calibrating gamma: SNP main effect");
     VectorXd p_main_Vec = VectorXd::Ones(num_random_snp) * NAN;
     VectorXd beta_main_var_Vec = 1 / ((snp_mat_part_random).cwiseProduct(m_Vi0 * snp_mat_part_random)).colwise().sum().array();
     VectorXd se_main_Vec = beta_main_var_Vec.array().sqrt();
@@ -4755,19 +2546,21 @@ void fastGxE::test_GxE(const string& bed_file,
     require_random_snp_fraction(num_random_snp_used, num_random_snp, 0.5, "Used random SNPs: {} (<50%)");
     gamma_main /= num_random_snp_used;
 
-    ofstream fout = open_output_stream(m_out_file + ".main.random.res");
-    
-    fout << "order af missing gamma beta se p" << std::endl;
-    for(std::int64_t i = 0; i < num_random_snp; i++){
-        fout << random_snp_index_vec[i] << " " << freq_arr(i) << " " << missing_rate_arr(i) << " "
-              << gamma_main_Vec[i] << " " << beta_main_Vec[i] << " " << se_main_Vec[i] << " " << p_main_Vec[i]
-               << std::endl;
+    ofstream fout;
+    if(keep_random){
+        fout = open_output_stream(m_out_file + ".main.random.assoc");
+        fout << "order\taf\tN\tgamma\tbeta\tse\tp" << std::endl;
+        for(std::int64_t i = 0; i < num_random_snp; i++){
+            fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i)) << "\t"
+                  << gamma_main_Vec[i] << "\t" << beta_main_Vec[i] << "\t" << se_main_Vec[i] << "\t" << p_main_Vec[i]
+                   << std::endl;
+        }
+        fout.close();
     }
-    fout.close();
     gamma_main_Vec.resize(0); beta_main_Vec.resize(0); se_main_Vec.resize(0); p_main_Vec.resize(0); beta_main_var_Vec.resize(0);
 
     // 2) Random-SNP calibration for marginal GxE terms without the SNP main effect.
-    spdlog::info("GxE without main");
+    spdlog::info("Calibrating gamma: GxE (no main effect)");
     VectorXd gamma_GxEnoMain_Vec = VectorXd::Zero(m_num_bye);
     MatrixXd beta_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
     MatrixXd se_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
@@ -4800,26 +2593,28 @@ void fastGxE::test_GxE(const string& bed_file,
     }
     gamma_GxEnoMain_Vec = gamma_GxEnoMain_Vec / num_random_snp_used;
 
-    fout = open_output_stream(m_out_file + ".GxEnoMain.random.res");
-    fout << "order af missing";
-    for(std::int64_t i = 0; i < m_num_bye; i++){
-        fout << " gamma" << i + 1 << " beta" << i + 1 << " se" << i + 1 << " p" << i + 1;
-    }
-    fout << std::endl;
-
-    for(std::int64_t i = 0; i < num_random_snp; i++){
-        fout << random_snp_index_vec[i] << " " << freq_arr(i) << " " << missing_rate_arr(i);
-        for(std::int64_t j = 0; j < m_num_bye; j++){
-            fout <<  " " << gamma_GxEnoMain_Mat(i, j) << " " << beta_GxEnoMain_Mat(i, j) << " " 
-            << se_GxEnoMain_Mat(i, j) << " " << p_GxEnoMain_Mat(i, j);
+    if(keep_random){
+        fout = open_output_stream(m_out_file + ".GxEnoMain.random.assoc");
+        fout << "order\taf\tN";
+        for(std::int64_t i = 0; i < m_num_bye; i++){
+            fout << "\tgamma_" << m_bye_name_vec[i] << "\tbeta_" << m_bye_name_vec[i] << "\tse_" << m_bye_name_vec[i] << "\tp_" << m_bye_name_vec[i];
         }
         fout << std::endl;
+
+        for(std::int64_t i = 0; i < num_random_snp; i++){
+            fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i));
+            for(std::int64_t j = 0; j < m_num_bye; j++){
+                fout <<  "\t" << gamma_GxEnoMain_Mat(i, j) << "\t" << beta_GxEnoMain_Mat(i, j) << "\t"
+                << se_GxEnoMain_Mat(i, j) << "\t" << p_GxEnoMain_Mat(i, j);
+            }
+            fout << std::endl;
+        }
+        fout.close();
     }
-    fout.close();
     gamma_GxEnoMain_Mat.resize(0, 0); beta_GxEnoMain_Mat.resize(0, 0); se_GxEnoMain_Mat.resize(0, 0); p_GxEnoMain_Mat.resize(0, 0);
 
     // 3) Random-SNP calibration for joint SNP + single-environment fits.
-    spdlog::info("GxE with main");
+    spdlog::info("Calibrating gamma: GxE (with main effect)");
     MatrixXd beta_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
     MatrixXd se_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
     MatrixXd p_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
@@ -4869,20 +2664,37 @@ void fastGxE::test_GxE(const string& bed_file,
     }
 
     
-    fout = open_output_stream(m_out_file + ".GxE.random.res");
-    fout << "order af missing";
-    for(std::int64_t i = 0; i < m_num_bye; i++){
-        fout << " beta" << i + 1 << " se" << i + 1 << " p" << i + 1;
-    }
-    fout << std::endl;
-    for(std::int64_t i = 0; i < num_random_snp; i++){
-        fout << random_snp_index_vec[i] << " " << freq_arr(i) << " " << missing_rate_arr(i);
-        for(std::int64_t j = 0; j < m_num_bye; j++){
-            fout << " " << beta_Mat(i, j) << " " << se_Mat(i, j) << " " << p_Mat(i, j);
+    if(keep_random){
+        fout = open_output_stream(m_out_file + ".GxE.random.assoc");
+        fout << "order\taf\tN";
+        for(std::int64_t i = 0; i < m_num_bye; i++){
+            fout << "\tbeta_" << m_bye_name_vec[i] << "\tse_" << m_bye_name_vec[i] << "\tp_" << m_bye_name_vec[i];
         }
         fout << std::endl;
+        for(std::int64_t i = 0; i < num_random_snp; i++){
+            fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i));
+            for(std::int64_t j = 0; j < m_num_bye; j++){
+                fout << "\t" << beta_Mat(i, j) << "\t" << se_Mat(i, j) << "\t" << p_Mat(i, j);
+            }
+            fout << std::endl;
+        }
+        fout.close();
     }
-    fout.close();
+
+    // Always write a compact calibration summary to <out>.gamma.
+    {
+        ofstream fout_gamma = open_output_stream(m_out_file + ".gamma");
+        fout_gamma << "term\tvalue" << std::endl;
+        fout_gamma << "gamma_main\t" << gamma_main << std::endl;
+        for(std::int64_t j = 0; j < m_num_bye; j++){
+            fout_gamma << "gamma_noMain_" << m_bye_name_vec[j] << "\t" << gamma_GxEnoMain_Vec(j) << std::endl;
+        }
+        for(std::int64_t j = 0; j < m_num_bye; j++){
+            fout_gamma << "gamma_withMain_" << m_bye_name_vec[j] << "\t" << gamma_Mat_vec[j](1, 1) << std::endl;
+        }
+        fout_gamma << "n_random_used\t" << num_random_snp_used << std::endl;
+        fout_gamma.close();
+    }
 
     // The environment correlation is used as a lightweight approximation for
     // the multi-environment combined score test in the genome-wide scan.
@@ -4897,13 +2709,19 @@ void fastGxE::test_GxE(const string& bed_file,
     VectorXd corrE_eigenvalues = eigensolver.eigenvalues();
     
     // 4) Genome-wide scan using the random-SNP calibration factors above.
-    spdlog::info("Genome-wide association");
-    fout = open_output_stream(m_out_file + ".res");
-    fout << "order chrom SNP cm base allele1 allele2 af missing beta_main se_main p_main";
-    for(std::int64_t i = 0; i < m_num_bye; i++){
-        fout << " beta" << i + 1 << " se" << i + 1 << " p" << i + 1;
+    spdlog::info("Genome-wide GxE scan; writing results to {}.assoc", m_out_file);
+    // Main result: SNP main effect + the three combined p-values.
+    fout = open_output_stream(m_out_file + ".assoc");
+    fout << "order\tchrom\tSNP\tbase\tallele1\tallele2\taf\tN\tbeta_main\tse_main\tp_main\tp_single\tp_multi\tp_gxe" << std::endl;
+
+    // Single-environment interaction tests (one beta/se/p triple per environment)
+    // go to a separate <out>.perE.assoc.
+    ofstream fout_single = open_output_stream(m_out_file + ".perE.assoc");
+    fout_single << "order\tchrom\tSNP\tbase\tallele1\tallele2\taf\tN";
+    for(std::int64_t j = 0; j < m_num_bye; j++){
+        fout_single << "\tbeta_" << m_bye_name_vec[j] << "\tse_" << m_bye_name_vec[j] << "\tp_" << m_bye_name_vec[j];
     }
-    fout << " p_single p_multi p_gxe" << std::endl;
+    fout_single << std::endl;
 
     const std::int64_t initial_partition_size = get_snp_partition(start_pos, end_pos, npart_snp, 0).num_snp_read;
     std::vector<double> snp_mat_part(initial_partition_size * bed_context.num_id_used);
@@ -4957,6 +2775,8 @@ void fastGxE::test_GxE(const string& bed_file,
                 bed_context.num_id_used, EVy.data(), 1, 0.0, prod_Vec.data(), 1);
             vdMul(partition.num_snp_read, se_Mat.col(k+1).data(), prod_Vec.data(), beta_Mat.col(k+1).data());
         }
+        // Convert calibrated variances to z-scores (effect / SE) for column 0
+        // (main effect) and columns 1.. (per-environment interactions).
         se_Mat = se_Mat.array().sqrt();
         MatrixXd z_mat = beta_Mat.array() / se_Mat.array();
 
@@ -4971,6 +2791,8 @@ void fastGxE::test_GxE(const string& bed_file,
                     p_Vec(m) = gsl_cdf_chisq_Q(chi2_val, 1);
                 }
 
+                // Refit each environment's interaction (exact or approximate) only
+                // when the cheap approximation already looks significant.
                 if(p_Vec.minCoeff() < p_approx_cut){
                     Eigen::Map<Eigen::VectorXd> snpk(
                         snp_mat_part.data() + k * bed_context.num_id_used, bed_context.num_id_used);
@@ -4981,34 +2803,34 @@ void fastGxE::test_GxE(const string& bed_file,
 
                     for(std::int64_t m = 0; m < m_num_bye; m++){
                             xmatk.col(1) = snpkME.col(m);
-                            if(speed == 0){
-                                // exact test
+
+                            // Fast approximate refit (gamma-calibrated information matrix).
+                            MatrixXd beta_Vec_var = (gamma_Mat_vec[m] * snpk_norm2).inverse();
+                            double beta = (beta_Vec_var * (xmatk.transpose() * Vi0y))(1);
+                            double beta_var = beta_Vec_var(1, 1);
+                            double p_val = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
+
+                            // Adaptive exact refit: recompute x'V^-1 x exactly for this
+                            // SNP-environment when the approximate hit is significant enough
+                            // (p < --exact-cut; exact_cut == 1 forces it for all promising SNPs).
+                            if(p_val < exact_cut){
                                 MatrixXd design_cross_product = xmatk.transpose() * m_Vi0 * xmatk;
                                 MatrixXd design_cross_inverse = design_cross_product.inverse();
                                 VectorXd beta_Vec = design_cross_inverse * (xmatk.transpose() * Vi0y);
-                                double beta_var = design_cross_inverse(1, 1);
-                                double beta = beta_Vec(1);
-                                double p_val = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
-                                beta_Mat(k, m+1) = beta;
-                                se_Mat(k, m+1) = sqrt(beta_var);
-                                z_mat(k, m+1) = beta_Mat(k, m+1) / se_Mat(k, m+1);
-                                p_Vec(m+1) = p_val;
-                            }else{
-                                // approximate test
-                                MatrixXd beta_Vec_var = (gamma_Mat_vec[m] * snpk_norm2).inverse();
-                                double beta = (beta_Vec_var * (xmatk.transpose() * Vi0y))(1);
-                                double beta_var = beta_Vec_var(1, 1);
-                                double chi_val = beta * beta / beta_var;
-                                double p_val = gsl_cdf_chisq_Q(chi_val, 1);
-                                beta_Mat(k, m+1) = beta;
-                                se_Mat(k, m+1) = sqrt(beta_var);
-                                z_mat(k, m+1) = beta_Mat(k, m+1) / se_Mat(k, m+1);
-                                p_Vec(m+1) = p_val;
+                                beta_var = design_cross_inverse(1, 1);
+                                beta = beta_Vec(1);
+                                p_val = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
                             }
+
+                            beta_Mat(k, m+1) = beta;
+                            se_Mat(k, m+1) = sqrt(beta_var);
+                            z_mat(k, m+1) = beta_Mat(k, m+1) / se_Mat(k, m+1);
+                            p_Vec(m+1) = p_val;
                     }
 
                 }
 
+                // p_single: ACAT combination of the per-environment GxE p-values.
                 p_Mat.row(k) = p_Vec;
                 Eigen::VectorXd result = acat_combine_pvalues(p_Vec.tail(m_num_bye));
                 p_combined_Mat(k, 0) = result(1);
@@ -5021,16 +2843,21 @@ void fastGxE::test_GxE(const string& bed_file,
             }
         }
 
+        // Combined GxE score = sum of squared interaction z-scores across
+        // environments; its null is a chi-square mixture weighted by the
+        // environment-correlation eigenvalues, evaluated with saddle().
         VectorXd score_Vec = z_mat.rightCols(m_num_bye).array().square().matrix().rowwise().sum();
-        
+
         #pragma omp parallel for schedule(dynamic)
         for(std::int64_t k = 0; k < partition.num_snp_read; k++){
             double score_val = score_Vec(k);
             if(isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut) && score_val >= 0.0 && std::isfinite(score_val)){
 
+                // p_multi: saddlepoint p-value of the combined score.
                 double p1 = saddle(score_val, corrE_eigenvalues);
                 p_combined_Mat(k, 1) = p1;
 
+                // p_gxe: ACAT combination of p_single and p_multi.
                 VectorXd p_Vec(2);
                 p_Vec(0) = p_combined_Mat(k, 0);
                 p_Vec(1) = p1;
@@ -5041,118 +2868,151 @@ void fastGxE::test_GxE(const string& bed_file,
         }
         
         const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
-        fastGxE::output_GxE(fout, snp_info_vec, freq_arr, missing_rate_arr,
+        fastGxE::output_GxE(fout, fout_single, snp_info_vec, freq_arr, nobs_geno_arr,
             beta_Mat, se_Mat, p_Mat, p_combined_Mat,
             partition.start_snp, partition.num_snp_read);
     }
     fout.close();
+    fout_single.close();
 }
 
-void fastGxE::output_GxE(ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& missing_rate_arr,
+// Writes the genome-wide GxE results, split across two files. The main stream
+// `fout` (<out>.assoc) gets the SNP annotation, the SNP main effect (beta/se/p)
+// and the three combined p-values (p_single, p_multi, p_gxe). The `fout_single`
+// stream (<out>.perE.assoc) gets the SNP annotation plus every single-
+// environment interaction (beta/se/p, columns 1..num_env of the matrices) side
+// by side. Rows are buffered per stream and flushed once for throughput.
+void fastGxE::output_GxE(ofstream& fout, ofstream& fout_single,
+            const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
             const MatrixXd& beta_mat, const MatrixXd& se_mat, const MatrixXd& p_mat, const MatrixXd& p_combined_Mat,
             std::int64_t start_snp, std::int64_t num_snp_read){
-    
-    std::stringstream ss;
-    ss.precision(8);
+
+    const std::int64_t num_env = beta_mat.cols() - 1;  // column 0 is the SNP main effect
+    std::stringstream ss_main;
+    std::stringstream ss_single;
+    ss_main.precision(8);
+    ss_single.precision(8);
 
     for (std::int64_t i = 0; i < num_snp_read; i++) {
-        ss << start_snp + i << " " << snp_info_vec[i] << " " << freq_arr(i) << " " << missing_rate_arr(i);
-        
-        for (std::int64_t m = 0; m < beta_mat.cols(); m++) {
-            ss << " " << beta_mat(i, m) << " " << se_mat(i, m) << " " << p_mat(i, m);
-        }
+        const long long n_i = static_cast<long long>(nobs_geno_arr(i));
 
+        // Main file: SNP-identifying prefix + main effect + combined p-values.
+        ss_main << start_snp + i << "\t" << snp_info_vec[i] << "\t" << freq_arr(i) << "\t" << n_i
+                << "\t" << beta_mat(i, 0) << "\t" << se_mat(i, 0) << "\t" << p_mat(i, 0);
         for (std::int64_t m = 0; m < p_combined_Mat.cols(); m++) {
-            ss << " " << p_combined_Mat(i, m);
+            ss_main << "\t" << p_combined_Mat(i, m);
         }
+        ss_main << "\n";
 
-        ss << std::endl;
+        // Single-environment file: same prefix + every environment's interaction.
+        ss_single << start_snp + i << "\t" << snp_info_vec[i] << "\t" << freq_arr(i) << "\t" << n_i;
+        for (std::int64_t j = 0; j < num_env; j++) {
+            ss_single << "\t" << beta_mat(i, j + 1) << "\t" << se_mat(i, j + 1) << "\t" << p_mat(i, j + 1);
+        }
+        ss_single << "\n";
     }
 
-    fout << ss.str();
+    fout << ss_main.str();
+    fout_single << ss_single.str();
 }
 
 
+// ===== Top-level driver =====
+
+// Program entry point for the fastGxE class. Parses and validates CLI options,
+// sets the MKL/OpenMP thread counts, resolves the requested columns, runs the
+// shared data-preparation pipeline (pre_data + process_grm), fits the null-model
+// variance components for the selected mode (varcom_main or varcom_GxE), and, if a
+// .bed file is supplied, runs the corresponding genome-wide scan (test_main or
+// test_GxE) over the resolved SNP range. Returns 0 on success.
 int fastGxE::run(int argc, char **argv) {
-    CLI::App app{"fastGxE - Scalable and fast multivariate GxE analysis"};
+    CLI::App app{"fastGxE -  Scalable and fast genome-wide multi-environment GxE method"};
     RunOptions options;
     configure_run_cli(app, options);
     CLI11_PARSE(app, argc, argv);
+    // Echo the user-supplied options (no defaults, no descriptions) so the exact
+    // invocation can be reproduced from the log.
+    spdlog::info("Options:\n{}", app.config_to_str(false, false));
     validate_run_options(options);
     log_run_options(options);
     
     // Set MKL and OpenMP threads
     mkl_set_num_threads(options.threads);
+    // Let MKL trim its thread count for small problems and, crucially, run
+    // single-threaded when called from inside an OpenMP parallel region (the
+    // per-SNP scan loops in test_GxE). This is the MKL default; setting it
+    // explicitly guards against an environment that forces MKL_DYNAMIC=false,
+    // which could otherwise oversubscribe to threads^2 threads.
+    mkl_set_dynamic(1);
     omp_set_num_threads(options.threads);
 
     // Resolve all requested column names against the data-file header before any
     // expensive GRM or genotype work starts.
     ResolvedInputColumns resolved = resolve_input_columns(options);
     m_trait_name_vec = options.trait_vec;
+    m_bye_name_vec = options.bye_vec;
 
     // prepare data
     this->pre_data(options.out_file, options.data_file, options.agrm_file,
             resolved.covariate_index_vec, resolved.class_index_vec,
             resolved.bye_index_vec, resolved.trait_index_vec, options.missing_in_data_vec);
-    
-    if (options.test_main_binary) {
-        require_binary_trait_matrix(m_y);
-    } else if (options.test_main_binary_continuous) {
-        require_binary_continuous_trait_matrix(m_y);
-    } else if (options.test_main_multitrait_continuous) {
-        require_multitrait_continuous_trait_matrix(m_y);
+
+    // Optional log-transform is applied to the RAW phenotype (before any
+    // covariate/environment correction), for both analysis modes.
+    if(options.log_transform){
+        spdlog::info("Applying natural-log transform to the raw phenotype");
+        apply_log_transform(m_y);
     }
 
     VectorXd init_varcom;
     this->process_grm(options.test_main);
     if(options.test_main){
+        // Main-effect mode keeps covariates in the model, so the inverse-normal
+        // transform (if requested) is applied directly to the phenotype here.
+        if(options.inv_normal){
+            spdlog::info("Applying inverse-normal transform to the phenotype");
+            apply_inverse_normal_transform(m_y);
+        }
         this->varcom_main(init_varcom, options.maxiter, options.cc_gra, options.cc_gra, options.cc_logL);
-    }else if(options.test_main_binary){
-        this->varcom_main_binary(init_varcom, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
-    }else if(options.test_main_binary_continuous){
-        this->varcom_main_binary_continuous(init_varcom, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
-    }else if(options.test_main_multitrait_continuous){
-        this->varcom_main_multitrait_continuous(init_varcom, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
     }else if(options.test_gxe){
-        this->pre_data_GxE(options.standardize_env, true);  // Phenotype correction is always required here.
+        // For GxE the inverse-normal transform is applied inside pre_data_GxE,
+        // AFTER the covariate/environment correction (see its inv_normal arg).
+        this->pre_data_GxE(options.standardize_env, true, options.inv_normal);  // Phenotype correction is always required here.
         this->varcom_GxE(init_varcom, options.no_noisebye, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
     }
     
     
     if(options.bed_file.empty()){
-        spdlog::info("If you want to perform GWAS, please give --bfile.");
+        spdlog::info("No --bfile provided; variance components estimated only (no genome-wide scan).");
+        spdlog::info("Analysis completed.");
         return 0;
     }
-    
+
     vector<std::int64_t> tmp_vec = this->get_start_end_pos(options.bed_file, options.snp_range_vec, options.split_task_vec);
     std::int64_t start_pos = tmp_vec[0], end_pos = tmp_vec[1];
     if(end_pos - start_pos <= options.npart_snp) options.npart_snp = 1;
+    spdlog::info("Scanning SNPs [{}, {}) ({} SNPs) in {} partition(s)",
+            start_pos, end_pos, end_pos - start_pos, options.npart_snp);
 
     if(options.test_main){
         this->test_main(options.bed_file, start_pos, end_pos, options.npart_snp,
-                options.speed, options.num_random_snp, options.p_approx_cut, options.p_cut, options.maf_cut, options.missing_rate_cut,
-                options.maxiter, options.cc_par, options.cc_gra);
-    }else if(options.test_main_binary){
-        this->test_main_binary(options.bed_file, start_pos, end_pos, options.npart_snp,
-                options.speed, options.num_random_snp, options.p_approx_cut, options.p_cut,
-                options.maf_cut, options.missing_rate_cut, options.maxiter, options.cc_par, options.cc_gra);
-    }else if(options.test_main_binary_continuous){
-        this->test_main_binary_continuous(options.bed_file, start_pos, end_pos, options.npart_snp,
-                options.speed, options.num_random_snp, options.p_approx_cut, options.p_cut,
-                options.maf_cut, options.missing_rate_cut, options.maxiter, options.cc_par, options.cc_gra);
-    }else if(options.test_main_multitrait_continuous){
-        this->test_main_multitrait_continuous(options.bed_file, start_pos, end_pos, options.npart_snp,
-                options.speed, options.num_random_snp, options.p_approx_cut, options.p_cut,
-                options.maf_cut, options.missing_rate_cut, options.maxiter, options.cc_par, options.cc_gra);
+                options.keep_random,
+                options.num_random_snp, options.maf_cut, options.missing_rate_cut);
     }else if(options.test_gxe){
         this->test_GxE(options.bed_file, start_pos, end_pos, options.npart_snp,
-                                 options.speed, options.num_random_snp, options.p_approx_cut, options.p_cut,
+                                 options.keep_random,
+                                 options.exact_cut, options.num_random_snp, options.p_approx_cut,
                                  options.maf_cut, options.missing_rate_cut);
     }
+    spdlog::info("Analysis completed.");
     return 0;
 }
 
 
+// Determines the [start, end) SNP index range to scan. Defaults to the whole .bed
+// file, or honors a --snp-range (resolved from SNP names via the .bim) or a
+// --split-task partition (total parts, current part); the two are mutually
+// exclusive. Updates the output prefix accordingly and aborts on an invalid range.
 vector<std::int64_t> fastGxE::get_start_end_pos(const string& bed_file,
             const vector<string>& snp_range_vec, const vector<std::int64_t>& split_task_vec){
     GENO GenoA(bed_file);
