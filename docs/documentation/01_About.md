@@ -20,9 +20,4 @@ Contact
 -------------------
 if you have questions, feel free to leave messages on the [github issues](https://github.com/chaoning/fastGxE/issues) or contact me through email: ningchao91@gmail.com
 
-Our group
--------------------
-[Xiang Zhou Lab Website](https://xiangzhou.github.io/)
-
-
 
