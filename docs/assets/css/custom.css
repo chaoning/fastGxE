@@ -1,0 +1,162 @@
+/* ==========================================================================
+   fastGxE docs — custom polish layered on top of allejo/jekyll-docs-theme.
+   Loaded after the theme stylesheet via _includes/head/stylesheets-post.html,
+   so these rules win. Everything is scoped to the page content (.scope-markdown)
+   to avoid touching the navbar / sidebar / masthead. Colors use neutral rgba
+   overlays so they adapt to both light and dark mode automatically; only the
+   accent (brand) colors are split per prefers-color-scheme.
+   ========================================================================== */
+
+/* ---------- Reading rhythm ------------------------------------------------ */
+.scope-markdown {
+    line-height: 1.72;
+}
+
+.scope-markdown p,
+.scope-markdown li {
+    text-align: left;          /* the theme justifies; left is easier to read */
+}
+
+.scope-markdown li + li {
+    margin-top: 0.25em;
+}
+
+/* ---------- Headings ------------------------------------------------------ */
+.scope-markdown h1,
+.scope-markdown h2,
+.scope-markdown h3,
+.scope-markdown h4 {
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    scroll-margin-top: 5rem;   /* anchor links don't hide under the navbar */
+}
+
+.scope-markdown h2 {
+    margin-top: 2.1em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid rgba(136, 136, 136, 0.28);
+}
+
+.scope-markdown h3 {
+    margin-top: 1.7em;
+}
+
+/* ---------- Links --------------------------------------------------------- */
+.scope-markdown p a,
+.scope-markdown li a {
+    text-underline-offset: 0.15em;
+    text-decoration-thickness: 1px;
+}
+
+.scope-markdown p a:hover,
+.scope-markdown li a:hover {
+    text-decoration: underline;
+}
+
+/* ---------- Code ---------------------------------------------------------- */
+/* Block code: keep the theme's syntax background, just refine the frame.     */
+.scope-markdown pre {
+    border-radius: 10px;
+    padding: 1em 1.15em;
+    overflow-x: auto;
+    border: 1px solid rgba(136, 136, 136, 0.22);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.07);
+    font-size: 0.9em;
+    line-height: 1.55;
+}
+
+/* Inline code: subtle neutral pill (theme already sets the text color).       */
+.scope-markdown :not(pre) > code {
+    padding: 0.13em 0.4em;
+    border-radius: 6px;
+    font-size: 0.88em;
+    background: rgba(136, 136, 136, 0.16);
+    white-space: nowrap;
+}
+
+/* ---------- Tables -------------------------------------------------------- */
+.scope-markdown table {
+    display: block;            /* lets wide tables scroll on small screens    */
+    width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 1.5em 0;
+    font-size: 0.94em;
+}
+
+.scope-markdown th,
+.scope-markdown td {
+    padding: 0.55em 0.85em;
+    border: 1px solid rgba(136, 136, 136, 0.28);
+    text-align: left;
+    vertical-align: top;
+}
+
+.scope-markdown thead th {
+    background: rgba(136, 136, 136, 0.14);
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.scope-markdown tbody tr:nth-child(even) td {
+    background: rgba(136, 136, 136, 0.07);
+}
+
+/* ---------- Images -------------------------------------------------------- */
+.scope-markdown img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 1.6em auto;
+    border-radius: 12px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.13);
+}
+
+/* ---------- Blockquotes / callouts --------------------------------------- */
+.scope-markdown blockquote {
+    margin: 1.4em 0;
+    padding: 0.7em 1.1em;
+    border-left: 4px solid;
+    border-radius: 0 8px 8px 0;
+    background: rgba(136, 136, 136, 0.09);
+}
+
+/* ---------- Horizontal rule ---------------------------------------------- */
+.scope-markdown hr {
+    border: 0;
+    height: 1px;
+    margin: 2.2em 0;
+    background: rgba(136, 136, 136, 0.3);
+}
+
+/* ---------- Brand accents (split by color scheme) ------------------------ */
+@media (prefers-color-scheme: light) {
+    .scope-markdown blockquote {
+        border-left-color: #d32f2f;
+    }
+    .scope-markdown h1 {
+        border-bottom-color: #d32f2f;
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+    .scope-markdown blockquote {
+        border-left-color: #00ceff;
+    }
+    .scope-markdown h1 {
+        border-bottom-color: #00ceff;
+    }
+    /* Slightly stronger overlays read better on dark backgrounds. */
+    .scope-markdown :not(pre) > code {
+        background: rgba(255, 255, 255, 0.1);
+    }
+    .scope-markdown thead th {
+        background: rgba(255, 255, 255, 0.08);
+    }
+    .scope-markdown tbody tr:nth-child(even) td {
+        background: rgba(255, 255, 255, 0.04);
+    }
+    .scope-markdown pre {
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+    }
+}
