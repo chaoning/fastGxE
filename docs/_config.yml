@@ -22,8 +22,6 @@ collections:
   
 # Navigation menu
 nav:
-  - title: "About"
-    url: /documentation/01_About/
   - title: "Installation"
     url: /documentation/02_installation/
   - title: "Tutorial"
