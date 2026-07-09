@@ -15,3 +15,6 @@ Chao Ning, Xiang Zhou#, fastGxE: Powering genome-wide detection of genotype-envi
 
 ## Contact
 If you have questions, feel free to leave messages on the [GitHub issues](https://github.com/chaoning/fastGxE/issues) or contact me by email: ningchao91@gmail.com
+
+## More software
+For more statistical software, visit [Chao Ning's software page](https://chaoning.github.io/software.html).
