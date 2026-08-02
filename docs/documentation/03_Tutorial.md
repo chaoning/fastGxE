@@ -276,17 +276,25 @@ pip install .
 
 ### Prepare the sparse GRM
 
-Export the GRM in index-triplet form required by mmSuSiE:
+mmSuSiE's sparse workflow reads two files under one prefix: `output/test.grm.group`
+(sample IDs + relatedness groups) and `output/test.grm.index_triplet` (the GRM
+values). The `.grm.group` file is written by the grouping step; if you have not run
+it yet, do so first:
+
+```bash
+fastgxe --process-grm --group --grm output/test --cut-value 0.05
+```
+
+Then reformat the GRM to index-triplet form:
 
 ```bash
 fastgxe --process-grm --reformat --grm output/test --out-fmt 1 --out output/test
 ```
 
-This writes the files used by the sparse block-diagonal workflow:
-
-- `output/test.grm.id`
-- `output/test.grm.group`
-- `output/test.grm.index_triplet`
+`--reformat` writes `output/test.grm.index_triplet` (and `output/test.grm.id`); keep
+`--out` on the same prefix as `--grm` so both files sit under one prefix.
+`MMSuSiESp.read_sp_grm` then reads `.grm.group` and `.grm.index_triplet` — the
+`.grm.id` file is produced but not required.
 
 ### Run mmSuSiE
 
@@ -336,7 +344,7 @@ res_dct = model.mmsusie_lead_gxe(
     tol=1e-3,            # convergence tolerance on ELBO
     coverage=0.95,       # credible set coverage level
     min_abs_corr=0.5,    # minimum purity for a credible set to be reported
-    estimate_sigma=False, # use fixed prior variance during fitting
+    estimate_sigma=False, # keep the fastGxE variance components fixed (recommended)
 )
 
 # res_dct["cs"]             — credible sets: environments with cumulative PIP >= coverage
@@ -349,6 +357,14 @@ df_pip = res_dct["pip"]
 print(df_pip)
 print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of interaction
 ```
+
+> **Keep `estimate_sigma=False` here.** mmSuSiE residualizes many fixed effects out of
+> the interaction design — the intercept, covariates, all environment main effects, and
+> the lead-SNP main effect (≈ `2 + n_env` columns, e.g. 42 for `E1:E40`). With
+> `estimate_sigma=True` the in-loop variance-component refit is profile-ML (not REML), so
+> it does not correct for those degrees of freedom and biases the components downward — the
+> more environments, the worse (σ²_gxe drops toward zero for `E1:E40`). Use the
+> genome-wide REML components from `--test-gxe` (`estimate_sigma=False`) instead.
 
 ### Output files
 

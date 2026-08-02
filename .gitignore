@@ -2,3 +2,5 @@ build/
 external/boost_1_90_0/
 external/intel/
 .codex
+__pycache__/
+example/output/
