@@ -358,13 +358,15 @@ print(df_pip)
 print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of interaction
 ```
 
-> **Keep `estimate_sigma=False` here.** mmSuSiE residualizes many fixed effects out of
-> the interaction design — the intercept, covariates, all environment main effects, and
-> the lead-SNP main effect (≈ `2 + n_env` columns, e.g. 42 for `E1:E40`). With
-> `estimate_sigma=True` the in-loop variance-component refit is profile-ML (not REML), so
-> it does not correct for those degrees of freedom and biases the components downward — the
-> more environments, the worse (σ²_gxe drops toward zero for `E1:E40`). Use the
-> genome-wide REML components from `--test-gxe` (`estimate_sigma=False`) instead.
+> **`estimate_sigma=False` is recommended here.** It reuses the variance components
+> that `--test-gxe` estimated **genome-wide** (over all SNPs) — the best-calibrated
+> values for this locus. `estimate_sigma=True` instead re-estimates the components in
+> the loop from this single locus; that refit is now REML (it corrects for the many
+> fixed effects mmSuSiE projects out — intercept, covariates, all environment main
+> effects, and the lead-SNP main effect, ≈ `2 + n_env` columns), so it is stable and no
+> longer biases the components downward. Prefer `False` for the genome-wide calibration;
+> use `True` only if you specifically want the components re-estimated jointly with the
+> fine-mapping.
 
 ### Output files
 
