@@ -288,7 +288,7 @@ fastgxe --process-grm --group --grm output/test --cut-value 0.05
 Then reformat the GRM to index-triplet form:
 
 ```bash
-fastgxe --process-grm --reformat --grm output/test --out-fmt 1 --out output/test
+fastgxe --process-grm --reformat --sparse --grm output/test --out-fmt 1 --out output/test
 ```
 
 `--reformat` writes `output/test.grm.index_triplet` (and `output/test.grm.id`); keep
