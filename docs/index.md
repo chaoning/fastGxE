@@ -11,7 +11,7 @@ fastGxE is a scalable and effective method designed for genome-wide GxE associat
 ## User's Guide with fastGxE: [Tutorial](https://chaoning.github.io/fastGxE/documentation/03_Tutorial.html).
 
 ## Citation
-Chao Ning, Xiang Zhou#, fastGxE: Powering genome-wide detection of genotype-environment interactions in biobank studies, 2025
+Genome-wide detection of genotype-environment interactions at biobank scale with fastGxE. Chao Ning, Xiang Zhou\*. *Nature Genetics*, 2026 (accepted).
 
 ## Contact
 If you have questions, feel free to leave messages on the [GitHub issues](https://github.com/chaoning/fastGxE/issues) or contact me by email: ningchao91@gmail.com
