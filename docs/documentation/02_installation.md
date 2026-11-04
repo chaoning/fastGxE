@@ -12,17 +12,21 @@ order: 2
 
 ## 1. Prebuilt Linux executable
 
-A prebuilt 64-bit Linux executable is available here:
-[**fastGxE Linux Executable**](https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe)
+Prebuilt 64-bit Linux executables are available for both versions. The two can be installed side by side:
 
-After downloading it, make it executable and check that it runs:
+- Version 2.0, with the three-step GxE workflow: [**fastgxe2.0**](https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe2.0)
+- Version 1.0: [**fastgxe**](https://github.com/chaoning/fastGxE/raw/refs/heads/main/app/linux/fastgxe)
+
+After downloading one, make it executable and check that it runs:
 
 ```bash
-chmod +x fastgxe
-./fastgxe -h
+chmod +x fastgxe2.0
+./fastgxe2.0 -h
 ```
 
 This is the quickest option if you only need to run the program and your system is compatible with the published binary.
+
+If the program stops with `OMP: Error #13: Assertion failure at kmp_affinity.cpp`, run `export KMP_AFFINITY=disabled` and try again.
 
 ## 2. Build from source
 
@@ -44,7 +48,8 @@ The repository already vendors several dependencies under `external/`, including
 - `LBFGSpp`
 - `CLI`
 - `spdlog`
-- `Boost`
+
+Boost is not in the repository. Unpack the Boost 1.90.0 headers into `external/boost_1_90_0/` before building.
 
 ### Clone the repository
 
@@ -81,10 +86,10 @@ cmake --build build -j
 cmake -S . -B build -DCMAKE_CXX_COMPILER=/path/to/your/compiler
 ```
 
-The main executable is generated at `build/fastgxe`:
+The main executable is generated at `build/fastgxe2.0`:
 
 ```bash
-./build/fastgxe -h
+./build/fastgxe2.0 -h
 ```
 
 ### Static linking option

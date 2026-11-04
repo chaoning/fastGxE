@@ -19,6 +19,12 @@
 //                 for the polygenic genetic effect plus residual noise).
 //   --test-gxe  : a scalable and effective genome-wide multi-environment GxE method.
 //
+// The GxE analysis can also run as three separate steps, each resuming from the
+// files written by the one before (see fastGxE::run_step1/2/3):
+//   --step 1 : fit the null model; writes <out>.null.bin (plus .var and .h2).
+//   --step 2 : draw random SNPs genome-wide and calibrate; writes <out>.gamma.
+//   --step 3 : scan the genome, optionally by chromosome and with --split-task.
+//
 // High-level pipeline (see fastGxE::run):
 //   1. Parse CLI options (configure_run_cli / validate_run_options) and resolve
 //      requested column names against the data-file header (resolve_input_columns).
@@ -86,7 +92,9 @@
 #include "../utils/acat_utils.hpp"
 #include "../utils/random_sampling.hpp"
 #include "../utils/fatal_error.hpp"
+#include "../utils/geno_set.hpp"
 #include "fastgxe.hpp"
+#include "null_model_io.hpp"
 
 
 using std::ifstream;
@@ -96,6 +104,47 @@ using std::cout;
 using std::endl;
 using Eigen::HouseholderQR;
 using Eigen::ColPivHouseholderQR;
+
+// All command-line options parsed from argv, with their default values. A single
+// instance is filled by configure_run_cli and then validated/logged.
+struct RunOptions {
+    int threads = 10;
+    bool test_main = false;
+    bool test_gxe = false;
+    bool standardize_env = true;
+    bool no_noisebye = false;
+    bool log_transform = false;
+    bool inv_normal = false;
+    bool keep_random = false;
+
+    std::string data_file;
+    std::string agrm_file;
+    std::string bed_file;
+    std::string out_file;
+
+    std::vector<std::string> trait_vec;
+    std::vector<std::string> covariate_vec;
+    std::vector<std::string> class_vec;
+    std::vector<std::string> bye_vec;
+    std::vector<std::string> snp_range_vec;
+    std::vector<std::string> missing_in_data_vec = {
+        "NA", "Na", "na", "NAN", "NaN", "nan", "-NAN", "-NaN", "-nan", "<NA>", "<na>", "N/A", "n/a"
+    };
+    std::vector<std::int64_t> split_task_vec;
+
+    std::int64_t num_random_snp = 1000;
+    int npart_snp = 20;
+    std::uint64_t seed = 0;
+    bool seed_given = false;
+    double exact_cut = 1.0e-5;  // GxE: exact-refit when approximate p < this (0=off, 1=all)
+    int maxiter = 100;
+    double p_approx_cut = 1.0e-3;
+    double maf_cut = 0.01;
+    double missing_rate_cut = 0.05;
+    double cc_par = 1.0e-7;
+    double cc_gra = 1.0e-6;
+    double cc_logL = 5.0e-5;
+};
 
 // ===== Anonymous-namespace helpers (CLI, linear algebra, GRM, REML, scan) =====
 namespace {
@@ -135,45 +184,6 @@ std::string join_or_none(const std::vector<std::string>& values,
                          const char* delimiter = ", ") {
     return values.empty() ? "None" : join_string(values, delimiter);
 }
-
-// All command-line options parsed from argv, with their default values. A single
-// instance is filled by configure_run_cli and then validated/logged.
-struct RunOptions {
-    int threads = 10;
-    bool test_main = false;
-    bool test_gxe = false;
-    bool standardize_env = true;
-    bool no_noisebye = false;
-    bool log_transform = false;
-    bool inv_normal = false;
-    bool keep_random = false;
-
-    std::string data_file;
-    std::string agrm_file;
-    std::string bed_file;
-    std::string out_file;
-
-    std::vector<std::string> trait_vec;
-    std::vector<std::string> covariate_vec;
-    std::vector<std::string> class_vec;
-    std::vector<std::string> bye_vec;
-    std::vector<std::string> snp_range_vec;
-    std::vector<std::string> missing_in_data_vec = {
-        "NA", "Na", "na", "NAN", "NaN", "nan", "-NAN", "-NaN", "-nan", "<NA>", "<na>", "N/A", "n/a"
-    };
-    std::vector<std::int64_t> split_task_vec;
-
-    std::int64_t num_random_snp = 1000;
-    int npart_snp = 20;
-    double exact_cut = 1.0e-5;  // GxE: exact-refit when approximate p < this (0=off, 1=all)
-    int maxiter = 100;
-    double p_approx_cut = 1.0e-3;
-    double maf_cut = 0.01;
-    double missing_rate_cut = 0.05;
-    double cc_par = 1.0e-7;
-    double cc_gra = 1.0e-6;
-    double cc_logL = 5.0e-5;
-};
 
 // ===== Internal data structures (option resolution and numerical caches) =====
 
@@ -933,8 +943,9 @@ BedScanContext prepare_bed_scan_context(GENO& geno, const std::vector<string>& s
 
 // Samples `num_random_snp` distinct SNP indices in [0, num_snp) for the gamma
 // calibration panel.
-std::vector<std::int64_t> sample_random_snp_indices(std::int64_t num_snp, std::int64_t num_random_snp) {
-    return sample_unique_integers(0, num_snp, num_random_snp);
+std::vector<std::int64_t> sample_random_snp_indices(std::int64_t num_snp, std::int64_t num_random_snp,
+        std::uint64_t seed) {
+    return sample_unique_integers(0, num_snp, num_random_snp, seed);
 }
 
 // Reads the random-SNP genotype panel from the .bed file and mean-centers each
@@ -962,6 +973,36 @@ SnpPartition get_snp_partition(std::int64_t start_pos, std::int64_t end_pos, int
     return partition;
 }
 
+// The partitions of get_snp_partition, as blocks of a single fileset.
+std::vector<SnpSegment> blocks_from_partitions(std::int64_t start_pos, std::int64_t end_pos, int npart_snp) {
+    std::vector<SnpSegment> blocks;
+    blocks.reserve(static_cast<std::size_t>(npart_snp));
+    for (int part = 0; part < npart_snp; ++part) {
+        const SnpPartition partition = get_snp_partition(start_pos, end_pos, npart_snp, part);
+        SnpSegment block;
+        block.local_start = partition.start_snp;
+        block.global_start = partition.start_snp;
+        block.num_snp = partition.num_snp_read;
+        blocks.push_back(block);
+    }
+    return blocks;
+}
+
+// Cuts each segment into blocks of at most block_size SNPs.
+std::vector<SnpSegment> blocks_from_segments(const std::vector<SnpSegment>& segments, std::int64_t block_size) {
+    std::vector<SnpSegment> blocks;
+    for (const SnpSegment& segment : segments) {
+        for (std::int64_t done = 0; done < segment.num_snp; done += block_size) {
+            SnpSegment block = segment;
+            block.local_start += done;
+            block.global_start += done;
+            block.num_snp = std::min(block_size, segment.num_snp - done);
+            blocks.push_back(block);
+        }
+    }
+    return blocks;
+}
+
 // Aborts (with a formatted error containing num_used) if the fraction of random
 // SNPs that passed QC is below min_fraction, since gamma calibration would then be
 // unreliable.
@@ -983,39 +1024,19 @@ ofstream open_output_stream(const string& file_path) {
 
 // ===== CLI definition, validation and logging =====
 
-// Declares all command-line flags/options on the CLI11 app and binds them to the
-// fields of `options`, including help text and defaults. Establishes that
-// --test-main and --test-gxe are mutually exclusive.
-void configure_run_cli(CLI::App& app, RunOptions& options) {
-    app.description(R"(
-    Quick Start:
-
-      Test GxE:
-        fastgxe --test-gxe --grm grm_file --bfile bed_file --data data_file --trait BMI --env-int age smoking:alcohol --out test_gxe
-
-      Test SNP Main Effects:
-        fastgxe --test-main --grm grm_file --bfile bed_file --data data_file --trait BMI --out test_main
-    )");
-
+// Declares the options that define the null model: the inputs, the phenotype and
+// environment handling, and the REML settings. Shared by the single-command
+// modes and step 1.
+void add_null_model_options(CLI::App& app, RunOptions& options) {
     app.add_option("-p,--threads", options.threads,
         "Number of threads to use (default: 10).")
         ->default_val(10);
-
-    auto* test_main_flag = app.add_flag("--test-main", options.test_main,
-        "Enable testing of SNP main effects for continuous traits (mutually exclusive with --test-gxe).");
-    auto* test_gxe_flag = app.add_flag("--test-gxe", options.test_gxe,
-        "Enable testing of SNP-environment interactions (mutually exclusive with --test-main).");
-    test_main_flag->excludes(test_gxe_flag);
-    test_gxe_flag->excludes(test_main_flag);
 
     app.add_flag("--no-noisebye", [&options](int count) {
         if (count > 0) options.no_noisebye = true;
     }, "Disable noise-by-environment interaction terms.\n"
        "  - Noise-by-environment interactions are ENABLED by default.\n"
        "  - Use --no-noisebye to turn it OFF.");
-
-    app.add_flag("--keep-random", options.keep_random,
-        "Also write the per-SNP random-SNP gamma-calibration files (*.random.res). Off by default; the calibration summary is always written to <out>.gamma.");
 
     app.add_option("--data", options.data_file, "Path to input data file (required).")->required();
     app.add_option("--trait", options.trait_vec,
@@ -1032,7 +1053,6 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
         ->expected(-1);
     app.add_option("--out", options.out_file, "Path to output file (required).")->required();
     app.add_option("--grm", options.agrm_file, "Path to genetic relationship matrix (GRM) file (required).")->required();
-    app.add_option("--bfile", options.bed_file, "Path to binary PLINK BED file (optional).");
 
     app.add_option("--covar", options.covariate_vec,
         "List of covariates for the analysis (required).\n"
@@ -1080,6 +1100,59 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
         ->default_val(1e-6);
     app.add_option("--cc-logL", options.cc_logL, "Convergence threshold for log-likelihood change (default: 5e-5).")
         ->default_val(5e-5);
+}
+
+// Declares --seed. seed_given records whether the user set it, because every
+// value, including 0, is a valid seed.
+void add_seed_option(CLI::App& app, std::uint64_t& seed, bool& seed_given) {
+    app.add_option_function<std::uint64_t>("--seed",
+        [&seed, &seed_given](const std::uint64_t& value) {
+            seed = value;
+            seed_given = true;
+        },
+        "Seed for drawing the random SNPs. Default: chosen at random and recorded in <out>.gamma.");
+}
+
+// Returns the seed to use and logs it, so that a run can always be repeated.
+std::uint64_t resolve_seed(std::uint64_t seed, bool seed_given) {
+    const std::uint64_t resolved = seed_given ? seed : draw_random_seed();
+    spdlog::info("Random seed: {}", resolved);
+    return resolved;
+}
+
+// Declares the options of the single-command modes on the CLI11 app and binds them
+// to the fields of `options`, including help text and defaults. Establishes that
+// --test-main and --test-gxe are mutually exclusive.
+void configure_run_cli(CLI::App& app, RunOptions& options) {
+    app.description(R"(
+    Quick Start:
+
+      Test GxE in three steps (see --step 1 --help):
+        fastgxe2.0 --step 1 --grm grm_file --data data_file --trait BMI --env-int age smoking:alcohol --out s1
+        fastgxe2.0 --step 2 --null s1 --bfile bed_file --out s2
+        fastgxe2.0 --step 3 --null s1 --gamma s2 --bfile bed_file --out s3
+
+      Test GxE with one command:
+        fastgxe2.0 --test-gxe --grm grm_file --bfile bed_file --data data_file --trait BMI --env-int age smoking:alcohol --out test_gxe
+
+      Test SNP Main Effects:
+        fastgxe2.0 --test-main --grm grm_file --bfile bed_file --data data_file --trait BMI --out test_main
+    )");
+
+    add_null_model_options(app, options);
+
+    auto* test_main_flag = app.add_flag("--test-main", options.test_main,
+        "Enable testing of SNP main effects for continuous traits (mutually exclusive with --test-gxe).");
+    auto* test_gxe_flag = app.add_flag("--test-gxe", options.test_gxe,
+        "Enable testing of SNP-environment interactions (mutually exclusive with --test-main).");
+    test_main_flag->excludes(test_gxe_flag);
+    test_gxe_flag->excludes(test_main_flag);
+
+    app.add_flag("--keep-random", options.keep_random,
+        "Also write the per-SNP random-SNP gamma-calibration files (*.random.assoc). Off by default; the calibration summary is always written to <out>.gamma.");
+    add_seed_option(app, options.seed, options.seed_given);
+    app.add_option("--bfile", options.bed_file, "Path to binary PLINK BED file (optional).");
+
     app.add_option("--snp-range", options.snp_range_vec, "Specify start and end SNPs (expects 2 values).")->expected(2);
     app.add_option("--npart-SNP", options.npart_snp, "Number of SNP partitions (default: 1000).")->default_val(1000);
     app.add_option("--exact-cut", options.exact_cut,
@@ -1097,6 +1170,157 @@ void configure_run_cli(CLI::App& app, RunOptions& options) {
     app.add_option("--split-task", options.split_task_vec,
         "Partition the task for parallel execution (expects 2 values: total parts, current part).")
         ->expected(2);
+}
+
+// Options of steps 2 and 3. Everything about the samples, the phenotype and the
+// environments is fixed by step 1 and read from the null-model file.
+struct GenotypeStepOptions {
+    int step = 0;
+    int threads = 10;
+    std::string null_prefix;
+    std::string gamma_prefix;
+    std::string bed_file;
+    std::string mbfile;
+    std::string out_file;
+    double maf_cut = 0.01;
+    double missing_rate_cut = 0.05;
+
+    // Step 2 only.
+    std::int64_t num_random_snp = 1000;
+    std::uint64_t seed = 0;
+    bool seed_given = false;
+    bool keep_random = false;
+
+    // Step 3 only.
+    double exact_cut = 1.0e-5;
+    double p_approx_cut = 1.0e-3;
+    std::int64_t bsize = 1000;
+    std::vector<std::string> snp_range_vec;
+    std::vector<std::int64_t> split_task_vec;
+};
+
+// Declares the options that steps 2 and 3 have in common.
+void add_genotype_step_options(CLI::App& app, GenotypeStepOptions& options) {
+    app.add_option("--step", options.step, "Workflow step: 1, 2 or 3.")->required();
+    app.add_option("-p,--threads", options.threads, "Number of threads to use (default: 10).")->default_val(10);
+    app.add_option("--null", options.null_prefix, "Output prefix of step 1 (required).")->required();
+    auto* bfile = app.add_option("--bfile", options.bed_file, "PLINK prefix.");
+    auto* mbfile = app.add_option("--mbfile", options.mbfile,
+        "Text file with one PLINK prefix per line. The filesets are treated as one genome, in the\n"
+        "order listed. Use this instead of --bfile when the genome is split into several filesets.");
+    bfile->excludes(mbfile);
+    mbfile->excludes(bfile);
+    app.add_option("--out", options.out_file, "Output prefix (required).")->required();
+    app.add_option("--maf", options.maf_cut, "Minor allele frequency (MAF) cutoff (default: 0.01).")->default_val(0.01);
+    app.add_option("--missing-rate", options.missing_rate_cut, "Missing genotype rate cutoff (default: 0.05).")->default_val(0.05);
+}
+
+void configure_step1_cli(CLI::App& app, RunOptions& options, int& step) {
+    app.description(R"(
+    Step 1 of the GxE workflow: fit the null model. No genotypes are needed.
+    Writes <out>.var, <out>.h2 and <out>.null.bin.
+
+      fastgxe2.0 --step 1 --grm grm_file --data data_file --trait BMI --env-int E1:E40 --out s1
+    )");
+    app.add_option("--step", step, "Workflow step: 1, 2 or 3.")->required();
+    add_null_model_options(app, options);
+}
+
+void configure_step2_cli(CLI::App& app, GenotypeStepOptions& options) {
+    app.description(R"(
+    Step 2 of the GxE workflow: draw random SNPs across the whole genome and calibrate gamma.
+    Writes <out>.gamma.
+
+      fastgxe2.0 --step 2 --null s1 --bfile genome --seed 2026 --out s2
+      fastgxe2.0 --step 2 --null s1 --mbfile chr_list.txt --seed 2026 --out s2
+    )");
+    add_genotype_step_options(app, options);
+    app.add_option("--num-random-snp", options.num_random_snp,
+        "Number of random SNPs that pass --maf and --missing-rate (default: 1000).")->default_val(1000);
+    add_seed_option(app, options.seed, options.seed_given);
+    app.add_flag("--keep-random", options.keep_random,
+        "Also write the per-SNP calibration files (*.random.assoc).");
+}
+
+void configure_step3_cli(CLI::App& app, GenotypeStepOptions& options) {
+    app.description(R"(
+    Step 3 of the GxE workflow: genome-wide GxE scan. Writes <out>.assoc and <out>.perE.assoc.
+    Every job shares the gamma factors of step 2, however the scan is divided.
+
+      fastgxe2.0 --step 3 --null s1 --gamma s2 --bfile genome --out s3
+      fastgxe2.0 --step 3 --null s1 --gamma s2 --bfile chr1 --out s3.chr1
+      fastgxe2.0 --step 3 --null s1 --gamma s2 --bfile chr1 --split-task 20 3 --out s3.chr1
+      fastgxe2.0 --step 3 --null s1 --gamma s2 --mbfile chr_list.txt --split-task 200 7 --out s3
+    )");
+    add_genotype_step_options(app, options);
+    app.add_option("--gamma", options.gamma_prefix, "Output prefix of step 2 (required).")->required();
+    app.add_option("--exact-cut", options.exact_cut,
+        "Adaptive exact-refit threshold (default: 1e-5).\n"
+        "  - Range [0, 1]. Set to 0 to disable it; V^-1 is then not loaded, which saves memory.")
+        ->default_val(1e-5);
+    app.add_option("--p-approx-cut", options.p_approx_cut, "P-value approximation threshold (default: 1e-3).")->default_val(1e-3);
+    app.add_option("--bsize", options.bsize,
+        "Number of SNPs read at a time (default: 1000). Genotypes need about n * bsize * 8 bytes.")
+        ->default_val(1000);
+    auto* split_task = app.add_option("--split-task", options.split_task_vec,
+        "Run one part of the scan (expects 2 values: total parts, current part).\n"
+        "  - Output files get the suffix .<total>_<part>.\n"
+        "  - With --mbfile the parts are even across the genome and may span two filesets.")
+        ->expected(2);
+    auto* snp_range = app.add_option("--snp-range", options.snp_range_vec,
+        "Scan from one SNP to another (expects 2 SNP names). Needs --bfile.")->expected(2);
+    split_task->excludes(snp_range);
+    snp_range->excludes(split_task);
+}
+
+// Checks the options shared by steps 2 and 3.
+void validate_genotype_step_options(GenotypeStepOptions& options) {
+    if (options.bed_file.empty() == options.mbfile.empty()) {
+        fatal_error("Exactly one of --bfile or --mbfile must be specified.");
+    }
+    if (options.threads <= 0) {
+        options.threads = 10;
+    }
+}
+
+// Opens the genotype input named by --bfile or --mbfile.
+GenoSet open_genotypes(const GenotypeStepOptions& options) {
+    return options.mbfile.empty() ? GenoSet({options.bed_file})
+                                  : GenoSet(GenoSet::read_prefix_list(options.mbfile));
+}
+
+// Sets the MKL and OpenMP thread counts. Letting MKL trim its thread count for
+// small problems also makes it run single-threaded when called from inside an
+// OpenMP parallel region (the per-SNP scan loops). This is the MKL default; setting
+// it explicitly guards against an environment that forces MKL_DYNAMIC=false, which
+// could otherwise oversubscribe to threads^2 threads.
+void configure_threads(int threads) {
+    mkl_set_num_threads(threads);
+    mkl_set_dynamic(1);
+    omp_set_num_threads(threads);
+}
+
+// Returns the value of --step, or 0 if it is absent.
+int find_step_argument(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        std::string value;
+        if (arg == "--step") {
+            if (i + 1 >= argc) {
+                fatal_error("--step needs a value: 1, 2 or 3.");
+            }
+            value = argv[i + 1];
+        } else if (arg.rfind("--step=", 0) == 0) {
+            value = arg.substr(7);
+        } else {
+            continue;
+        }
+        if (value != "1" && value != "2" && value != "3") {
+            fatal_error("--step must be 1, 2 or 3, not {}.", value);
+        }
+        return value[0] - '0';
+    }
+    return 0;
 }
 
 // Validates parsed options: exactly one analysis mode, --env-int required for
@@ -2010,7 +2234,7 @@ VectorXd fastGxE::varcom_main(VectorXd& init, int maxiter0, double cc_par0, doub
  */
 void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
                 bool keep_random,
-                std::int64_t num_random_snp,
+                std::int64_t num_random_snp, std::uint64_t seed,
                 double maf_cut, double missing_rate_cut){
     spdlog::info("Association: scanning SNPs for main effects");
     GENO GenoA(bed_file);
@@ -2027,7 +2251,7 @@ void fastGxE::test_main(const string& bed_file, std::int64_t start_pos, std::int
         build_projection_cache(inverse_diagonal, m_xmat_trans);
     
     spdlog::info("Randomly select SNPs and calculate the gamma");
-    const vector<std::int64_t> random_snp_index_vec = sample_random_snp_indices(bed_context.num_snp, num_random_snp);
+    const vector<std::int64_t> random_snp_index_vec = sample_random_snp_indices(bed_context.num_snp, num_random_snp, seed);
     MatrixXd snp_mat_part_random;
     VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
     load_centered_random_snp_panel(
@@ -2495,62 +2719,120 @@ void fastGxE::output_GxE_multi(std::ofstream& fout, const vector<string>& snp_in
 //      per-environment GxE p-values with ACAT (p_single), compute a correlation-
 //      based combined score test (p_multi) via the saddlepoint method on the
 //      environment-correlation eigenvalues, and ACAT-combine the two into p_gxe.
-// Results are written to <out>.res with per-stage random panels alongside.
-void fastGxE::test_GxE(const string& bed_file,
+// Results are written to <out>.assoc and <out>.perE.assoc.
+//
+// Stages 1-3 are in calibrate_gamma_GxE and stage 4 is in scan_GxE. test_GxE runs
+// both in one process; --step 2 and --step 3 run them separately.
+void fastGxE::test_GxE(GenoSet& genotypes,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
                 bool keep_random,
-                double exact_cut, std::int64_t num_random_snp,
+                double exact_cut, std::int64_t num_random_snp, std::uint64_t seed,
                 double p_approx_cut, double maf_cut, double missing_rate_cut){
-
     spdlog::info("Association: SNP-by-environment (GxE) scan for individual environments");
-    spdlog::info("GxE exact-refit cutoff for promising SNPs: {}",
-            exact_cut <= 0.0 ? "disabled" : (exact_cut >= 1.0 ? "all" : "p < " + std::to_string(exact_cut)));
-    GENO GenoA(bed_file);
-    const BedScanContext bed_context = prepare_bed_scan_context(GenoA, m_id_in_data_vec);
-    spdlog::info("The number of used iids: {}", bed_context.num_id_used);
+    genotypes.bind_samples(m_id_in_data_vec);
+    spdlog::info("The number of used iids: {}", m_num_id);
     const VectorXd Vi0y = m_Vi0 * m_y;
-    
+
+    GxeGamma gamma = this->calibrate_gamma_GxE(
+        genotypes, Vi0y, num_random_snp, seed, keep_random, maf_cut, missing_rate_cut);
+    gamma.null_fingerprint = compute_null_fingerprint(
+        m_id_in_data_vec, m_bye_name_vec, m_varcom_null, Vi0y, m_bye_mat);
+    write_gamma_file(m_out_file, gamma, m_bye_name_vec);
+
+    this->scan_GxE(genotypes, Vi0y, gamma, blocks_from_partitions(start_pos, end_pos, npart_snp),
+            exact_cut, p_approx_cut, maf_cut, missing_rate_cut);
+}
+
+// Builds the random SNP panel by going through the SNPs in a random order and
+// keeping the first num_random_snp that pass QC, so rare or poorly genotyped SNPs do
+// not shrink the panel. The panel depends only on the seed and the global SNP order.
+fastGxE::RandomSnpPanel fastGxE::select_random_panel(GenoSet& genotypes, std::int64_t num_random_snp,
+                std::uint64_t seed, double maf_cut, double missing_rate_cut){
+    if(num_random_snp <= 0){
+        fatal_error("--num-random-snp must be positive.");
+    }
+    const std::int64_t num_snp = genotypes.num_snp();
+    const std::int64_t target = std::min(num_random_snp, num_snp);
+    const vector<std::int64_t> shuffled = sample_unique_integers(0, num_snp, num_snp, seed);
+
+    RandomSnpPanel panel;
+    panel.snp_indices.reserve(static_cast<std::size_t>(target));
+    panel.snp_mat.resize(m_num_id, target);
+    panel.freq_arr.resize(target);
+    panel.nobs_geno_arr.resize(target);
+
+    std::int64_t num_used = 0;
+    std::int64_t num_tested = 0;
+    MatrixXd batch_mat;
+    VectorXd batch_freq, batch_missing_rate, batch_nobs;
+    while(num_used < target && num_tested < num_snp){
+        const std::int64_t batch_size = std::min(target, num_snp - num_tested);
+        const vector<std::int64_t> batch(shuffled.begin() + num_tested, shuffled.begin() + num_tested + batch_size);
+        genotypes.read_snps_by_index(batch, batch_mat, batch_freq, batch_missing_rate, batch_nobs);
+
+        for(std::int64_t k = 0; k < batch_size && num_used < target; k++){
+            if(isValidSnp(batch_freq(k), batch_missing_rate(k), maf_cut, missing_rate_cut)){
+                panel.snp_indices.push_back(batch[k]);
+                panel.snp_mat.col(num_used) = batch_mat.col(k).array() - 2 * batch_freq(k);
+                panel.freq_arr(num_used) = batch_freq(k);
+                panel.nobs_geno_arr(num_used) = batch_nobs(k);
+                num_used++;
+            }
+        }
+        num_tested += batch_size;
+    }
+
+    if(num_used == 0){
+        fatal_error("No SNP passed --maf and --missing-rate, so gamma cannot be calibrated.");
+    }
+    if(num_used < num_random_snp){
+        spdlog::warn("Only {} SNPs passed QC, fewer than the {} requested by --num-random-snp.",
+                num_used, num_random_snp);
+        panel.snp_mat.conservativeResize(m_num_id, num_used);
+        panel.freq_arr.conservativeResize(num_used);
+        panel.nobs_geno_arr.conservativeResize(num_used);
+    }
+    spdlog::info("Random panel: {} SNPs used, {} drawn", num_used, num_tested);
+    return panel;
+}
+
+// Calibrates the gamma factors on a random SNP panel: stages 1-3 of the description
+// above test_GxE. The samples must already be matched with GenoSet::bind_samples.
+GxeGamma fastGxE::calibrate_gamma_GxE(GenoSet& genotypes, const VectorXd& Vi0y,
+                std::int64_t num_random_snp, std::uint64_t seed, bool keep_random,
+                double maf_cut, double missing_rate_cut){
     spdlog::info("Randomly select SNPs and calculate the gamma");
-    const vector<std::int64_t> random_snp_index_vec = sample_random_snp_indices(bed_context.num_snp, num_random_snp);
-    MatrixXd snp_mat_part_random;
-    VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
-    load_centered_random_snp_panel(
-        GenoA, bed_file, random_snp_index_vec, bed_context.id_index_in_bed_vec,
-        snp_mat_part_random, freq_arr, missing_rate_arr, nobs_geno_arr);
+    const RandomSnpPanel panel = this->select_random_panel(
+        genotypes, num_random_snp, seed, maf_cut, missing_rate_cut);
+    const MatrixXd& snp_mat_part_random = panel.snp_mat;
+    const vector<std::int64_t>& random_snp_index_vec = panel.snp_indices;
+    const VectorXd& freq_arr = panel.freq_arr;
+    const VectorXd& nobs_geno_arr = panel.nobs_geno_arr;
+    const std::int64_t num_random_snp_used = panel.snp_mat.cols();
     const VectorXd snp_squaredNorm_Vec = snp_mat_part_random.colwise().squaredNorm();
 
     // 1) Random-SNP calibration for the SNP main effect.
     spdlog::info("Calibrating gamma: SNP main effect");
-    VectorXd p_main_Vec = VectorXd::Ones(num_random_snp) * NAN;
+    VectorXd p_main_Vec = VectorXd::Ones(num_random_snp_used) * NAN;
     VectorXd beta_main_var_Vec = 1 / ((snp_mat_part_random).cwiseProduct(m_Vi0 * snp_mat_part_random)).colwise().sum().array();
     VectorXd se_main_Vec = beta_main_var_Vec.array().sqrt();
     VectorXd beta_main_Vec = beta_main_var_Vec.cwiseProduct(snp_mat_part_random.transpose() * Vi0y);
     VectorXd gamma_main_Vec = 1 / (beta_main_var_Vec.array() * snp_squaredNorm_Vec.array());  // gamma = x'V(-1)x / x'x
 
-    std::int64_t num_random_snp_used = 0;
     double gamma_main = 0;
-    for(std::int64_t i = 0; i < num_random_snp; i++){
-        if(isValidSnp(freq_arr(i), missing_rate_arr(i), maf_cut, missing_rate_cut)){
-            num_random_snp_used++;
-            gamma_main += gamma_main_Vec[i];
-            double beta = beta_main_Vec[i];
-            double se = se_main_Vec[i];
-            p_main_Vec[i] = gsl_cdf_chisq_Q(beta * beta / (se * se), 1);
-        }else{
-            p_main_Vec[i] = NAN;
-            se_main_Vec[i] = NAN;
-            beta_main_Vec[i] = NAN;
-            gamma_main_Vec[i] = NAN;
-        }
+    for(std::int64_t i = 0; i < num_random_snp_used; i++){
+        gamma_main += gamma_main_Vec[i];
+        double beta = beta_main_Vec[i];
+        double se = se_main_Vec[i];
+        p_main_Vec[i] = gsl_cdf_chisq_Q(beta * beta / (se * se), 1);
     }
-    require_random_snp_fraction(num_random_snp_used, num_random_snp, 0.5, "Used random SNPs: {} (<50%)");
     gamma_main /= num_random_snp_used;
 
     ofstream fout;
     if(keep_random){
         fout = open_output_stream(m_out_file + ".main.random.assoc");
         fout << "order\taf\tN\tgamma\tbeta\tse\tp" << std::endl;
-        for(std::int64_t i = 0; i < num_random_snp; i++){
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
             fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i)) << "\t"
                   << gamma_main_Vec[i] << "\t" << beta_main_Vec[i] << "\t" << se_main_Vec[i] << "\t" << p_main_Vec[i]
                    << std::endl;
@@ -2562,29 +2844,22 @@ void fastGxE::test_GxE(const string& bed_file,
     // 2) Random-SNP calibration for marginal GxE terms without the SNP main effect.
     spdlog::info("Calibrating gamma: GxE (no main effect)");
     VectorXd gamma_GxEnoMain_Vec = VectorXd::Zero(m_num_bye);
-    MatrixXd beta_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
-    MatrixXd se_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
-    MatrixXd p_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
-    MatrixXd gamma_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
+    MatrixXd beta_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
+    MatrixXd se_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
+    MatrixXd p_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
+    MatrixXd gamma_GxEnoMain_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
     for(std::int64_t j = 0; j < m_num_bye; j++){
         MatrixXd snp_mat_part_random_xE = snp_mat_part_random.array().colwise() * m_bye_mat.col(j).array();
         VectorXd beta_GxEnoMain_var_Vec = 1 / ((snp_mat_part_random_xE).cwiseProduct(m_Vi0 * snp_mat_part_random_xE)).colwise().sum().array();
         VectorXd se_GxEnoMain_Vec = beta_GxEnoMain_var_Vec.array().sqrt();
         VectorXd beta_GxEnoMain_Vec = beta_GxEnoMain_var_Vec.cwiseProduct(snp_mat_part_random_xE.transpose() * Vi0y);
         VectorXd gamma_GxEnoMain_j = 1 / (beta_GxEnoMain_var_Vec.array() * snp_squaredNorm_Vec.array());
-        VectorXd p_GxEnoMain_Vec = VectorXd::Ones(num_random_snp) * NAN;
-        for(std::int64_t i = 0; i < num_random_snp; i++){
-            if(isValidSnp(freq_arr(i), missing_rate_arr(i), maf_cut, missing_rate_cut)){
-                gamma_GxEnoMain_Vec[j] += gamma_GxEnoMain_j[i];
-                double beta = beta_GxEnoMain_Vec[i];
-                double se = se_GxEnoMain_Vec[i];
-                p_GxEnoMain_Vec[i] = gsl_cdf_chisq_Q(beta * beta / (se * se), 1);
-            }else{
-                p_GxEnoMain_Vec[i] = NAN;
-                se_GxEnoMain_Vec[i] = NAN;
-                beta_GxEnoMain_Vec[i] = NAN;
-                gamma_GxEnoMain_j[i] = NAN;
-            }
+        VectorXd p_GxEnoMain_Vec = VectorXd::Ones(num_random_snp_used) * NAN;
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
+            gamma_GxEnoMain_Vec[j] += gamma_GxEnoMain_j[i];
+            double beta = beta_GxEnoMain_Vec[i];
+            double se = se_GxEnoMain_Vec[i];
+            p_GxEnoMain_Vec[i] = gsl_cdf_chisq_Q(beta * beta / (se * se), 1);
         }
         beta_GxEnoMain_Mat.col(j) = beta_GxEnoMain_Vec;
         se_GxEnoMain_Mat.col(j) = se_GxEnoMain_Vec;
@@ -2601,7 +2876,7 @@ void fastGxE::test_GxE(const string& bed_file,
         }
         fout << std::endl;
 
-        for(std::int64_t i = 0; i < num_random_snp; i++){
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
             fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i));
             for(std::int64_t j = 0; j < m_num_bye; j++){
                 fout <<  "\t" << gamma_GxEnoMain_Mat(i, j) << "\t" << beta_GxEnoMain_Mat(i, j) << "\t"
@@ -2615,41 +2890,39 @@ void fastGxE::test_GxE(const string& bed_file,
 
     // 3) Random-SNP calibration for joint SNP + single-environment fits.
     spdlog::info("Calibrating gamma: GxE (with main effect)");
-    MatrixXd beta_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
-    MatrixXd se_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
-    MatrixXd p_Mat = MatrixXd::Ones(num_random_snp, m_num_bye) * NAN;
+    MatrixXd beta_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
+    MatrixXd se_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
+    MatrixXd p_Mat = MatrixXd::Ones(num_random_snp_used, m_num_bye) * NAN;
     vector<vector<MatrixXd>> gamma_Mat_2Dvec;
     gamma_Mat_2Dvec.reserve(m_num_bye);
     for(std::int64_t j = 0; j < m_num_bye; j++){
         vector<MatrixXd> gamma_Mat_vec;
-        gamma_Mat_vec.reserve(num_random_snp);
-        for(std::int64_t i = 0; i < num_random_snp; i++){
+        gamma_Mat_vec.reserve(num_random_snp_used);
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
             gamma_Mat_vec.push_back(MatrixXd::Zero(2, 2));
         }
         gamma_Mat_2Dvec.push_back(gamma_Mat_vec);
     }
 
     #pragma omp parallel for schedule(dynamic)
-    for(std::int64_t i = 0; i < num_random_snp; i++){
-        if(isValidSnp(freq_arr(i), missing_rate_arr(i), maf_cut, missing_rate_cut)){
-            VectorXd snpi = snp_mat_part_random.col(i);
-            double snp_norm2 = snp_squaredNorm_Vec(i);
-            MatrixXd snpiME = m_bye_mat.array().colwise() * snpi.array();
-            MatrixXd xmati = MatrixXd::Zero(bed_context.num_id_used, 2);
-            xmati.col(0) = snpi;
-            for(std::int64_t j = 0; j < m_num_bye; j++){
-                xmati.col(1) = snpiME.col(j);
-                MatrixXd design_cross_product = xmati.transpose() * m_Vi0 * xmati;
-                MatrixXd design_cross_inverse = design_cross_product.inverse();
-                VectorXd beta_Vec = design_cross_inverse * (xmati.transpose() * Vi0y);
-                double beta_var = design_cross_inverse(1, 1);
-                double beta = beta_Vec(1);
-                double p = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
-                beta_Mat(i, j) = beta;
-                se_Mat(i, j) = sqrt(beta_var);
-                p_Mat(i, j) = p;
-                gamma_Mat_2Dvec[j][i] = design_cross_product / snp_norm2;
-            }
+    for(std::int64_t i = 0; i < num_random_snp_used; i++){
+        VectorXd snpi = snp_mat_part_random.col(i);
+        double snp_norm2 = snp_squaredNorm_Vec(i);
+        MatrixXd snpiME = m_bye_mat.array().colwise() * snpi.array();
+        MatrixXd xmati = MatrixXd::Zero(m_num_id, 2);
+        xmati.col(0) = snpi;
+        for(std::int64_t j = 0; j < m_num_bye; j++){
+            xmati.col(1) = snpiME.col(j);
+            MatrixXd design_cross_product = xmati.transpose() * m_Vi0 * xmati;
+            MatrixXd design_cross_inverse = design_cross_product.inverse();
+            VectorXd beta_Vec = design_cross_inverse * (xmati.transpose() * Vi0y);
+            double beta_var = design_cross_inverse(1, 1);
+            double beta = beta_Vec(1);
+            double p = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
+            beta_Mat(i, j) = beta;
+            se_Mat(i, j) = sqrt(beta_var);
+            p_Mat(i, j) = p;
+            gamma_Mat_2Dvec[j][i] = design_cross_product / snp_norm2;
         }
     }
 
@@ -2657,7 +2930,7 @@ void fastGxE::test_GxE(const string& bed_file,
     gamma_Mat_vec.reserve(m_num_bye);
     for(std::int64_t j = 0; j < m_num_bye; j++){
         MatrixXd gamma_Mat = MatrixXd::Zero(2, 2);
-        for(std::int64_t i = 0; i < num_random_snp; i++){
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
             gamma_Mat += gamma_Mat_2Dvec[j][i];
         }
         gamma_Mat_vec.push_back(gamma_Mat / num_random_snp_used);
@@ -2671,7 +2944,7 @@ void fastGxE::test_GxE(const string& bed_file,
             fout << "\tbeta_" << m_bye_name_vec[i] << "\tse_" << m_bye_name_vec[i] << "\tp_" << m_bye_name_vec[i];
         }
         fout << std::endl;
-        for(std::int64_t i = 0; i < num_random_snp; i++){
+        for(std::int64_t i = 0; i < num_random_snp_used; i++){
             fout << random_snp_index_vec[i] << "\t" << freq_arr(i) << "\t" << static_cast<long long>(nobs_geno_arr(i));
             for(std::int64_t j = 0; j < m_num_bye; j++){
                 fout << "\t" << beta_Mat(i, j) << "\t" << se_Mat(i, j) << "\t" << p_Mat(i, j);
@@ -2681,20 +2954,24 @@ void fastGxE::test_GxE(const string& bed_file,
         fout.close();
     }
 
-    // Always write a compact calibration summary to <out>.gamma.
-    {
-        ofstream fout_gamma = open_output_stream(m_out_file + ".gamma");
-        fout_gamma << "term\tvalue" << std::endl;
-        fout_gamma << "gamma_main\t" << gamma_main << std::endl;
-        for(std::int64_t j = 0; j < m_num_bye; j++){
-            fout_gamma << "gamma_noMain_" << m_bye_name_vec[j] << "\t" << gamma_GxEnoMain_Vec(j) << std::endl;
-        }
-        for(std::int64_t j = 0; j < m_num_bye; j++){
-            fout_gamma << "gamma_withMain_" << m_bye_name_vec[j] << "\t" << gamma_Mat_vec[j](1, 1) << std::endl;
-        }
-        fout_gamma << "n_random_used\t" << num_random_snp_used << std::endl;
-        fout_gamma.close();
-    }
+    GxeGamma gamma;
+    gamma.main = gamma_main;
+    gamma.no_main = gamma_GxEnoMain_Vec;
+    gamma.with_main = gamma_Mat_vec;
+    gamma.num_random_used = num_random_snp_used;
+    gamma.num_random_requested = num_random_snp;
+    gamma.seed = seed;
+    return gamma;
+}
+
+// Genome-wide GxE scan over the given blocks of SNPs, using the calibration factors
+// in `gamma`: stage 4 of the description above test_GxE. The samples must already be
+// matched with GenoSet::bind_samples.
+void fastGxE::scan_GxE(GenoSet& genotypes, const VectorXd& Vi0y, const GxeGamma& gamma,
+                const vector<SnpSegment>& blocks, double exact_cut,
+                double p_approx_cut, double maf_cut, double missing_rate_cut){
+    spdlog::info("GxE exact-refit cutoff for promising SNPs: {}",
+            exact_cut <= 0.0 ? "disabled" : (exact_cut >= 1.0 ? "all" : "p < " + std::to_string(exact_cut)));
 
     // The environment correlation is used as a lightweight approximation for
     // the multi-environment combined score test in the genome-wide scan.
@@ -2708,10 +2985,10 @@ void fastGxE::test_GxE(const string& bed_file,
     
     VectorXd corrE_eigenvalues = eigensolver.eigenvalues();
     
-    // 4) Genome-wide scan using the random-SNP calibration factors above.
+    // 4) Genome-wide scan using the random-SNP calibration factors.
     spdlog::info("Genome-wide GxE scan; writing results to {}.assoc", m_out_file);
     // Main result: SNP main effect + the three combined p-values.
-    fout = open_output_stream(m_out_file + ".assoc");
+    ofstream fout = open_output_stream(m_out_file + ".assoc");
     fout << "order\tchrom\tSNP\tbase\tallele1\tallele2\taf\tN\tbeta_main\tse_main\tp_main\tp_single\tp_multi\tp_gxe" << std::endl;
 
     // Single-environment interaction tests (one beta/se/p triple per environment)
@@ -2723,57 +3000,62 @@ void fastGxE::test_GxE(const string& bed_file,
     }
     fout_single << std::endl;
 
-    const std::int64_t initial_partition_size = get_snp_partition(start_pos, end_pos, npart_snp, 0).num_snp_read;
-    std::vector<double> snp_mat_part(initial_partition_size * bed_context.num_id_used);
-    VectorXd geno_var_Vec = VectorXd::Zero(initial_partition_size);
-    beta_Mat.resize(initial_partition_size, m_num_bye + 1);
-    se_Mat.resize(initial_partition_size, m_num_bye + 1);
-    p_Mat.resize(initial_partition_size, m_num_bye + 1);
-    MatrixXd p_combined_Mat = MatrixXd::Zero(initial_partition_size, 3);
-    VectorXd EVy = VectorXd::Zero(bed_context.num_id_used);
-    VectorXd prod_Vec = VectorXd::Zero(initial_partition_size);
-    
-    for(std::int64_t ipart = 0; ipart < npart_snp; ipart++){
-        const SnpPartition partition = get_snp_partition(start_pos, end_pos, npart_snp, ipart);
-        if(partition.num_snp_read != geno_var_Vec.size()){
-            snp_mat_part.resize(partition.num_snp_read * bed_context.num_id_used);
-            geno_var_Vec.resize(partition.num_snp_read);
-            beta_Mat.resize(partition.num_snp_read, m_num_bye + 1);
-            se_Mat.resize(partition.num_snp_read, m_num_bye + 1);
-            p_Mat.resize(partition.num_snp_read, m_num_bye + 1);
-            p_combined_Mat.resize(partition.num_snp_read, 3);
-            prod_Vec.resize(partition.num_snp_read);
+    const std::int64_t num_id_used = m_num_id;
+    const std::int64_t initial_block_size = blocks.front().num_snp;
+    std::vector<double> snp_mat_part(initial_block_size * num_id_used);
+    VectorXd geno_var_Vec = VectorXd::Zero(initial_block_size);
+    MatrixXd beta_Mat(initial_block_size, m_num_bye + 1);
+    MatrixXd se_Mat(initial_block_size, m_num_bye + 1);
+    MatrixXd p_Mat(initial_block_size, m_num_bye + 1);
+    MatrixXd p_combined_Mat = MatrixXd::Zero(initial_block_size, 3);
+    VectorXd EVy = VectorXd::Zero(num_id_used);
+    VectorXd prod_Vec = VectorXd::Zero(initial_block_size);
+    VectorXd freq_arr, missing_rate_arr, nobs_geno_arr;
+
+    const std::int64_t num_blocks = static_cast<std::int64_t>(blocks.size());
+    for(std::int64_t iblock = 0; iblock < num_blocks; iblock++){
+        const SnpSegment& block = blocks[iblock];
+        if(block.num_snp != geno_var_Vec.size()){
+            snp_mat_part.resize(block.num_snp * num_id_used);
+            geno_var_Vec.resize(block.num_snp);
+            beta_Mat.resize(block.num_snp, m_num_bye + 1);
+            se_Mat.resize(block.num_snp, m_num_bye + 1);
+            p_Mat.resize(block.num_snp, m_num_bye + 1);
+            p_combined_Mat.resize(block.num_snp, 3);
+            prod_Vec.resize(block.num_snp);
         }
-        
-        spdlog::info("Part {}/{}: Start SNP {}, read SNPs {}", ipart + 1, npart_snp, partition.start_snp, partition.num_snp_read);
-        GenoA.read_bed_centered_to_buffer_omp(
-            bed_file + ".bed", snp_mat_part.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
-            partition.start_snp, partition.num_snp_read, bed_context.id_index_in_bed_vec);
+
+        spdlog::info("Part {}/{}: {}, start SNP {}, read SNPs {}", iblock + 1, num_blocks,
+                genotypes.prefix(block.file_index), block.local_start, block.num_snp);
+        GENO& geno = genotypes.geno(block.file_index);
+        geno.read_bed_centered_to_buffer_omp(
+            genotypes.prefix(block.file_index) + ".bed", snp_mat_part.data(), freq_arr, missing_rate_arr, nobs_geno_arr,
+            block.local_start, block.num_snp, genotypes.sample_index(block.file_index));
 
         // First get cheap marginal approximations for the main effect and each
         // environment-specific interaction; fall back to exact per-SNP refits
         // only when one of those approximations looks promising.
         #pragma omp parallel for schedule(dynamic)
-        for (std::int64_t j = 0; j < partition.num_snp_read; ++j) {
+        for (std::int64_t j = 0; j < block.num_snp; ++j) {
             geno_var_Vec(j) = cblas_ddot(
-                bed_context.num_id_used, snp_mat_part.data() + j * bed_context.num_id_used, 1,
-                snp_mat_part.data() + j * bed_context.num_id_used, 1);
+                num_id_used, snp_mat_part.data() + j * num_id_used, 1,
+                snp_mat_part.data() + j * num_id_used, 1);
         }
 
         // main
-        se_Mat.col(0) = 1.0 / (gamma_main * geno_var_Vec.array());
+        se_Mat.col(0) = 1.0 / (gamma.main * geno_var_Vec.array());
 
-        cblas_dgemv(CblasRowMajor, CblasNoTrans, partition.num_snp_read, bed_context.num_id_used, 1.0, snp_mat_part.data(), 
-                bed_context.num_id_used, Vi0y.data(), 1, 0.0, prod_Vec.data(), 1);
-        vdMul(partition.num_snp_read, se_Mat.col(0).data(), prod_Vec.data(), beta_Mat.col(0).data());
+        cblas_dgemv(CblasRowMajor, CblasNoTrans, block.num_snp, num_id_used, 1.0, snp_mat_part.data(), 
+                num_id_used, Vi0y.data(), 1, 0.0, prod_Vec.data(), 1);
+        vdMul(block.num_snp, se_Mat.col(0).data(), prod_Vec.data(), beta_Mat.col(0).data());
         
         // GxE
         for(std::int64_t k = 0; k < m_num_bye; k++){
-            se_Mat.col(k+1) = 1.0 / (gamma_GxEnoMain_Vec(k) * geno_var_Vec.array());
-            vdMul(bed_context.num_id_used, m_bye_mat.col(k).data(), Vi0y.data(), EVy.data());
-            cblas_dgemv(CblasRowMajor, CblasNoTrans, partition.num_snp_read, bed_context.num_id_used, 1.0, snp_mat_part.data(), 
-                bed_context.num_id_used, EVy.data(), 1, 0.0, prod_Vec.data(), 1);
-            vdMul(partition.num_snp_read, se_Mat.col(k+1).data(), prod_Vec.data(), beta_Mat.col(k+1).data());
+            se_Mat.col(k+1) = 1.0 / (gamma.no_main(k) * geno_var_Vec.array());
+            vdMul(num_id_used, m_bye_mat.col(k).data(), Vi0y.data(), EVy.data());
+            cblas_dgemv(CblasRowMajor, CblasNoTrans, block.num_snp, num_id_used, 1.0, snp_mat_part.data(), 
+                num_id_used, EVy.data(), 1, 0.0, prod_Vec.data(), 1);
+            vdMul(block.num_snp, se_Mat.col(k+1).data(), prod_Vec.data(), beta_Mat.col(k+1).data());
         }
         // Convert calibrated variances to z-scores (effect / SE) for column 0
         // (main effect) and columns 1.. (per-environment interactions).
@@ -2781,7 +3063,7 @@ void fastGxE::test_GxE(const string& bed_file,
         MatrixXd z_mat = beta_Mat.array() / se_Mat.array();
 
         #pragma omp parallel for schedule(dynamic)
-        for(std::int64_t k = 0; k < partition.num_snp_read; k++){
+        for(std::int64_t k = 0; k < block.num_snp; k++){
             if(isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut)){
                 VectorXd p_Vec = VectorXd::Ones(m_num_bye + 1) * NAN;
 
@@ -2795,17 +3077,17 @@ void fastGxE::test_GxE(const string& bed_file,
                 // when the cheap approximation already looks significant.
                 if(p_Vec.minCoeff() < p_approx_cut){
                     Eigen::Map<Eigen::VectorXd> snpk(
-                        snp_mat_part.data() + k * bed_context.num_id_used, bed_context.num_id_used);
+                        snp_mat_part.data() + k * num_id_used, num_id_used);
                     double snpk_norm2 = geno_var_Vec(k);
                     MatrixXd snpkME = m_bye_mat.array().colwise() * snpk.array();
-                    MatrixXd xmatk = MatrixXd::Zero(bed_context.num_id_used, 2);
+                    MatrixXd xmatk = MatrixXd::Zero(num_id_used, 2);
                     xmatk.col(0) = snpk;
 
                     for(std::int64_t m = 0; m < m_num_bye; m++){
                             xmatk.col(1) = snpkME.col(m);
 
                             // Fast approximate refit (gamma-calibrated information matrix).
-                            MatrixXd beta_Vec_var = (gamma_Mat_vec[m] * snpk_norm2).inverse();
+                            MatrixXd beta_Vec_var = (gamma.with_main[m] * snpk_norm2).inverse();
                             double beta = (beta_Vec_var * (xmatk.transpose() * Vi0y))(1);
                             double beta_var = beta_Vec_var(1, 1);
                             double p_val = gsl_cdf_chisq_Q(beta * beta / beta_var, 1);
@@ -2849,7 +3131,7 @@ void fastGxE::test_GxE(const string& bed_file,
         VectorXd score_Vec = z_mat.rightCols(m_num_bye).array().square().matrix().rowwise().sum();
 
         #pragma omp parallel for schedule(dynamic)
-        for(std::int64_t k = 0; k < partition.num_snp_read; k++){
+        for(std::int64_t k = 0; k < block.num_snp; k++){
             double score_val = score_Vec(k);
             if(isValidSnp(freq_arr(k), missing_rate_arr(k), maf_cut, missing_rate_cut) && score_val >= 0.0 && std::isfinite(score_val)){
 
@@ -2867,10 +3149,10 @@ void fastGxE::test_GxE(const string& bed_file,
             }
         }
         
-        const vector<string> snp_info_vec = GenoA.snp_anno(partition.start_snp, partition.num_snp_read);
+        const vector<string> snp_info_vec = geno.snp_anno(block.local_start, block.num_snp);
         fastGxE::output_GxE(fout, fout_single, snp_info_vec, freq_arr, nobs_geno_arr,
             beta_Mat, se_Mat, p_Mat, p_combined_Mat,
-            partition.start_snp, partition.num_snp_read);
+            block.global_start, block.num_snp);
     }
     fout.close();
     fout_single.close();
@@ -2926,6 +3208,13 @@ void fastGxE::output_GxE(ofstream& fout, ofstream& fout_single,
 // .bed file is supplied, runs the corresponding genome-wide scan (test_main or
 // test_GxE) over the resolved SNP range. Returns 0 on success.
 int fastGxE::run(int argc, char **argv) {
+    switch (find_step_argument(argc, argv)) {
+        case 1: return this->run_step1(argc, argv);
+        case 2: return this->run_step2(argc, argv);
+        case 3: return this->run_step3(argc, argv);
+        default: break;
+    }
+
     CLI::App app{"fastGxE -  Scalable and fast genome-wide multi-environment GxE method"};
     RunOptions options;
     configure_run_cli(app, options);
@@ -2935,17 +3224,41 @@ int fastGxE::run(int argc, char **argv) {
     spdlog::info("Options:\n{}", app.config_to_str(false, false));
     validate_run_options(options);
     log_run_options(options);
-    
-    // Set MKL and OpenMP threads
-    mkl_set_num_threads(options.threads);
-    // Let MKL trim its thread count for small problems and, crucially, run
-    // single-threaded when called from inside an OpenMP parallel region (the
-    // per-SNP scan loops in test_GxE). This is the MKL default; setting it
-    // explicitly guards against an environment that forces MKL_DYNAMIC=false,
-    // which could otherwise oversubscribe to threads^2 threads.
-    mkl_set_dynamic(1);
-    omp_set_num_threads(options.threads);
+    configure_threads(options.threads);
 
+    this->fit_null_model(options);
+
+    if(options.bed_file.empty()){
+        spdlog::info("No --bfile provided; variance components estimated only (no genome-wide scan).");
+        spdlog::info("Analysis completed.");
+        return 0;
+    }
+
+    GenoSet genotypes({options.bed_file});
+    vector<std::int64_t> tmp_vec = this->get_start_end_pos(genotypes, options.snp_range_vec, options.split_task_vec);
+    std::int64_t start_pos = tmp_vec[0], end_pos = tmp_vec[1];
+    if(end_pos - start_pos <= options.npart_snp) options.npart_snp = 1;
+    spdlog::info("Scanning SNPs [{}, {}) ({} SNPs) in {} partition(s)",
+            start_pos, end_pos, end_pos - start_pos, options.npart_snp);
+
+    const std::uint64_t seed = resolve_seed(options.seed, options.seed_given);
+    if(options.test_main){
+        this->test_main(options.bed_file, start_pos, end_pos, options.npart_snp,
+                options.keep_random,
+                options.num_random_snp, seed, options.maf_cut, options.missing_rate_cut);
+    }else if(options.test_gxe){
+        this->test_GxE(genotypes, start_pos, end_pos, options.npart_snp,
+                                 options.keep_random,
+                                 options.exact_cut, options.num_random_snp, seed, options.p_approx_cut,
+                                 options.maf_cut, options.missing_rate_cut);
+    }
+    spdlog::info("Analysis completed.");
+    return 0;
+}
+
+// Loads the phenotype and GRM, then fits the variance components of the null model
+// for the selected analysis mode.
+void fastGxE::fit_null_model(RunOptions& options){
     // Resolve all requested column names against the data-file header before any
     // expensive GRM or genotype work starts.
     ResolvedInputColumns resolved = resolve_input_columns(options);
@@ -2973,55 +3286,156 @@ int fastGxE::run(int argc, char **argv) {
             spdlog::info("Applying inverse-normal transform to the phenotype");
             apply_inverse_normal_transform(m_y);
         }
-        this->varcom_main(init_varcom, options.maxiter, options.cc_gra, options.cc_gra, options.cc_logL);
+        this->varcom_main(init_varcom, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
     }else if(options.test_gxe){
         // For GxE the inverse-normal transform is applied inside pre_data_GxE,
         // AFTER the covariate/environment correction (see its inv_normal arg).
         this->pre_data_GxE(options.standardize_env, true, options.inv_normal);  // Phenotype correction is always required here.
         this->varcom_GxE(init_varcom, options.no_noisebye, options.maxiter, options.cc_par, options.cc_gra, options.cc_logL);
     }
-    
-    
-    if(options.bed_file.empty()){
-        spdlog::info("No --bfile provided; variance components estimated only (no genome-wide scan).");
-        spdlog::info("Analysis completed.");
-        return 0;
-    }
+}
 
-    vector<std::int64_t> tmp_vec = this->get_start_end_pos(options.bed_file, options.snp_range_vec, options.split_task_vec);
-    std::int64_t start_pos = tmp_vec[0], end_pos = tmp_vec[1];
-    if(end_pos - start_pos <= options.npart_snp) options.npart_snp = 1;
-    spdlog::info("Scanning SNPs [{}, {}) ({} SNPs) in {} partition(s)",
-            start_pos, end_pos, end_pos - start_pos, options.npart_snp);
+// Step 1: fits the GxE null model and saves what steps 2 and 3 need.
+int fastGxE::run_step1(int argc, char **argv) {
+    CLI::App app{"fastGxE step 1 - fit the null model"};
+    RunOptions options;
+    options.test_gxe = true;
+    int step = 0;
+    configure_step1_cli(app, options, step);
+    CLI11_PARSE(app, argc, argv);
+    spdlog::info("fastGxE {} step 1", FASTGXE_VERSION);
+    spdlog::info("Options:\n{}", app.config_to_str(false, false));
+    validate_run_options(options);
+    configure_threads(options.threads);
 
-    if(options.test_main){
-        this->test_main(options.bed_file, start_pos, end_pos, options.npart_snp,
-                options.keep_random,
-                options.num_random_snp, options.maf_cut, options.missing_rate_cut);
-    }else if(options.test_gxe){
-        this->test_GxE(options.bed_file, start_pos, end_pos, options.npart_snp,
-                                 options.keep_random,
-                                 options.exact_cut, options.num_random_snp, options.p_approx_cut,
-                                 options.maf_cut, options.missing_rate_cut);
+    this->fit_null_model(options);
+
+    NullModel model;
+    model.trait_name = m_trait_name_vec.front();
+    model.sample_ids = m_id_in_data_vec;
+    model.env_names = m_bye_name_vec;
+    model.varcom = m_varcom_null;
+    model.vinv_y = m_Vi0 * m_y;
+    model.env_mat = m_bye_mat;
+    model.vinv = m_Vi0;
+    model.vinv.makeCompressed();
+    model.no_noisebye = options.no_noisebye;
+    model.fingerprint = compute_null_fingerprint(
+        model.sample_ids, model.env_names, model.varcom, model.vinv_y, model.env_mat);
+    write_null_model(m_out_file, model);
+
+    spdlog::info("Step 1 completed.");
+    return 0;
+}
+
+// Restores the state left by step 1. model.vinv_y and model.fingerprint stay in
+// `model`, for the caller to use.
+void fastGxE::adopt_null_model(NullModel& model){
+    m_trait_name_vec = {model.trait_name};
+    m_num_id = static_cast<std::int64_t>(model.sample_ids.size());
+    m_id_in_data_vec = std::move(model.sample_ids);
+    m_num_bye = static_cast<std::int64_t>(model.env_names.size());
+    m_bye_name_vec = std::move(model.env_names);
+    m_bye_mat = std::move(model.env_mat);
+    m_varcom_null = std::move(model.varcom);
+    m_Vi0 = std::move(model.vinv);
+}
+
+// Step 2: calibrates the gamma factors on random SNPs drawn across all the genotype
+// input, and writes them to <out>.gamma.
+int fastGxE::run_step2(int argc, char **argv) {
+    CLI::App app{"fastGxE step 2 - calibrate gamma on random SNPs"};
+    GenotypeStepOptions options;
+    configure_step2_cli(app, options);
+    CLI11_PARSE(app, argc, argv);
+    spdlog::info("fastGxE {} step 2", FASTGXE_VERSION);
+    spdlog::info("Options:\n{}", app.config_to_str(false, false));
+    validate_genotype_step_options(options);
+    configure_threads(options.threads);
+
+    NullModel model = read_null_model(options.null_prefix, true);
+    this->adopt_null_model(model);
+    m_out_file = options.out_file;
+
+    GenoSet genotypes = open_genotypes(options);
+    genotypes.bind_samples(m_id_in_data_vec);
+
+    const std::uint64_t seed = resolve_seed(options.seed, options.seed_given);
+    GxeGamma gamma = this->calibrate_gamma_GxE(genotypes, model.vinv_y, options.num_random_snp, seed,
+            options.keep_random, options.maf_cut, options.missing_rate_cut);
+    gamma.null_fingerprint = model.fingerprint;
+    write_gamma_file(m_out_file, gamma, m_bye_name_vec);
+
+    spdlog::info("Gamma factors written to {}.gamma", m_out_file);
+    spdlog::info("Step 2 completed.");
+    return 0;
+}
+
+// Step 3: scans the requested SNPs with the null model of step 1 and the gamma
+// factors of step 2.
+int fastGxE::run_step3(int argc, char **argv) {
+    CLI::App app{"fastGxE step 3 - genome-wide GxE scan"};
+    GenotypeStepOptions options;
+    configure_step3_cli(app, options);
+    CLI11_PARSE(app, argc, argv);
+    spdlog::info("fastGxE {} step 3", FASTGXE_VERSION);
+    spdlog::info("Options:\n{}", app.config_to_str(false, false));
+    validate_genotype_step_options(options);
+    if(options.exact_cut < 0.0 || options.exact_cut > 1.0){
+        fatal_error("--exact-cut ({}) must be between 0 and 1.", options.exact_cut);
     }
-    spdlog::info("Analysis completed.");
+    if(options.bsize <= 0){
+        fatal_error("--bsize must be positive.");
+    }
+    configure_threads(options.threads);
+
+    // V^-1 is only used by the exact refit.
+    NullModel model = read_null_model(options.null_prefix, options.exact_cut > 0.0);
+    const GxeGamma gamma = read_gamma_file(options.gamma_prefix, model.env_names);
+    if(gamma.null_fingerprint != model.fingerprint){
+        fatal_error("{}.gamma was not calibrated on the null model {}.null.bin. Rerun step 2.",
+                options.gamma_prefix, options.null_prefix);
+    }
+    this->adopt_null_model(model);
+    m_out_file = options.out_file;
+
+    GenoSet genotypes = open_genotypes(options);
+    const vector<std::int64_t> range = this->get_start_end_pos(
+        genotypes, options.snp_range_vec, options.split_task_vec);
+    const vector<SnpSegment> segments = genotypes.segments(range[0], range[1]);
+
+    // Only match samples against the filesets this job reads.
+    vector<std::size_t> file_indices;
+    for(const SnpSegment& segment : segments){
+        file_indices.push_back(segment.file_index);
+    }
+    genotypes.bind_samples(m_id_in_data_vec, file_indices);
+
+    spdlog::info("Scanning SNPs [{}, {}) ({} SNPs) with gamma from {} random SNPs",
+            range[0], range[1], range[1] - range[0], gamma.num_random_used);
+    this->scan_GxE(genotypes, model.vinv_y, gamma, blocks_from_segments(segments, options.bsize),
+            options.exact_cut, options.p_approx_cut, options.maf_cut, options.missing_rate_cut);
+
+    spdlog::info("Step 3 completed.");
     return 0;
 }
 
 
-// Determines the [start, end) SNP index range to scan. Defaults to the whole .bed
-// file, or honors a --snp-range (resolved from SNP names via the .bim) or a
+// Determines the [start, end) SNP index range to scan. Defaults to the whole genotype
+// input, or honors a --snp-range (resolved from SNP names via the .bim) or a
 // --split-task partition (total parts, current part); the two are mutually
 // exclusive. Updates the output prefix accordingly and aborts on an invalid range.
-vector<std::int64_t> fastGxE::get_start_end_pos(const string& bed_file,
+vector<std::int64_t> fastGxE::get_start_end_pos(GenoSet& genotypes,
             const vector<string>& snp_range_vec, const vector<std::int64_t>& split_task_vec){
-    GENO GenoA(bed_file);
-    std::int64_t num_snp = GenoA.get_num_sid();
+    std::int64_t num_snp = genotypes.num_snp();
     std::int64_t start_pos = 0, end_pos = num_snp;
     if((!snp_range_vec.empty()) && (!split_task_vec.empty())){
         fatal_error("Options --snp-range and --split-task cannot be used together.");
     }else if(!snp_range_vec.empty()){
-        vector<std::int64_t> tmp = GenoA.find_bim_index(snp_range_vec);
+        if(genotypes.num_files() != 1){
+            fatal_error("--snp-range needs a single fileset; use --bfile.");
+        }
+        vector<std::int64_t> tmp = genotypes.geno(0).find_bim_index(snp_range_vec);
         start_pos = tmp[0];
         end_pos = tmp[1] + 1;
         this->reset_output_prefix(this->m_out_file, start_pos, end_pos);

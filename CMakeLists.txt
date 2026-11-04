@@ -9,7 +9,7 @@ if(NOT CMAKE_CXX_COMPILER)
     set(CMAKE_CXX_COMPILER "/home/chaoning/intel/oneapi/compiler/2025.2/bin/icpx")
 endif()
 
-project(fastgxeProject LANGUAGES CXX)
+project(fastgxeProject VERSION 2.0.0 LANGUAGES CXX)
 
 option(FASTGXE_FULL_STATIC_LINK "Link executables as fully static binaries when static runtimes are available" ON)
 
@@ -60,6 +60,7 @@ set(SOURCE_FILES
     utils/acat_utils.cpp
     utils/EigenMatrix_utils.cpp
     utils/geno.cpp
+    utils/geno_set.cpp
     utils/iterator_utils.cpp
     utils/partitionLowerTriangle.cpp
     utils/phen.cpp
@@ -69,6 +70,7 @@ set(SOURCE_FILES
     gmatrix/gmatrix.cpp
     gmatrix/processGRM.cpp
     fastgxe/fastgxe.cpp
+    fastgxe/null_model_io.cpp
     fastgxe/mom.cpp
     fastgxe/mmsusie.cpp
     fastgxe/main.cpp
@@ -95,11 +97,14 @@ set(FASTGXE_RUNTIME_LIBS
     -lrt
 )
 
-# Define the executable
-add_executable(fastgxe ${SOURCE_FILES})
+# Define the executable. The file is named fastgxe2.0 so that it can sit next to
+# version 1 (fastgxe) on the same PATH.
+add_executable(fastgxe2 ${SOURCE_FILES})
+set_target_properties(fastgxe2 PROPERTIES OUTPUT_NAME "fastgxe2.0")
+target_compile_definitions(fastgxe2 PRIVATE FASTGXE_VERSION="${PROJECT_VERSION}")
 
 # Link Libraries
-target_link_libraries(fastgxe
+target_link_libraries(fastgxe2
     ${FASTGXE_MKL_LIBS}
     ${FASTGXE_GSL_LIBS}
     ${FASTGXE_RUNTIME_LIBS}

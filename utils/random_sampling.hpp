@@ -13,3 +13,10 @@
 #include <vector>
 
 std::vector<std::int64_t> sample_unique_integers(std::int64_t min, std::int64_t max, std::int64_t num);
+
+// Same as above, but the draw is fully determined by `seed`.
+std::vector<std::int64_t> sample_unique_integers(std::int64_t min, std::int64_t max, std::int64_t num,
+                                                 std::uint64_t seed);
+
+// Returns a fresh non-deterministic seed, for runs where the user gave none.
+std::uint64_t draw_random_seed();

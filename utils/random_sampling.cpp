@@ -48,3 +48,33 @@ vector<std::int64_t> sample_unique_integers(std::int64_t min, std::int64_t max, 
 
     return sampled_values;
 }
+
+/**
+ * @brief Seeded variant of `sample_unique_integers`.
+ *
+ * The result only depends on the arguments, so a run can be reproduced exactly.
+ * Taking the first `n` values of a larger draw gives the same values as asking
+ * for `n` directly, because the whole interval is shuffled either way.
+ */
+vector<std::int64_t> sample_unique_integers(std::int64_t min, std::int64_t max, std::int64_t num,
+                                            std::uint64_t seed)
+{
+    if (num > max - min) {
+        fatal_error(" exceeds the upper limit");
+    }
+
+    vector<std::int64_t> sampled_values(static_cast<size_t>(max - min));
+    std::iota(sampled_values.begin(), sampled_values.end(), min);
+
+    std::mt19937_64 rng(seed);
+    std::shuffle(sampled_values.begin(), sampled_values.end(), rng);
+
+    sampled_values.resize(static_cast<size_t>(num));
+    return sampled_values;
+}
+
+std::uint64_t draw_random_seed()
+{
+    std::random_device device;
+    return (static_cast<std::uint64_t>(device()) << 32) | device();
+}

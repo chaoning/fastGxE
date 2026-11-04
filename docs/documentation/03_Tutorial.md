@@ -14,7 +14,7 @@ cd example
 mkdir -p output
 ```
 
-The executable is assumed to be on your `PATH` as `fastgxe`. If you built from source and the binary is not on your `PATH`, replace `fastgxe` with the full path, e.g. `../build/fastgxe`.
+The commands use `fastgxe` for the executable. They work with both version 1.0 (`fastgxe`) and version 2.0 (`fastgxe2.0`), except for the three-step workflow in section 5, which needs `fastgxe2.0`. If the binary is not on your `PATH`, use its full path, e.g. `../build/fastgxe2.0`.
 
 ## 1. Example inputs
 
@@ -230,7 +230,106 @@ fastgxe --test-gxe \
   --out output/test_gxe_no_noisebye
 ```
 
-## 5. Parallelize genome-wide scans
+## 5. Run the GxE scan in three steps
+
+Version 2.0 (`fastgxe2.0`) can run the GxE analysis as three separate steps, similar to [regenie](https://rgcgithub.github.io/regenie/options/). Each step reads the files written by the step before. The null model is fitted once, and every scan job uses the same gamma factors, however the genome is divided.
+
+| Step | What it does | Inputs | Outputs |
+| --- | --- | --- | --- |
+| `--step 1` | Fits the null model and estimates the variance components | GRM, phenotype table | `.var`, `.h2`, `.null.bin` |
+| `--step 2` | Draws random SNPs from the whole genome and calibrates gamma | step 1, genotypes | `.gamma` |
+| `--step 3` | Scans the SNPs for GxE | step 1, step 2, genotypes | `.assoc`, `.perE.assoc` |
+
+The output files have the same format as those of `--test-gxe`. Use `fastgxe2.0 --step N -h` to list the options of a step. An option that does not belong to a step is rejected.
+
+### Step 1: fit the null model
+
+```bash
+fastgxe2.0 --step 1 \
+  --grm output/test \
+  --data test_simu_pheno.txt \
+  --trait pheno \
+  --env-int E1:E40 \
+  --out output/s1
+```
+
+This step needs no genotypes. It takes the same phenotype, covariate and environment options as `--test-gxe`, such as `--covar`, `--class`, `--inv-normal` and `--no-noisebye`.
+
+`output/s1.null.bin` holds what the later steps need, so they take no phenotype options. It contains sample IDs and environment values, so treat it as individual-level data.
+
+### Step 2: calibrate gamma
+
+With one fileset for the whole genome:
+
+```bash
+fastgxe2.0 --step 2 --null output/s1 --bfile test --seed 2026 --out output/s2
+```
+
+With one fileset per chromosome, list the PLINK prefixes in a text file, one per line, and pass it to `--mbfile`:
+
+```bash
+for c in {1..22}; do echo "geno/chr$c"; done > chr_list.txt
+fastgxe2.0 --step 2 --null output/s1 --mbfile chr_list.txt --seed 2026 --out output/s2
+```
+
+The SNPs are drawn evenly across all filesets, so each chromosome contributes in proportion to its number of SNPs. For the same seed, the same SNPs are drawn whether the genome is stored in one fileset or several, provided the SNPs are listed in the same order.
+
+- `--num-random-snp` (default `1000`) counts SNPs that pass `--maf` and `--missing-rate`. SNPs that fail are replaced by further random SNPs.
+- `--seed` makes the draw reproducible. Without it a random seed is chosen. The seed is always recorded in `output/s2.gamma`.
+- `--keep-random` also writes the per-SNP calibration files.
+
+### Step 3: scan the genome
+
+Whole genome in one job:
+
+```bash
+fastgxe2.0 --step 3 --null output/s1 --gamma output/s2 --bfile test --out output/s3
+```
+
+One job per chromosome:
+
+```bash
+for c in {1..22}; do
+  fastgxe2.0 --step 3 --null output/s1 --gamma output/s2 --bfile geno/chr$c --out output/s3.chr$c
+done
+```
+
+One chromosome split into 20 jobs, which write `output/s3.chr1.20_1.assoc` to `output/s3.chr1.20_20.assoc`:
+
+```bash
+for i in {1..20}; do
+  fastgxe2.0 --step 3 --null output/s1 --gamma output/s2 --bfile geno/chr1 --split-task 20 $i --out output/s3.chr1
+done
+```
+
+The whole genome split into 200 jobs of equal size. A job may span two chromosomes:
+
+```bash
+for i in {1..200}; do
+  fastgxe2.0 --step 3 --null output/s1 --gamma output/s2 --mbfile chr_list.txt --split-task 200 $i --out output/s3
+done
+```
+
+Each loop body can be submitted as a job array. Merge the results, keeping one header line:
+
+```bash
+awk 'FNR>1 || NR==1' output/s3.chr{1..22}.assoc > output/s3.assoc
+awk 'FNR>1 || NR==1' output/s3.chr{1..22}.perE.assoc > output/s3.perE.assoc
+```
+
+Useful options:
+
+- `--bsize` (default `1000`) sets how many SNPs are read at a time. Genotypes take about `samples * bsize * 8` bytes of memory.
+- `--exact-cut`, `--p-approx-cut`, `--maf`, `--missing-rate` and `--snp-range` work as for `--test-gxe`. `--snp-range` needs `--bfile`.
+- `--exact-cut 0` skips the exact refit and does not load `V^-1`, which saves memory, but the top hits then only have approximate p-values.
+
+Notes:
+
+- The `order` column counts SNPs within the input of that run. With `--bfile` it restarts in each file; with `--mbfile` it counts across all filesets.
+- `.gamma` records which null model it belongs to. Step 3 stops if `--null` and `--gamma` do not match.
+- Splitting the work changes results only through rounding. `p_multi` and `p_gxe` can differ by about `1e-6` (relative) for SNPs near `p_multi = 0.46`, where the saddlepoint approximation is sensitive to the last digits of the score. Significant SNPs are not affected.
+
+## 6. Parallelize single-command scans
 
 Both `--test-main` and `--test-gxe` support task splitting with:
 
@@ -259,8 +358,9 @@ Important notes:
 - Give each parallel job a distinct `--out` prefix.
 - The result files are written under task-specific output names after the split is resolved.
 - Merging association result files is currently left to an external Python or R script.
+- Each job fits the null model again and draws its own random SNPs, so the gamma factors differ slightly between jobs. Use the three-step workflow in section 5 if all jobs should share them.
 
-## 6. Identify environments driving lead SNP GxE signals with mmSuSiE
+## 7. Identify environments driving lead SNP GxE signals with mmSuSiE
 
 Once candidate GxE loci are identified, you can use **mmSuSiE** to prioritize the environmental variables driving the signal:
 
@@ -327,7 +427,7 @@ print(df_leading)
 # Step 2: Fine-map environments for a chosen lead SNP.
 snp_id = "rs550011"                    # lead SNP from df_leading
 trait = "pheno"                        # phenotype column in pheno_file
-varcom_file = "output/test_gxe.var"   # variance components estimated by fastGxE
+varcom_file = "output/test_gxe.var"   # variance components from --test-gxe, or the .var of --step 1
 out_file = "output/test_mmsusie"      # output file prefix
 
 res_dct = model.mmsusie_lead_gxe(
@@ -379,12 +479,12 @@ print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of inter
 | `output/test_mmsusie.mu.txt` | Posterior mean effects |
 | `output/test_mmsusie.cs.txt` | Credible sets |
 
-## 7. Summary workflow
+## 8. Summary workflow
 
 For a full example run, the main steps are:
 
 1. `cd example && mkdir -p output`
 2. Build the GRM with `--make-grm`.
 3. Group related samples with `--process-grm --group`.
-4. Run `--test-main` or `--test-gxe`.
+4. Run `--test-main`, or run the GxE scan with `--test-gxe` or with `--step 1`, `--step 2` and `--step 3`.
 5. Reformat the GRM and follow up with `mmSuSiE` if you want environment-level fine-mapping.

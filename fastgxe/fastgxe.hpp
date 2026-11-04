@@ -27,6 +27,11 @@ using Eigen::VectorXd;
 using Eigen::SparseMatrix;
 
 class PHEN;
+class GenoSet;
+struct GxeGamma;
+struct NullModel;
+struct RunOptions;
+struct SnpSegment;
 
 class fastGxE{
 
@@ -78,6 +83,14 @@ private:
         std::unordered_map<std::int64_t, SampleBlockLocation> sample_location_map;
     };
 
+    // Random SNPs used to calibrate gamma. Every SNP here has passed QC.
+    struct RandomSnpPanel {
+        vector<std::int64_t> snp_indices;   // global SNP indices
+        MatrixXd snp_mat;                   // n x panel size, mean-centered
+        VectorXd freq_arr;
+        VectorXd nobs_geno_arr;
+    };
+
     // Data preparation helpers: align phenotype rows with the GRM order, then
     // build the fixed-effect and environment matrices once for all later steps.
     void initialize_analysis_metadata(const string& out_file,
@@ -103,6 +116,23 @@ private:
             const std::unordered_map<std::int64_t, SampleBlockLocation>& sample_location_map,
             vector<MatrixXd>& grm_blocks) const;
 
+    // Shared by the single-command modes and the three-step workflow.
+    void fit_null_model(RunOptions& options);
+    void adopt_null_model(NullModel& model);
+    RandomSnpPanel select_random_panel(GenoSet& genotypes, std::int64_t num_random_snp,
+            std::uint64_t seed, double maf_cut, double missing_rate_cut);
+    GxeGamma calibrate_gamma_GxE(GenoSet& genotypes, const VectorXd& Vi0y,
+            std::int64_t num_random_snp, std::uint64_t seed, bool keep_random,
+            double maf_cut, double missing_rate_cut);
+    void scan_GxE(GenoSet& genotypes, const VectorXd& Vi0y, const GxeGamma& gamma,
+            const vector<SnpSegment>& blocks, double exact_cut,
+            double p_approx_cut, double maf_cut, double missing_rate_cut);
+
+    // The three steps of the GxE workflow, selected with --step.
+    int run_step1(int argc, char **argv);
+    int run_step2(int argc, char **argv);
+    int run_step3(int argc, char **argv);
+
 public:
     fastGxE();
     ~fastGxE();
@@ -126,7 +156,7 @@ public:
     void test_main(const string& bed_file,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
                 bool keep_random,
-                std::int64_t num_random_snp,
+                std::int64_t num_random_snp, std::uint64_t seed,
                 double maf_cut, double missing_rate_cut);
     void output(std::ofstream& fout, const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
                 const double* eff_arr, const double* se_arr, const VectorXd& p_arr,
@@ -142,16 +172,16 @@ public:
             const VectorXd& beta_main_Vec, const VectorXd& se_main_Vec, const VectorXd& p_main_Vec,
             const VectorXd& score_Vec, const VectorXd& p_Vec, std::int64_t start_snp, std::int64_t num_snp_read);
 
-    void test_GxE(const string& bed_file,
+    void test_GxE(GenoSet& genotypes,
                 std::int64_t start_pos, std::int64_t end_pos, int npart_snp,
                 bool keep_random,
-                double exact_cut, std::int64_t num_random_snp,
+                double exact_cut, std::int64_t num_random_snp, std::uint64_t seed,
                 double p_approx_cut, double maf_cut, double missing_rate_cut);
     void output_GxE(std::ofstream& fout, std::ofstream& fout_single,
             const vector<string>& snp_info_vec, const VectorXd& freq_arr, const VectorXd& nobs_geno_arr,
             const MatrixXd& beta_mat, const MatrixXd& se_mat, const MatrixXd& p_mat, const MatrixXd& p_combined_Mat,
             std::int64_t start_snp, std::int64_t num_snp_read);
 
-    vector<std::int64_t> get_start_end_pos(const string& bed_file,
+    vector<std::int64_t> get_start_end_pos(GenoSet& genotypes,
             const vector<string>& snp_range_vec, const vector<std::int64_t>& split_task_vec);
 };

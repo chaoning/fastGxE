@@ -18,10 +18,11 @@
  *     --process-grm   ->  ProcessGRM   post-process an existing GRM
  *     --test-main     ->  fastGxE      SNP main-effect association scan
  *     --test-gxe      ->  fastGxE      SNP-by-environment (GxE) association scan
+ *     --step 1|2|3    ->  fastGxE      GxE scan as three separate steps
  *     --mom           ->  MoM          Method-of-Moments GxE heritability
  *
- * --test-main and --test-gxe both run the fastGxE class, so here they count as
- * the SAME choice (Tool::Association); fastGxE::run() tells them apart later.
+ * --test-main, --test-gxe and --step all run the fastGxE class, so here they count
+ * as the SAME choice (Tool::Association); fastGxE::run() tells them apart later.
  *
  * The rule enforced here: the user must pick exactly one tool.
  */
@@ -32,7 +33,7 @@
 
 #include <spdlog/spdlog.h>  // logging for error messages
 
-#include "fastgxe.hpp"     // fastGxE     (--test-main / --test-gxe)
+#include "fastgxe.hpp"     // fastGxE     (--test-main / --test-gxe / --step)
 #include "gmatrix.hpp"     // Gmatrix     (--make-grm)
 #include "mom.hpp"         // MoM         (--mom)
 #include "processGRM.hpp"  // ProcessGRM  (--process-grm)
@@ -48,7 +49,7 @@ enum class Tool {
     None,
     MakeGrm,
     ProcessGrm,
-    Association,  // shared by --test-main and --test-gxe
+    Association,  // shared by --test-main, --test-gxe and --step
     Mom
 };
 
@@ -58,7 +59,8 @@ Tool tool_for_flag(std::string_view arg) {
     if (arg == "-m" || arg == "--make-grm")     return Tool::MakeGrm;
     if (arg == "-d" || arg == "--process-grm")  return Tool::ProcessGrm;
     if (arg == "-g" || arg == "--test-main" ||
-        arg == "-x" || arg == "--test-gxe")     return Tool::Association;
+        arg == "-x" || arg == "--test-gxe" ||
+        arg == "--step" || arg.rfind("--step=", 0) == 0) return Tool::Association;
     if (arg == "-o" || arg == "--mom")          return Tool::Mom;
     return Tool::None;
 }
@@ -178,30 +180,39 @@ int print_tool_help(Tool tool, const char* program_name) {
 // Prints the program-wide usage banner (the list of tools and a few examples).
 void print_general_help() {
     std::cout
+        << "fastGxE " << FASTGXE_VERSION << "\n\n"
         << "Usage:\n"
-        << "  fastgxe --make-grm [options]\n"
-        << "  fastgxe --process-grm [options]\n"
-        << "  fastgxe --test-main [options]\n"
-        << "  fastgxe --test-gxe [options]\n"
-        << "  fastgxe --mom [options]\n\n"
+        << "  fastgxe2.0 --make-grm [options]\n"
+        << "  fastgxe2.0 --process-grm [options]\n"
+        << "  fastgxe2.0 --step 1|2|3 [options]\n"
+        << "  fastgxe2.0 --test-main [options]\n"
+        << "  fastgxe2.0 --test-gxe [options]\n"
+        << "  fastgxe2.0 --mom [options]\n\n"
         << "Top-Level Modes:\n"
         << "  -m, --make-grm           Compute the genomic relationship matrix (GRM)\n"
         << "  -d, --process-grm        Post-process an existing GRM\n"
+        << "      --step 1             GxE step 1: fit the null model\n"
+        << "      --step 2             GxE step 2: calibrate gamma on random SNPs genome-wide\n"
+        << "      --step 3             GxE step 3: genome-wide GxE scan\n"
         << "  -g, --test-main          Run the association module for SNP main effects\n"
-        << "  -x, --test-gxe           Run the association module for GxE testing\n"
+        << "  -x, --test-gxe           Run all GxE steps with a single command\n"
         << "  -o, --mom                Estimate GxE heritability with Method of Moments\n\n"
         << "Help:\n"
         << "  -h, --help               Show this general help\n"
         << "  -h 1                     Show GRM-construction help\n"
         << "  -h 2                     Show GRM post-processing help\n"
         << "  -h 3                     Show association-module help\n"
-        << "  -h 5                     Show MoM help\n\n"
+        << "  -h 5                     Show MoM help\n"
+        << "  --step N -h              Show the help of GxE step N\n"
+        << "  --version                Show the version\n\n"
         << "Examples:\n"
-        << "  fastgxe --make-grm --bfile data --out data_grm\n"
-        << "  fastgxe --process-grm --grm data_grm --out data_grm_processed\n"
-        << "  fastgxe --test-main --grm data_grm --bfile data --data pheno.txt --trait BMI --out test_main\n"
-        << "  fastgxe --test-gxe --grm data_grm --bfile data --data pheno.txt --trait BMI --env-int age smoking --out test_gxe\n"
-        << "  fastgxe --mom --grm data_grm --data pheno.txt --trait BMI --env-int age smoking --out test_mom\n";
+        << "  fastgxe2.0 --make-grm --bfile data --out data_grm\n"
+        << "  fastgxe2.0 --process-grm --grm data_grm --out data_grm_processed\n"
+        << "  fastgxe2.0 --step 1 --grm data_grm --data pheno.txt --trait BMI --env-int age smoking --out s1\n"
+        << "  fastgxe2.0 --step 2 --null s1 --bfile data --out s2\n"
+        << "  fastgxe2.0 --step 3 --null s1 --gamma s2 --bfile data --out s3\n"
+        << "  fastgxe2.0 --test-main --grm data_grm --bfile data --data pheno.txt --trait BMI --out test_main\n"
+        << "  fastgxe2.0 --mom --grm data_grm --data pheno.txt --trait BMI --env-int age smoking --out test_mom\n";
 }
 
 }  // namespace
@@ -216,17 +227,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 2. Decide which tool was requested; reject mixing two tools.
+    // 2. Version requested? Print it and stop.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--version") {
+            std::cout << "fastGxE " << FASTGXE_VERSION << "\n";
+            return 0;
+        }
+    }
+
+    // 3. Decide which tool was requested; reject mixing two tools.
     const ToolChoice choice = choose_tool(argc, argv);
     if (choice.conflict) {
         spdlog::error(
             "Choose only one top-level mode among --make-grm, --process-grm, "
-            "--test-main/--test-gxe, and --mom.");
+            "--step/--test-main/--test-gxe, and --mom.");
         print_general_help();
         return 1;
     }
 
-    // 3. Help requested? Handle it and stop here.
+    // 4. Help requested? Handle it and stop here.
     const HelpRequest help = scan_help(argc, argv);
     if (help.asked) {
         if (help.topic > 0) {
@@ -249,13 +268,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // 4. No help and no tool -> nothing to do.
+    // 5. No help and no tool -> nothing to do.
     if (choice.tool == Tool::None) {
         spdlog::error("No top-level analysis mode was specified.");
         print_general_help();
         return 1;
     }
 
-    // 5. Normal case: run the chosen tool with the original arguments.
+    // 6. Normal case: run the chosen tool with the original arguments.
     return run_tool(choice.tool, argc, argv);
 }
