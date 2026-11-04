@@ -438,10 +438,10 @@ df_leading = model.ld_pure(
 )
 print(df_leading)
 
-# Step 2: Fine-map environments for a chosen lead SNP.
+# Step 2: Fine-map environments for a chosen lead SNP. mmSuSiE estimates the
+# variance components itself, so no file from fastGxE is needed for them.
 snp_id = "rs550011"                    # lead SNP from df_leading
 trait = "pheno"                        # phenotype column in pheno_file
-varcom_file = "output/test_gxe.var"   # variance components from --test-gxe, or the .var of --step 1
 out_file = "output/test_mmsusie"      # output file prefix
 
 res_dct = model.mmsusie_lead_gxe(
@@ -451,14 +451,14 @@ res_dct = model.mmsusie_lead_gxe(
     grm_file,
     bed_file,
     snp_id,
-    varcom_file,
-    out_file,
+    out_file=out_file,
+    varcom_file="output/pheno.varcom.var",  # estimate once per trait, then reuse
     L=10,                # maximum number of causal environments
     maxiter=100,         # maximum ELBO iterations
     tol=1e-3,            # convergence tolerance on ELBO
     coverage=0.95,       # credible set coverage level
     min_abs_corr=0.5,    # minimum purity for a credible set to be reported
-    estimate_sigma=False, # keep the fastGxE variance components fixed (recommended)
+    estimate_sigma=False, # keep the null-model variance components fixed (recommended)
 )
 
 # res_dct["cs"]             — credible sets: environments with cumulative PIP >= coverage
@@ -472,19 +472,25 @@ print(df_pip)
 print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of interaction
 ```
 
-> **`estimate_sigma=False` is recommended here.** It reuses the variance components
-> that `--test-gxe` estimated **genome-wide** (over all SNPs) — the best-calibrated
-> values for this locus. `estimate_sigma=True` instead re-estimates the components in
-> the loop from this single locus; that refit is now REML (it corrects for the many
-> fixed effects mmSuSiE projects out — intercept, covariates, all environment main
-> effects, and the lead-SNP main effect, ≈ `2 + n_env` columns), so it is stable and no
-> longer biases the components downward. Prefer `False` for the genome-wide calibration;
-> use `True` only if you specifically want the components re-estimated jointly with the
-> fine-mapping.
+### Variance components
+
+`mmsusie_lead_gxe` fits the variance components itself, by REML under the null model (no SNP effect). It uses the same four components as fastGxE: G, GxE, NxE and residual. Set `nxe=False` to drop NxE, which matches `--no-noisebye`. If you installed mmSuSiE before November 2026, update it first, because older versions need a `.var` file.
+
+- **Reuse across lead SNPs.** The components are the same for every lead SNP of a trait, so pass `varcom_file`. The first SNP estimates them and writes that file, plus a `.json` recording the data and settings. Later SNPs read it. A file fitted to other data or settings is refused; delete it to re-estimate.
+- **Components from fastGxE.** They are accepted but not required. Pass a `.var` file with `varcom=` instead of `varcom_file`, for example `varcom="output/test_gxe.var"` or the `.var` from `--step 1`. The two arguments cannot be combined.
+- **Convergence.** When a component tends to zero, REML stops at `reml_maxiter` (default `200`) with a warning and uses the last iterate. The `.json` next to `varcom_file` records `converged`. With little relatedness GxE and NxE are nearly collinear, so this is expected: the 427-sample example gives this warning, and its estimates differ from the `.var` of fastGxE. On this example both sets of components give the same credible set.
+
+> **`estimate_sigma=False` is recommended here.** It keeps the components of the null
+> model, fitted across all samples. `estimate_sigma=True` instead re-estimates them
+> during fine-mapping, from this single locus. That update is REML (it corrects for the
+> many fixed effects mmSuSiE projects out — intercept, covariates, all environment main
+> effects, and the lead-SNP main effect, ≈ `2 + n_env` columns), so it is stable and
+> does not bias the components downward. Use `True` only if you specifically want the
+> components re-estimated jointly with the fine-mapping.
 
 ### Output files
 
-`model.mmsusie_lead_gxe()` writes four result files under the given `out_file` prefix:
+`model.mmsusie_lead_gxe()` writes five result files under the given `out_file` prefix:
 
 | File | Contents |
 | --- | --- |
@@ -492,6 +498,7 @@ print(df_pip[df_pip["pip"] > 0.5])  # environments with strong evidence of inter
 | `output/test_mmsusie.alpha.txt` | Per-component posterior assignment probabilities |
 | `output/test_mmsusie.mu.txt` | Posterior mean effects |
 | `output/test_mmsusie.cs.txt` | Credible sets |
+| `output/test_mmsusie.var` | Variance components used |
 
 ## 8. Summary workflow
 
