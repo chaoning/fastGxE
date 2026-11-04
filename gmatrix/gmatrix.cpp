@@ -2,6 +2,7 @@
 
 #define EIGEN_USE_MKL_ALL  // Must be defined before including Eigen.
 
+#include <algorithm>
 #include <fstream>
 #include <Eigen/Dense>
 #include <vector>
@@ -124,7 +125,7 @@ void Gmatrix::set_out_file(const std::string& file) {
 void Gmatrix::out_gmat(const MatrixXd& gmat, const double val) {
     const std::string filename = m_out_file + ".bin";
 
-    // Binary output matches the downstream GRM readers.
+    // float32, as in GCTA's .grm.bin; see processGRM.hpp for the layout.
     std::ofstream fout(filename, std::ios::binary);
     if (!fout) {
         spdlog::error("Failed to open output file: {}", filename);
@@ -137,12 +138,12 @@ void Gmatrix::out_gmat(const MatrixXd& gmat, const double val) {
         const std::int64_t global_row = m_start_id + i;
 
         for (std::int64_t j = 0; j < global_row; ++j) {
-            const double value = gmat(i, j);
-            fout.write(reinterpret_cast<const char*>(&value), sizeof(double));
+            const float value = static_cast<float>(gmat(i, j));
+            fout.write(reinterpret_cast<const char*>(&value), sizeof(float));
         }
 
-        const double diag_value = gmat(i, global_row) + val;
-        fout.write(reinterpret_cast<const char*>(&diag_value), sizeof(double));
+        const float diag_value = static_cast<float>(gmat(i, global_row) + val);
+        fout.write(reinterpret_cast<const char*>(&diag_value), sizeof(float));
     }
 
     if (!fout) {
@@ -245,7 +246,7 @@ MatrixXd Gmatrix::agmatrix(std::int64_t npart_snp, double maf, double missing_ra
         std::vector<Eigen::Index> local_filtered_indices;
         local_filtered_indices.reserve(static_cast<std::size_t>(num_snp_read));
         for (Eigen::Index it_snp = 0; it_snp < freq_arr.size(); ++it_snp) {
-            const bool low_maf = is_bed && (freq_arr(it_snp) < maf);
+            const bool low_maf = is_bed && (std::min(freq_arr(it_snp), 1.0 - freq_arr(it_snp)) < maf);
             const bool high_missing = missing_rate_arr(it_snp) > missing_rate_cut;
             const bool zero_variance = (scale_base(it_snp) == 0.0);
             if (low_maf || high_missing || zero_variance) {
@@ -358,7 +359,7 @@ MatrixXd Gmatrix::dgmatrix_as(std::int64_t npart_snp, double maf, double missing
         std::vector<Eigen::Index> local_filtered_indices;
         local_filtered_indices.reserve(static_cast<std::size_t>(num_snp_read));
         for (Eigen::Index it_snp = 0; it_snp < freq_arr.size(); ++it_snp) {
-            const bool low_maf = freq_arr(it_snp) < maf;
+            const bool low_maf = std::min(freq_arr(it_snp), 1.0 - freq_arr(it_snp)) < maf;
             const bool high_missing = missing_rate_arr(it_snp) > missing_rate_cut;
             if (low_maf || high_missing) {
                 freq_arr(it_snp) = 0.0;
@@ -472,7 +473,7 @@ MatrixXd Gmatrix::dgmatrix_gs(std::int64_t npart_snp, double maf, double missing
         std::vector<Eigen::Index> local_filtered_indices;
         local_filtered_indices.reserve(static_cast<std::size_t>(num_snp_read));
         for (Eigen::Index it_snp = 0; it_snp < freq_arr.size(); ++it_snp) {
-            const bool low_maf = freq_arr(it_snp) < maf;
+            const bool low_maf = std::min(freq_arr(it_snp), 1.0 - freq_arr(it_snp)) < maf;
             const bool high_missing = missing_rate_arr(it_snp) > missing_rate_cut;
             if (low_maf || high_missing) {
                 freq_arr(it_snp) = 0.0;

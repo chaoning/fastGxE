@@ -112,7 +112,7 @@ private:
             const vector<std::int64_t>& covariate_arr, const vector<std::int64_t>& class_arr,
             const vector<std::int64_t>& bye_arr, const vector<std::int64_t>& trait);
     GroupLayout build_group_layout(const vector<GroupRecord>& group_records) const;
-    void load_grouped_grm_blocks(const string& agrm_file,
+    void load_grouped_grm_blocks(const string& agrm_file, std::int64_t num_id_in_grm,
             const std::unordered_map<std::int64_t, SampleBlockLocation>& sample_location_map,
             vector<MatrixXd>& grm_blocks) const;
 

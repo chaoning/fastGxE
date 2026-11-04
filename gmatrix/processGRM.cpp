@@ -14,6 +14,8 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <set>
 #include <queue>
 #include <string>
@@ -70,22 +72,96 @@ const char* sparse_output_suffix(const int out_fmt) {
     }
 }
 
-bool read_sparse_grm_record(ifstream& fin, std::int64_t& index0, std::int64_t& index1, double& value, const string& input_file) {
-    if(!fin.read(reinterpret_cast<char*>(&index0), sizeof(std::int64_t))){
-        if(fin.eof()){
+constexpr char SPARSE_GRM_MAGIC[] = {'F', 'G', 'M', 'A', 'S', 'P', 'F', '4'};
+
+// Reads one GRM value stored as float32 or float64.
+bool read_grm_value(ifstream& fin, int value_bytes, double& value) {
+    if(value_bytes == static_cast<int>(sizeof(float))){
+        float value_f = 0.0f;
+        if(!fin.read(reinterpret_cast<char*>(&value_f), sizeof(float))){
             return false;
         }
-        fatal_error("Failed while reading: {}", input_file);
+        value = value_f;
+        return true;
     }
+    return static_cast<bool>(fin.read(reinterpret_cast<char*>(&value), sizeof(double)));
+}
 
-    if(!fin.read(reinterpret_cast<char*>(&index1), sizeof(std::int64_t)) ||
-       !fin.read(reinterpret_cast<char*>(&value), sizeof(double))){
-        fatal_error("Failed while reading: {}", input_file);
+void write_grm_value(ofstream& fout, double value) {
+    const float value_f = static_cast<float>(value);
+    fout.write(reinterpret_cast<const char*>(&value_f), sizeof(float));
+}
+
+void write_sparse_grm_header(ofstream& fout) {
+    fout.write(SPARSE_GRM_MAGIC, sizeof(SPARSE_GRM_MAGIC));
+}
+
+void write_sparse_grm_record(ofstream& fout, std::int64_t index0, std::int64_t index1, double value) {
+    fout.write(reinterpret_cast<const char*>(&index0), sizeof(std::int64_t));
+    fout.write(reinterpret_cast<const char*>(&index1), sizeof(std::int64_t));
+    write_grm_value(fout, value);
+}
+
+// A .grm.id line is "IID", or "FID IID" as written by fastGMA and GCTA.
+string grm_iid_from_line(const string& line) {
+    const vector<string> fields = split_string(line);
+    if(fields.empty()){
+        return "";
     }
-    return true;
+    return fields.size() >= 2 ? fields[1] : fields[0];
 }
 
 } // namespace
+
+int dense_grm_value_bytes(const std::string& bin_file, std::int64_t num_id) {
+    ifstream fin(bin_file, std::ios::binary | std::ios::ate);
+    if(!fin.is_open()){
+        fatal_error("Fail to open: {}", bin_file);
+    }
+    const std::int64_t file_size = static_cast<std::int64_t>(fin.tellg());
+    const std::int64_t num_values = num_id * (num_id + 1) / 2;
+    if(file_size == num_values * static_cast<std::int64_t>(sizeof(float))){
+        return static_cast<int>(sizeof(float));
+    }
+    if(file_size == num_values * static_cast<std::int64_t>(sizeof(double))){
+        return static_cast<int>(sizeof(double));
+    }
+    fatal_error("{} has {} bytes, which matches neither float32 ({}) nor float64 ({}) for {} samples",
+                bin_file, file_size, num_values * 4, num_values * 8, num_id);
+}
+
+int read_sparse_grm_header(std::ifstream& fin) {
+    char magic[sizeof(SPARSE_GRM_MAGIC)];
+    if(fin.read(magic, sizeof(magic)) && std::memcmp(magic, SPARSE_GRM_MAGIC, sizeof(magic)) == 0){
+        return static_cast<int>(sizeof(float));
+    }
+    fin.clear();
+    fin.seekg(0);
+    return static_cast<int>(sizeof(double));
+}
+
+bool read_sparse_grm_record(std::ifstream& fin, int value_bytes, std::int64_t& index0, std::int64_t& index1,
+                            double& value, const std::string& input_file, std::int64_t num_id) {
+    if(!fin.read(reinterpret_cast<char*>(&index0), sizeof(std::int64_t))){
+        if(fin.eof() && fin.gcount() == 0){
+            return false;
+        }
+        fatal_error("Incomplete record at the end of {}", input_file);
+    }
+
+    if(!fin.read(reinterpret_cast<char*>(&index1), sizeof(std::int64_t)) ||
+       !read_grm_value(fin, value_bytes, value)){
+        fatal_error("Incomplete record at the end of {}", input_file);
+    }
+    if(index0 < 0 || index0 >= num_id || index1 < 0 || index1 >= num_id){
+        fatal_error("{} contains the index pair ({}, {}), outside the {} samples in its .id file",
+                    input_file, index0, index1, num_id);
+    }
+    if(!std::isfinite(value)){
+        fatal_error("{} contains a non-finite value at ({}, {})", input_file, index0, index1);
+    }
+    return true;
+}
 
 ProcessGRM::ProcessGRM(){
 }
@@ -97,9 +173,10 @@ ProcessGRM::~ProcessGRM(){
 /**
  * @brief Read sample IDs from `<prefix>.grm.id` in file order.
  *
- * Blank lines are ignored after trimming. The returned vector is validated to
- * ensure there are no duplicated IDs, because downstream matrix readers assume
- * a one-to-one mapping between ID order and matrix rows.
+ * Blank lines are ignored after trimming, and a two-column line gives its second
+ * column. The returned vector is validated to ensure there are no duplicated IDs,
+ * because downstream matrix readers assume a one-to-one mapping between ID order
+ * and matrix rows.
  */
 vector<string> ProcessGRM::read_grm_id(const std::string& grm_file){
     const string grm_id_file = grm_prefix(grm_file) + ".id";
@@ -113,10 +190,11 @@ vector<string> ProcessGRM::read_grm_id(const std::string& grm_file){
     string line;
     while(getline(fin, line)){
         process_line(line);
-        if(line.empty()){
+        string iid = grm_iid_from_line(line);
+        if(iid.empty()){
             continue;
         }
-        grm_id_vec.push_back(line);
+        grm_id_vec.push_back(std::move(iid));
     }
 
     if(is_duplicated(grm_id_vec)){
@@ -155,9 +233,9 @@ void ProcessGRM::out_grm_id(const std::string& out_file, const std::vector<std::
 /**
  * @brief Read a dense lower-triangular GRM and materialize it as a full matrix.
  *
- * The on-disk `.grm.bin` file stores doubles in lower-triangular order. When
- * `grm_id_map` is empty, the matrix is read in its native order. Otherwise the
- * GRM is subset and reordered to match the caller-provided ID map.
+ * The on-disk `.grm.bin` file stores float32 or float64 values in lower-triangular
+ * order. When `grm_id_map` is empty, the matrix is read in its native order.
+ * Otherwise the GRM is subset and reordered to match the caller-provided ID map.
  */
 void ProcessGRM::read_grm_bin(const std::string& grm_file, const std::map<std::string, std::int64_t>& grm_id_map, Eigen::MatrixXd& mat, double val){
     const vector<string> grm_id_vec = this->read_grm_id(grm_file);
@@ -199,12 +277,12 @@ void ProcessGRM::read_grm_bin(const std::string& grm_file, const std::map<std::s
 
     mat.setZero(num_id_used, num_id_used);
     const std::int64_t num_id = static_cast<std::int64_t>(grm_id_index_vec.size());
+    const int value_bytes = dense_grm_value_bytes(grm_bin_file, num_id);
     for(std::int64_t i = 0; i < num_id; ++i){
         const std::int64_t index0 = grm_id_index_vec[i];
         for(std::int64_t j = 0; j <= i; ++j){
             double tmp_val = 0.0;
-            fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double));
-            if(!fin){
+            if(!read_grm_value(fin, value_bytes, tmp_val)){
                 fatal_error("Failed while reading dense GRM file: {}", grm_bin_file);
             }
 
@@ -224,8 +302,9 @@ void ProcessGRM::read_grm_bin(const std::string& grm_file, const std::map<std::s
  * @brief Read a sparse triplet GRM and materialize it as a symmetric sparse matrix.
  *
  * The `.grm.sp.bin` payload stores lower-triangular triplets `(row, col, value)`
- * using zero-based indices. As with `read_grm_bin`, an empty ID map preserves
- * the native order, while a non-empty map subsets and reorders the matrix.
+ * using zero-based indices, with float32 or float64 values. As with `read_grm_bin`,
+ * an empty ID map preserves the native order, while a non-empty map subsets and
+ * reorders the matrix.
  */
 void ProcessGRM::read_grm_sp_bin(const std::string& grm_sparse_file, const std::map<std::string, std::int64_t>& grm_id_map, Eigen::SparseMatrix<double>& mat, double val){
     const vector<string> grm_id_vec = this->read_grm_id(grm_sparse_file);
@@ -266,7 +345,9 @@ void ProcessGRM::read_grm_sp_bin(const std::string& grm_sparse_file, const std::
     std::vector<Eigen::Triplet<double>> triplet_list;
     double tmp_val = 0.0;
     std::int64_t index0 = 0, index1 = 0;
-    while(read_sparse_grm_record(fin, index0, index1, tmp_val, grm_sp_bin_file)){
+    const std::int64_t num_id = static_cast<std::int64_t>(grm_id_index_vec.size());
+    const int value_bytes = read_sparse_grm_header(fin);
+    while(read_sparse_grm_record(fin, value_bytes, index0, index1, tmp_val, grm_sp_bin_file, num_id)){
         const std::int64_t index_curr0 = grm_id_index_vec[index0];
         const std::int64_t index_curr1 = grm_id_index_vec[index1];
         if(index_curr0 != -1 && index_curr1 != -1){
@@ -453,8 +534,7 @@ void ProcessGRM::out_gmat(const Eigen::MatrixXd& gmat, const vector<string>& grm
 
         for(std::int64_t i = 0; i < num_id; ++i){
             for(std::int64_t j = 0; j <= i; ++j){
-                const double value = gmat(i, j);
-                fout.write(reinterpret_cast<const char*>(&value), sizeof(double));
+                write_grm_value(fout, gmat(i, j));
             }
         }
         if(!fout){
@@ -521,15 +601,11 @@ void ProcessGRM::out_gmat(const Eigen::SparseMatrix<double>& gmat, const vector<
             fatal_error("Fail to open the output file: {}", out_gmat_file);
         }
 
+        write_sparse_grm_header(fout);
         for (std::int64_t k = 0; k < upper_gmat.outerSize(); ++k){
             for (Eigen::SparseMatrix<double>::InnerIterator it(upper_gmat, k); it; ++it){
                 //output the transpose of upper triangular part -> low triangular part
-                const std::int64_t index0 = it.col();
-                const std::int64_t index1 = it.row();
-                const double value = it.value();
-                fout.write(reinterpret_cast<const char*>(&index0), sizeof(std::int64_t));
-                fout.write(reinterpret_cast<const char*>(&index1), sizeof(std::int64_t));
-                fout.write(reinterpret_cast<const char*>(&value), sizeof(double));
+                write_sparse_grm_record(fout, it.col(), it.row(), it.value());
             }
         }
         if(!fout){
@@ -619,28 +695,26 @@ void ProcessGRM::epistatic_grm(const std::string& prefix1, const std::string& pr
         fatal_error("Fail to open: {}", out_bin_file);
     }
 
+    // The two inputs can have different value widths; both are checked against
+    // the sample count, so their lengths agree.
+    const std::int64_t num_id = static_cast<std::int64_t>(grm_id_vec1.size());
+    const std::int64_t num_values = num_id * (num_id + 1) / 2;
+    const int value_bytes1 = dense_grm_value_bytes(bin_file1, num_id);
+    const int value_bytes2 = dense_grm_value_bytes(bin_file2, num_id);
+
     double val1 = 0.0;
     double val2 = 0.0;
-    while(fin1.read(reinterpret_cast<char*>(&val1), sizeof(double))){
-        if(!fin2.read(reinterpret_cast<char*>(&val2), sizeof(double))){
-            fatal_error("Dense GRM files have inconsistent lengths: {} and {}", bin_file1, bin_file2);
+    for(std::int64_t k = 0; k < num_values; ++k){
+        if(!read_grm_value(fin1, value_bytes1, val1)){
+            fatal_error("Failed while reading: {}", bin_file1);
         }
-        const double product = val1 * val2;
-        fout.write(reinterpret_cast<const char*>(&product), sizeof(double));
+        if(!read_grm_value(fin2, value_bytes2, val2)){
+            fatal_error("Failed while reading: {}", bin_file2);
+        }
+        write_grm_value(fout, val1 * val2);
         if(!fout){
             fatal_error("Failed while writing: {}", out_bin_file);
         }
-    }
-
-    if(!fin1.eof()){
-        fatal_error("Failed while reading: {}", bin_file1);
-    }
-
-    if(fin2.read(reinterpret_cast<char*>(&val2), sizeof(double))){
-        fatal_error("Dense GRM files have inconsistent lengths: {} and {}", bin_file1, bin_file2);
-    }
-    if(!fin2.eof()){
-        fatal_error("Failed while reading: {}", bin_file2);
     }
 }
 
@@ -682,9 +756,10 @@ void ProcessGRM::remove_close_id(const std::string& grm_file, int sparse, double
         }
 
         double tmp_val = 0.0;
+        const int value_bytes = dense_grm_value_bytes(grm_bin_file, num_id);
         for(std::int64_t i = 0; i < num_id; ++i){
             for(std::int64_t j = 0; j <= i; ++j){
-                if(!fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+                if(!read_grm_value(fin, value_bytes, tmp_val)){
                     fatal_error("Failed while reading: {}", grm_bin_file);
                 }
                 if(tmp_val > cutoff && i != j){
@@ -703,7 +778,8 @@ void ProcessGRM::remove_close_id(const std::string& grm_file, int sparse, double
 
         double tmp_val = 0.0;
         std::int64_t index0 = 0, index1 = 0;
-        while(read_sparse_grm_record(fin, index0, index1, tmp_val, grm_sp_bin_file)){
+        const int value_bytes = read_sparse_grm_header(fin);
+        while(read_sparse_grm_record(fin, value_bytes, index0, index1, tmp_val, grm_sp_bin_file, num_id)){
             if(tmp_val > cutoff && index0 != index1){
                 ++num_close;
                 close_id_map[id_in_grm_vec[index0]].insert(id_in_grm_vec[index1]);
@@ -783,9 +859,10 @@ void ProcessGRM::group_related_samples(const std::string& grm_file, double cutof
     }
 
     double tmp_val = 0.0;
+    const int value_bytes = dense_grm_value_bytes(grm_bin_file, num_id_in_grm);
     for(std::int64_t i = 0; i < num_id_in_grm; ++i){
         for(std::int64_t j = 0; j <= i; ++j){
-            if(!fin.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+            if(!read_grm_value(fin, value_bytes, tmp_val)){
                 fatal_error("Failed while reading: {}", grm_bin_file);
             }
             if(i != j && tmp_val > cutoff){
@@ -883,17 +960,16 @@ void ProcessGRM::group_related_samples(const std::string& grm_file, double cutof
         fatal_error("Fail to open: {}", grm_sp_bin_file);
     }
 
+    write_sparse_grm_header(fout);
     tmp_val = 0.0;
     std::int64_t num_values_kept = 0;
     for(std::int64_t i = 0; i < num_id_in_grm; ++i){
         for(std::int64_t j = 0; j <= i; ++j){
-            if(!dense_grm_in.read(reinterpret_cast<char*>(&tmp_val), sizeof(double))){
+            if(!read_grm_value(dense_grm_in, value_bytes, tmp_val)){
                 fatal_error("Failed while reading: {}", grm_bin_file);
             }
             if(id_to_group[i] == id_to_group[j]){
-                fout.write(reinterpret_cast<const char*>(&i), sizeof(std::int64_t));
-                fout.write(reinterpret_cast<const char*>(&j), sizeof(std::int64_t));
-                fout.write(reinterpret_cast<const char*>(&tmp_val), sizeof(double));
+                write_sparse_grm_record(fout, i, j, tmp_val);
                 ++num_values_kept;
             }
         }

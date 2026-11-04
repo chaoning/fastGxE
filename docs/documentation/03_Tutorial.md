@@ -122,6 +122,20 @@ This step identifies connected components in the relatedness graph and writes gr
 - `output/test.grm.group.size`
 - a sparse within-group GRM representation used by downstream analysis
 
+### GRM file format
+
+From version 2.0, GRM files hold `float32` values:
+
+- `.grm.bin` holds the lower triangle row by row, as in GCTA.
+- `.grm.sp.bin` starts with the 8 bytes `FGMASPF4`, followed by records of `int64 row, int64 col, float32 value`, with 0-based indices.
+
+This halves the size of `.grm.bin`. The precision loss, at most about `6e-8` per value, is far below the sampling noise of a GRM.
+
+- `fastgxe2.0` also reads the `float64` GRMs of version 1.0, so you do not need to rebuild them. To convert one, run `fastgxe2.0 --process-grm --reformat --grm old --out-fmt 3 --out new`, adding `--sparse` for `.grm.sp.bin`.
+- GRMs built with fastGMA can be used directly, including a two-column `FID IID` `.grm.id`.
+- The two programs give different values when genotypes are missing. fastGxE fills a missing genotype with the SNP mean and adds `--val` (default `0.001`) to the diagonal. fastGMA leaves it out of that pair and adds nothing by default. Without missing genotypes and with the same `--val`, the GRMs are identical.
+- **Version 1.0 (`fastgxe`) cannot read these files.** It does not check the format, so a `.grm.sp.bin` from version 2.0 gives wrong results without an error. Build a separate GRM with `fastgxe` if you need to use version 1.0.
+
 ## 3. Test SNP main effects
 
 Run a genome-wide SNP main-effect scan with:

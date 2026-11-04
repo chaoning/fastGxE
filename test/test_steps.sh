@@ -216,6 +216,118 @@ requested=$(awk '$1=="n_random_requested"{print $2}' syn2_all.gamma)
 if [ "$used" -gt 0 ] && [ "$used" -le 4000 ] && [ "$requested" = 100000 ]; then echo "ok    asking for more SNPs than exist uses them all ($used)"; else echo "FAIL  used=$used requested=$requested"; failures=$((failures + 1)); fi
 rejected "no SNP passes QC" --step 2 --null syn1 --mbfile syn_list.txt --maf 0.6 --out x
 
+echo "== --maf treats both alleles alike (simulated samples)"
+python3 - <<'PY'
+import numpy as np
+rng = np.random.default_rng(2)
+n, m = 300, 600
+rare_snp = np.arange(m) % 3 == 0
+dosage = rng.binomial(2, np.where(rare_snp, 0.002, 0.3), (n, m))
+code = np.array([0b11, 0b10, 0b00])  # .bed codes of dosage 0, 1 and 2
+
+def write_fileset(prefix, values):
+    with open(prefix + ".fam", "w") as f:
+        for i in range(n):
+            f.write(f"S{i:04d} S{i:04d} 0 0 0 -9\n")
+    with open(prefix + ".bim", "w") as f:
+        for j in range(m):
+            f.write(f"1 snp{j} 0 {j + 1} A G\n")
+    bits = code[values].T  # SNPs x samples
+    padded = np.zeros((m, (n + 3) // 4 * 4), dtype=np.uint8)
+    padded[:, :n] = bits
+    packed = padded[:, ::4] | padded[:, 1::4] << 2 | padded[:, 2::4] << 4 | padded[:, 3::4] << 6
+    with open(prefix + ".bed", "wb") as f:
+        f.write(bytes([0x6c, 0x1b, 0x01]) + packed.tobytes())
+
+write_fileset("maf_a", dosage)
+write_fileset("maf_b", 2 - dosage)  # every SNP counted through its other allele
+PY
+run --make-grm --bfile maf_a --out maf_a
+run --make-grm --bfile maf_b --out maf_b
+same maf_a.grm.N maf_b.grm.N "--maf keeps the same SNPs whichever allele is counted"
+python3 - > maf_check.txt <<'PY'
+import numpy as np
+first = np.fromfile("maf_a.grm.bin", dtype="<f4")
+second = np.fromfile("maf_b.grm.bin", dtype="<f4")
+print("same" if np.allclose(first, second, rtol=1e-5, atol=1e-5) else "different")
+PY
+if [ "$(cat maf_check.txt)" = same ]; then echo "ok    the GRM does not depend on which allele is counted"; else echo "FAIL  GRM depends on the allele"; failures=$((failures + 1)); fi
+
+echo "== GRM files"
+num_id=$(wc -l < grm.grm.id)
+if [ "$(stat -c %s grm.grm.bin)" = $((num_id * (num_id + 1) / 2 * 4)) ]; then echo "ok    .grm.bin is float32"; else echo "FAIL  .grm.bin size"; failures=$((failures + 1)); fi
+if [ "$(head -c 8 grm.grm.sp.bin)" = FGMASPF4 ]; then echo "ok    .grm.sp.bin has its format header"; else echo "FAIL  .grm.sp.bin header"; failures=$((failures + 1)); fi
+
+# The same GRM in the float64 layouts of version 1.0.
+python3 - <<'PY'
+import numpy as np
+np.fromfile("grm.grm.bin", dtype="<f4").astype("<f8").tofile("legacy.grm.bin")
+with open("grm.grm.sp.bin", "rb") as f:
+    f.read(8)
+    records = np.frombuffer(f.read(), dtype=[("i", "<i8"), ("j", "<i8"), ("v", "<f4")])
+legacy = np.zeros(len(records), dtype=[("i", "<i8"), ("j", "<i8"), ("v", "<f8")])
+legacy["i"], legacy["j"], legacy["v"] = records["i"], records["j"], records["v"]
+legacy.tofile("legacy.grm.sp.bin")
+PY
+for suffix in id N group group.size; do cp "grm.grm.$suffix" "legacy.grm.$suffix"; done
+
+run --step 1 --grm legacy --data "$EX/test_simu_pheno.txt" --trait pheno --env-int E1:E40 --out legacy_s1
+same s1.null.bin legacy_s1.null.bin "a float64 GRM gives the same null model"
+run --process-grm --reformat --grm legacy --out-fmt 3 --out dense_float32
+same grm.grm.bin dense_float32.grm.bin "--reformat converts a float64 .grm.bin"
+run --process-grm --reformat --sparse --grm legacy --out-fmt 3 --out sparse_float32
+same grm.grm.sp.bin sparse_float32.grm.sp.bin "--reformat --sparse converts a float64 .grm.sp.bin"
+
+mkdir regroup
+cp legacy.grm.bin legacy.grm.id regroup/
+run --process-grm --group --grm regroup/legacy --cut-value 0.05
+same grm.grm.sp.bin regroup/legacy.grm.sp.bin "--group reads a float64 .grm.bin"
+same grm.grm.group regroup/legacy.grm.group "--group finds the same groups"
+
+run --process-grm --make-epis --prefix1 grm --prefix2 grm --out epis_float32
+run --process-grm --make-epis --prefix1 grm --prefix2 legacy --out epis_mixed
+same epis_float32.grm.bin epis_mixed.grm.bin "--make-epis takes one GRM of each width"
+run --process-grm --out-close --grm grm --cut-value 0.05 --out close_dense
+run --process-grm --out-close --grm legacy --cut-value 0.05 --out close_dense_legacy
+same close_dense.grm.pruned_iid close_dense_legacy.grm.pruned_iid "--out-close reads both .grm.bin widths"
+run --process-grm --out-close --sparse --grm grm --cut-value 0.05 --out close_sparse
+run --process-grm --out-close --sparse --grm legacy --cut-value 0.05 --out close_sparse_legacy
+same close_sparse.grm.pruned_iid close_sparse_legacy.grm.pruned_iid "--out-close --sparse reads both widths"
+
+run --make-grm --bfile "$EX/test" --npart 2 1 --out part
+run --make-grm --bfile "$EX/test" --npart 2 2 --out part
+run --process-grm --merge --grm part --npart 2
+python3 - > part_check.txt <<'PY'
+import numpy as np
+whole = np.fromfile("grm.grm.bin", dtype="<f4")
+merged = np.fromfile("part.grm.bin", dtype="<f4")
+print("same" if whole.size == merged.size and np.allclose(whole, merged, rtol=1e-6, atol=1e-6) else "different")
+PY
+if [ "$(cat part_check.txt)" = same ]; then echo "ok    a GRM built in parts matches the whole"; else echo "FAIL  GRM built in parts"; failures=$((failures + 1)); fi
+
+# A two-column .grm.id (FID IID), as written by fastGMA and GCTA. Simulated samples.
+python3 - <<'PY'
+with open("syn_two.grm.id", "w") as f:
+    for i in range(300):
+        f.write(f"S{i:04d} S{i:04d}\n")
+PY
+for suffix in sp.bin N group group.size; do cp "syn_grm.grm.$suffix" "syn_two.grm.$suffix"; done
+run --step 1 --grm syn_two --data syn_pheno.txt --trait y --env-int E1:E3 --out syn_two_s1
+same syn1.null.bin syn_two_s1.null.bin "a two-column .grm.id gives the same null model"
+
+head -c 1000 grm.grm.bin > short.grm.bin
+cp grm.grm.id short.grm.id
+rejected "a .grm.bin of the wrong size" --process-grm --group --grm short --cut-value 0.05
+for suffix in id group group.size; do
+    cp "grm.grm.$suffix" "partial.grm.$suffix"
+    cp "grm.grm.$suffix" "noheader.grm.$suffix"
+done
+cp grm.grm.sp.bin partial.grm.sp.bin
+printf 'x' >> partial.grm.sp.bin
+rejected "a partial record in .grm.sp.bin" --step 1 --grm partial --data "$EX/test_simu_pheno.txt" --trait pheno --env-int E1:E40 --out x
+tail -c +9 grm.grm.sp.bin > noheader.grm.sp.bin
+rejected "float32 records without their header" --step 1 --grm noheader --data "$EX/test_simu_pheno.txt" --trait pheno --env-int E1:E40 --out x
+
 echo "== errors"
 run --step 1 --grm grm --data "$EX/test_simu_pheno.txt" --trait pheno --env-int E1:E20 --out other
 rejected "gamma of another null model" --step 3 --null other --gamma s2 --bfile chr22 --out x

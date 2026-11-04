@@ -1643,7 +1643,7 @@ fastGxE::GroupLayout fastGxE::build_group_layout(const vector<GroupRecord>& grou
 // are skipped unless both samples are retained and fall in the same block (cross-
 // block kinship is treated as zero); dense blocks are filled symmetrically and the
 // singleton block only stores its diagonal.
-void fastGxE::load_grouped_grm_blocks(const string& agrm_file,
+void fastGxE::load_grouped_grm_blocks(const string& agrm_file, std::int64_t num_id_in_grm,
         const std::unordered_map<std::int64_t, SampleBlockLocation>& sample_location_map,
         vector<MatrixXd>& grm_blocks) const {
     spdlog::info("Reading GRM blocks from {}.grm.sp.bin", agrm_file);
@@ -1655,10 +1655,10 @@ void fastGxE::load_grouped_grm_blocks(const string& agrm_file,
 
     double value;
     std::int64_t index0, index1;
+    const string grm_sp_bin_file = agrm_file + ".grm.sp.bin";
+    const int value_bytes = read_sparse_grm_header(fin);
 
-    while(fin.read((char*)&index0, sizeof(std::int64_t)) &&
-            fin.read((char*)&index1, sizeof(std::int64_t)) &&
-            fin.read((char*)&value, sizeof(double))){
+    while(read_sparse_grm_record(fin, value_bytes, index0, index1, value, grm_sp_bin_file, num_id_in_grm)){
         const auto loc0_it = sample_location_map.find(index0 + 1);
         if(loc0_it == sample_location_map.end()){
             continue;
@@ -1784,7 +1784,7 @@ int fastGxE::pre_data(const string& out_file, const string& data_file, const str
 
     GroupLayout group_layout = build_group_layout(group_records);
     m_grm_mat_group_vec = std::move(group_layout.grm_blocks);
-    load_grouped_grm_blocks(agrm_file, group_layout.sample_location_map, m_grm_mat_group_vec);
+    load_grouped_grm_blocks(agrm_file, num_id_in_grm, group_layout.sample_location_map, m_grm_mat_group_vec);
 
     spdlog::info("Data preparation completed: {} samples retained", m_num_id);
     return 0;
