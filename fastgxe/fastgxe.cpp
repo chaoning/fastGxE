@@ -701,26 +701,42 @@ double append_inverse_singleton_block(const MatrixXd& grm_block, const MatrixXd&
 
 // Inverts one dense within-group block of V for the GxE model. Forms the block
 //   V_g = σ²_g*GRM + σ²_gxe*GxE (+ σ²_noise*diag(nxe)) + σ²_resid*I,
-// factorizes it with LDLT, appends the dense inverse as triplets of V^{-1}, and
-// returns the block's log-determinant contribution.
+// factorizes it with MKL Cholesky (dpotrf) and inverts it in place (dpotri),
+// appends the dense inverse as triplets of V^{-1}, and returns the block's
+// log-determinant contribution.
+//
+// V_g is positive definite whenever σ²_resid > 0: the GRM block is a principal
+// submatrix of the full GRM (grouping keeps every within-group entry), the GxE
+// block is its elementwise product with E E'/k (Schur product theorem), and nxe
+// is nonnegative. A failed factorization therefore means bad input, so it aborts.
 double append_inverse_dense_block(const MatrixXd& grm_block, const MatrixXd& gxe_block,
         const VectorXd& nxe_block, const VectorXd& varcom, bool no_noisebye,
         std::int64_t start_index, std::vector<GrmTriplet>& triplets) {
-    MatrixXd variance_block = MatrixXd::Identity(grm_block.rows(), grm_block.rows()) * varcom(varcom.size() - 1);
+    const lapack_int block_size = static_cast<lapack_int>(grm_block.rows());
+    MatrixXd variance_block = MatrixXd::Identity(block_size, block_size) * varcom(varcom.size() - 1);
     variance_block += grm_block * varcom(0) + gxe_block * varcom(1);
     if (!no_noisebye) {
-        variance_block += nxe_block.asDiagonal() * varcom(2);
+        variance_block.diagonal() += nxe_block * varcom(2);
     }
 
-    Eigen::LDLT<MatrixXd> ldlt(variance_block);
-    if (ldlt.info() != Eigen::Success) {
-        fatal_error("Failed to factorize covariance block starting at index {}.", start_index);
+    // Lower-triangular Cholesky factor L (V_g = L L'), overwriting variance_block.
+    lapack_int info = LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', block_size, variance_block.data(), block_size);
+    if (info != 0) {
+        fatal_error("Covariance block starting at index {} (size {}) is not positive definite "
+                "(dpotrf info = {}).", start_index, block_size, info);
     }
+    // log|V_g| = 2 * sum(log(diag(L))).
+    const double logdet = 2.0 * variance_block.diagonal().array().log().sum();
 
-    const VectorXd diagonal = ldlt.vectorD();
-    const double logdet = diagonal.array().log().sum();
-    const MatrixXd inverse_block = ldlt.solve(MatrixXd::Identity(grm_block.rows(), grm_block.rows()));
-    append_dense_block_triplets(inverse_block, start_index, triplets);
+    // V_g^{-1} in place from L; dpotri fills only the lower triangle.
+    info = LAPACKE_dpotri(LAPACK_COL_MAJOR, 'L', block_size, variance_block.data(), block_size);
+    if (info != 0) {
+        fatal_error("Failed to invert covariance block starting at index {} (size {}) "
+                "(dpotri info = {}).", start_index, block_size, info);
+    }
+    variance_block.triangularView<Eigen::StrictlyUpper>() = variance_block.transpose();
+
+    append_dense_block_triplets(variance_block, start_index, triplets);
     return logdet;
 }
 
